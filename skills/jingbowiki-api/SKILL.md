@@ -34,7 +34,9 @@ description: 查询、调用和维护 jingboWiki 18082 端口的 HTTP 接口，�
 
 - **默认创建纯 Wiki 知识库**：`indexing_strategy` 仅 `wiki_enabled=true`（vector/keyword/graph 全关），其余配置按 [纯 Wiki 操作流程](references/pure-wiki.md) 的建库请求体；用户明确要 RAG/向量/关键词类时才按对应类型建。
 - **默认模型取本地环境默认模型**：用户未指定模型时，读本地 opencode 配置 `~/.config/opencode/opencode.jsonc`（或 `.json`）：顶层 `model` 字段（形如 `provider/模型名`）+ 对应 `provider.<provider>.options.baseURL` / `apiKey`（OpenAI 兼容接口）；模型名取 `/` 后的部分（端点上的 model id）。
-- 绑定前先 `GET /models` 查同名模型；未注册则先 `POST /models`（type=`KnowledgeQA`，source=`remote`，provider=`generic`，parameters: `base_url`/`api_key`），再用 `POST /initialization/remote/check` 验证 jingboWiki 侧出网连通。
+- 绑定前先 `GET /models` 查同名**且 type=`KnowledgeQA`** 的模型；未注册则先 `POST /models`（type=`KnowledgeQA`，source=`remote`，provider=`generic`，parameters: `base_url`/`api_key`），再用 `POST /initialization/remote/check` 验证 jingboWiki 侧出网连通。
+- **同名不同 type 是不同槽位，不能混用**：把 type=`VLLM` 的同名模型 id 传给 `PUT /initialization/config/{kb_id}` 的 `llmModelId`，会落到 `multimodal.vlm` 且 `llm` 配置整块消失（实测 `Qwen3.8-27B-FP8-Z`）。此时另注册一个 `KnowledgeQA` 型同名模型（允许重名）再绑；改绑正确 id 后 `multimodal` 自动恢复 `enabled:false`。智能体问答模型走 `PUT /agents/{id}` 的 `config.model_id`，同样只填 `KnowledgeQA` 型 id。
+- 换绑后必须复核三处：`GET /initialization/config/{kb_id}` 的 `llm.modelName`、`GET /knowledge-bases/{kb_id}` 的 `summary_model_id`、`GET /agents/{id}` 的 `config.model_id`；并实问一轮确认 SSE 正常出答案，不能只看接口返回 success。
 - apiKey 仅用于注册与调用，不输出到对话、不写入文档。
 - 用户明确指定（模型 / 知识库类型 / 空间）时以指定为准，默认只兜底。
 

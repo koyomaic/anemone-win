@@ -6,7 +6,7 @@
 
 从当前用户提供的凭据登录，检查 `active_tenant.id` 和 `memberships`，不能把 `user.tenant_id` 当作当前空间。只操作本次指定空间，不把账号和密码写入技能。
 
-`GET /models` 查找当前空间的目标模型，`type=KnowledgeQA`。**用户未指定模型时默认用本地环境默认模型**（见 SKILL.md「建库默认」：读本地 opencode 配置 `~/.config/opencode/opencode.jsonc`，顶层 `model` 取 `/` 后的模型名，base_url/api_key 取对应 provider 的 options；本文的 `DeepSeek-V4-Flash-BD` 为实测示例）。未注册先 `POST /models`（type=`KnowledgeQA`，source=`remote`，provider=`generic`，parameters: `base_url`/`api_key`）。纯 Wiki 不绑定 embedding 或 rerank。`POST /initialization/remote/check` 使用 `modelId`、`modelName`、`baseUrl`、`source=remote`、`provider=generic` 验证保存的凭据，不需要再次提交密钥。
+`GET /models` 查找当前空间的目标模型，`type=KnowledgeQA`。**用户未指定模型时默认用本地环境默认模型**（见 SKILL.md「建库默认」：读本地 opencode 配置 `~/.config/opencode/opencode.jsonc`，顶层 `model` 取 `/` 后的模型名，base_url/api_key 取对应 provider 的 options；本文的 `DeepSeek-V4-Flash-BD` 为实测示例）。未注册先 `POST /models`（type=`KnowledgeQA`，source=`remote`，provider=`generic`，parameters: `base_url`/`api_key`）。纯 Wiki 不绑定 embedding 或 rerank。`POST /initialization/remote/check` 使用 `modelId`、`modelName`、`baseUrl`、`source=remote`、`provider=generic` 验证保存的凭据，不需要再次提交密钥。同名但 type 不同的条目（如 type=`VLLM`）属另一槽位：把它的 id 传给 `PUT /initialization/config/{kb_id}` 的 `llmModelId` 会写入 `multimodal.vlm` 并丢失 `llm` 配置，须另注册 `KnowledgeQA` 型同名模型（允许重名）再绑，绑后复核 `llm.modelName`、`summary_model_id` 与智能体 `config.model_id`。
 
 如需思考开关，将模型 `parameters.extra_config.thinking_control` 配为 `chat_template_kwargs`。通过 `GET /models/{id}` 读取完整非敏感参数后再 `PUT /models/{id}`，保留其他设置；普通 PUT 会保留已有凭据。该配置把 `thinking` 布尔值映射为上游 `chat_template_kwargs.enable_thinking=true/false`。
 
