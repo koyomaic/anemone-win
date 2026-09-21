@@ -127,6 +127,28 @@ run_provision() { # $1=sha；部署/守护轮次后执行安装检测清单（�
   return "$rc"
 }
 
+sync_dev_workdir() { # 本地开发工作区同步远端 main（仅 fast-forward）；脏工作区/非目标分支/不可 ff 一律跳过并记日志，永不阻塞 boot 流程
+  local d="${DEV_DIR:-/mnt/vol-eltaah12/finaagent/relay-dev}" before after
+  [ -d "$d/.git" ] || return 0
+  [ "$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" = "$BRANCH" ] || { log "dev 工作区不在 $BRANCH 分支，跳过同步"; return 0; }
+  before="$(git -C "$d" rev-parse HEAD 2>/dev/null || true)"
+  if ! timeout 120 git -C "$d" fetch -q origin >>"$LOG" 2>&1; then
+    log "dev 工作区 fetch 失败（网络异常？），本轮跳过同步"
+    return 0
+  fi
+  if [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then
+    log "dev 工作区有未提交变更，跳过同步（需人工处理）"
+    return 0
+  fi
+  if git -C "$d" merge --ff-only -q "origin/$BRANCH" 2>>"$LOG"; then
+    after="$(git -C "$d" rev-parse HEAD)"
+    [ "$after" != "$before" ] && log "dev 工作区同步：${before:0:7} → ${after:0:7}"
+  else
+    log "dev 工作区领先远端或不可 fast-forward，跳过同步（需人工处理）"
+  fi
+  return 0
+}
+
 deploy() { # $1=sha
   local sha="$1" rel="$RELEASE_ROOT/$1" prev got tmp
   if [ -d "$rel" ]; then
@@ -209,6 +231,7 @@ cmd_boot() {
     fi
     run_provision "${sha:-$(current_sha)}" || prc=$?
   fi
+  sync_dev_workdir
   if [ "$prc" -ne 0 ]; then
     notify_failure "安装检测清单（provision）未通过 rc=$prc，详见 $LOG"
     exit 1
