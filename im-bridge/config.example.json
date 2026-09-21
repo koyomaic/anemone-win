@@ -1,0 +1,17 @@
+{
+  "personal": {
+    "mode": "whitelist",
+    "whitelist": [],
+    "blacklist": []
+  },
+  "group": {
+    "enabled": false,
+    "mode": "whitelist",
+    "whitelist": [],
+    "blacklist": []
+  },
+  "debounce_sec": 20,
+  "followup_debounce_sec": 30,
+  "ack_emoji": "收到",
+  "submit_emoji": "赞"
+}

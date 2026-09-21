@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 5. 可选：本机私有检查写 `/opt/team/relay-boot/provision-local.sh`（可执行，参数=模式；
    适合放内网 MCP 连通性等不进 git 的检查，失败只 WARN；PG 连通性已是原生清单项）
 
-## 清单项目（PG 模式 35 项 / SQLite 模式 34 项，顺序执行）
+## 清单项目（PG 模式 36 项 / SQLite 模式 35 项，顺序执行）
 
 | # | 项目 | 缺失时动作 | 级别 |
 |---|---|---|---|
@@ -72,6 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 29b | GitHub 访问就绪：SSH（默认）→ config `accept-new` 固化、无密钥自动生成、认证实测；HTTPS（备用）→ 查 `/root/.git-credentials` | config/密钥自愈；认证失败 WARN 附公钥与 Deploy keys 登记指引 | 软 |
 | 30 | GitHub 远端可达且 remote==current | 仅报告 | 软 |
 | 31 | dws 种子登录态实测（contact user me） | 仅报告 | 软 |
+| 31b | IM Bridge（`im-bridge/`，钉钉消息→relay 任务桥）：代码装 `/opt/team/relay-im-bridge`、状态在 `workspace/im-bridge/`、unit 渲染安装；**默认不启用**，`touch /etc/relay-im-bridge.enabled` 后 install 轮自动 enable --now；marker 在但拉不起=FAIL | 安装/按 marker 启停 | 软 |
 | 32 | provision-local.sh 本机附加检查 | 执行 hook | 软 |
 
 硬项失败：install 模式立即中止（后续项依赖它），退出码 1；软项失败只 WARN，退出码不受影响。

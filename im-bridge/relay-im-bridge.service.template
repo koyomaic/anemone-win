@@ -1,0 +1,18 @@
+[Unit]
+Description=Relay IM Bridge (DingTalk messages -> relay tasks)
+After=network-online.target relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/root
+Environment=BRIDGE_STATE_DIR=@STATE_DIR@
+ExecStartPre=/bin/sh -c 'mkdir -p /tmp/dws-event-0 && chmod 700 /tmp/dws-event-0'
+ExecStart=@VENV_PY@ @BRIDGE_DIR@/bridge.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

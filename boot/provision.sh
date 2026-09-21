@@ -614,6 +614,37 @@ if [ -d "$DWS_SEED" ] && command -v dws >/dev/null; then
   rm -rf "$WORK"
 else warn "跳过（无种子或无 dws）"; fi
 
+# ---------- 29b IM Bridge（SOFT，默认不启用，marker 开关随时启动） ----------
+step "IM Bridge"
+IMB_SRC="$RES_ROOT/im-bridge"
+IMB_DIR=/opt/team/relay-im-bridge
+IMB_STATE="$WORKSPACE/im-bridge"
+IMB_UNIT=relay-im-bridge.service
+IMB_MARKER=/etc/relay-im-bridge.enabled
+if [ -d "$IMB_SRC" ]; then
+  if heal; then
+    mkdir -p "$IMB_DIR" "$IMB_STATE/rounds" "$IMB_STATE/media"
+    cp -f "$IMB_SRC/bridge.py" "$IMB_SRC/bridge-cli" "$IMB_DIR/"
+    chmod 755 "$IMB_DIR/bridge.py" "$IMB_DIR/bridge-cli"
+    [ -f "$IMB_STATE/config.json" ] || cp "$IMB_SRC/config.example.json" "$IMB_STATE/config.json"
+    sed -e "s|@VENV_PY@|$VENV/bin/python|" -e "s|@BRIDGE_DIR@|$IMB_DIR|" -e "s|@STATE_DIR@|$IMB_STATE|" \
+        "$IMB_SRC/relay-im-bridge.service.template" > "$UNIT_DIR/$IMB_UNIT"
+    systemctl daemon-reload
+  fi
+  if [ -f "$IMB_MARKER" ]; then
+    if heal; then systemctl enable --now "$IMB_UNIT" 2>/dev/null; fi
+    if systemctl is-active --quiet "$IMB_UNIT"; then ok "enabled+active（名单/参数 $IMB_STATE/config.json）"
+    elif heal; then bad "marker 在但服务拉不起来（journalctl -u $IMB_UNIT）"
+    else bad "marker 在但服务未运行"; fi
+  else
+    if heal; then systemctl disable --now "$IMB_UNIT" 2>/dev/null; fi
+    if [ -f "$UNIT_DIR/$IMB_UNIT" ]; then ok "已安装未启用（启用: touch $IMB_MARKER && systemctl enable --now $IMB_UNIT）"
+    elif heal; then bad "unit 安装失败"
+    else warn "未安装（install 模式自动安装）"; fi
+  fi
+  [ -f "$IMB_STATE/bridge.env" ] || warn "bridge.env 缺失（启用前需建 relay 用户+设备激活，见 im-bridge/README.md）"
+else warn "资源树无 im-bridge 目录（旧版本？）"; fi
+
 # ---------- 30 本机私有附加检查（SOFT，可选 hook） ----------
 step "本机附加检查"
 if [ -f "$LOCAL_HOOK" ]; then
