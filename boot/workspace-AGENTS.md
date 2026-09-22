@@ -73,6 +73,12 @@ store sync scan|push|verify|backfill          # jingboWiki 同步
 
 落盘新文件后**必须** `store add`（或 `store scan`）登记一行，否则台账与磁盘漂移。
 
+### 凭据边界（硬性）
+
+`shared/secrets/`、`relay.env`、以及**任何进程的环境变量（`/proc/<pid>/environ`）**都不得读取、复制、外发或回显。任务需要数据库/接口能力时走已封装的 CLI（`store`、`dws`）或 relay 接口，**不要**为了拿连接串去翻服务进程环境。缺凭据就在结果里说明缺什么，由人处理。
+
+> 为什么单列这条：任务 agent 与 relay 服务同为 root，`relay.env` 的 `600` 与 `/proc/<pid>/environ` 的 `400` 对 agent 并无实际约束力，只能靠规则约束。
+
 ## 共享知识（取消隔离，个人上传即全员可用）
 
 - `shared/skills/`：团队技能，已自动加载，按技能名直接用。其中**基础技能**（入库到 git `skills/` 的，安装位由技能内 `.dest` 指定，缺省 shared/skills）以 git 为真源：改动须提交回仓库，否则夜间 provision 以仓库版覆盖本机改动（旧版备份 `*.bak-provision-*`）；未入库的本地/实验技能不受限
