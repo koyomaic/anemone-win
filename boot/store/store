@@ -325,6 +325,60 @@ def resolve_base(a, root_name: str) -> str:
     return a.workspace if root_name == "workspace" else a.root
 
 
+def make_skeleton(root: str) -> list[str]:
+    """建目录骨架（含 report/knowledge 的域白名单目录）。纯文件系统操作，不碰数据库。"""
+    made = []
+    for d in SKELETON:
+        p = os.path.join(root, d)
+        if not os.path.isdir(p):
+            os.makedirs(p, exist_ok=True)
+            made.append(d)
+    for dom, k, *_ in DOMAINS:
+        p = os.path.join(root, "report" if k == "report" else "knowledge", dom)
+        if not os.path.isdir(p):
+            os.makedirs(p, exist_ok=True)
+            made.append(os.path.relpath(p, root))
+    return made
+
+
+def cmd_skeleton(a) -> None:
+    made = make_skeleton(a.root)
+    info = write_today(a.root)
+    write_kbmap(a.root)
+    out({"ok": True, "root": a.root, "dirs_created": made, "today": info,
+         "note": "仅建目录与 index 配置，未触碰数据库"})
+
+
+def cmd_ping(a) -> None:
+    """探活：DB 可连 + 5 张表在 + 台账行数。供 provision 检查项用，绝不建表。
+
+    ok=False 时退出码 1，便于 shell 直接判断。
+    """
+    try:
+        conn = connect()
+    except Exception as e:
+        out({"ok": False, "stage": "connect", "error": str(e).splitlines()[0],
+             "hint": "RELAY_DB 不可达或缺失"})
+        sys.exit(1)
+    cur = conn.cursor()
+    missing = []
+    for t in ("store_files", "store_refs", "store_senders", "store_domains", "store_wiki_sync"):
+        cur.execute("""SELECT 1 FROM information_schema.tables
+                       WHERE table_schema='public' AND table_name=%s""", (t,))
+        if not cur.fetchone():
+            missing.append(t)
+    n = None
+    if not missing:
+        cur.execute("SELECT count(*) n FROM store_files")
+        n = cur.fetchone()["n"]
+    conn.close()
+    out({"ok": not missing, "missing_tables": missing, "store_files_rows": n,
+         "root": a.root,
+         "hint": "" if not missing else "首次需人工执行: store init（会建表，属有副作用操作）"})
+    if missing:
+        sys.exit(1)
+
+
 def cmd_init(a) -> None:
     conn = connect()
     cur = conn.cursor()
@@ -344,17 +398,7 @@ def cmd_init(a) -> None:
                        ON CONFLICT(sender_id) DO UPDATE SET name=EXCLUDED.name,
                          role=EXCLUDED.role, open_dingtalk_id=EXCLUDED.open_dingtalk_id,
                          note=EXCLUDED.note""", (sid, name, role, odid, note))
-    made = []
-    for d in SKELETON:
-        p = os.path.join(a.root, d)
-        if not os.path.isdir(p):
-            os.makedirs(p, exist_ok=True)
-            made.append(d)
-    for dom, k, *_ in DOMAINS:
-        p = os.path.join(a.root, "report" if k == "report" else "knowledge", dom)
-        if not os.path.isdir(p):
-            os.makedirs(p, exist_ok=True)
-            made.append(os.path.relpath(p, a.root))
+    made = make_skeleton(a.root)
     info = write_today(a.root)
     write_kbmap(a.root)
     cur.execute("SELECT count(*) n FROM store_files")
@@ -1006,6 +1050,8 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", help="建扩展/表/索引 + 目录骨架 + 种子").set_defaults(f=cmd_init)
+    sub.add_parser("skeleton", help="只建目录骨架与 index 配置，不碰数据库").set_defaults(f=cmd_skeleton)
+    sub.add_parser("ping", help="探活：DB 可连 + 5 张表在（不建表；缺表退出码 1）").set_defaults(f=cmd_ping)
 
     p = sub.add_parser("scan", help="扫描入库（按 path 幂等 upsert）")
     p.add_argument("--src", default="", help="要扫描的目录（默认 store 根）")

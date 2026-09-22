@@ -470,6 +470,41 @@ else
   fi
 fi
 
+# ---------- 21e store 台账 CLI（业务存储统一索引，SOFT） ----------
+# 三层架构：磁盘为文件真身、PostgreSQL（relay 同库 public schema、store_ 前缀）为权威索引、
+# index/manifest.jsonl 为降级快照。约定见 workspace AGENTS.md「共享区约定」。
+# 注意：建表（store init）属有副作用操作，install 模式**不自动执行**——只做 CLI 同步、
+# 目录骨架（纯文件系统）与探活；首次由人工执行 init，避免在新机器上意外建表。
+step "store台账CLI"
+STORE_SRC="$RES_ROOT/boot/store/store"
+STORE_DIR="${STORE_DIR:-/opt/team/store}"
+STORE_BIN="$STORE_DIR/store"
+STORE_ROOT="${STORE_ROOT:-$WORKSPACE/shared}"
+if [ ! -f "$STORE_SRC" ]; then
+  warn "资源树无 boot/store/store（旧版本？），跳过"
+else
+  if [ -f "$STORE_BIN" ] && cmp -s "$STORE_SRC" "$STORE_BIN"; then :
+  elif ! heal; then warn "CLI 缺失或与仓库漂移（install 模式自动同步）"
+  else
+    miss "同步CLI"
+    mkdir -p "$STORE_DIR"
+    [ -f "$STORE_BIN" ] && cp "$STORE_BIN" "$STORE_BIN.bak-provision-$(date +%Y%m%d-%H%M)"
+    cp "$STORE_SRC" "$STORE_BIN" && chmod 755 "$STORE_BIN"
+  fi
+  # PATH 入口（任务 agent 直接敲 store）
+  if [ -e /usr/local/bin/store ] || [ -L /usr/local/bin/store ]; then :
+  elif heal; then ln -sfn "$STORE_BIN" /usr/local/bin/store; fi
+  # 目录骨架 + index 配置（纯文件系统，幂等，无 DB 副作用）
+  [ -f "$STORE_BIN" ] && "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" skeleton >/dev/null 2>&1
+  # 台账探活：DB 可连且 5 张表在（缺表时 ping 退出码 1）
+  if [ ! -f "$STORE_BIN" ]; then bad "store CLI 安装失败"
+  elif "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" ping >/dev/null 2>&1; then
+    ok "CLI+骨架+台账就绪（root=$STORE_ROOT）"
+  else
+    warn "台账未初始化或 DB 不可达；首次需人工执行: $STORE_BIN init（会建表，故不自动跑）"
+  fi
+fi
+
 # ---------- 22 workspace opencode.json（内网 MCP，SOFT） ----------
 step "workspace MCP配置"
 if [ -f "$WORKSPACE/opencode.json" ]; then ok

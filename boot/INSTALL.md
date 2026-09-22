@@ -13,6 +13,7 @@
 | dws 登录态小时级刷新 | `dws-refresh.timer` → `dws-refresh.sh` | 每小时整点（±60s 抖动）：软链共享种子进临时 HOME 跑 `auth status`，token 刷新原地发生在种子上（与 boot 预警同一份登录态）；日志 `/var/log/dws-refresh.log`；登录态失效时清单 WARN，需人工设备码重授权 |
 | Claude 代理 | `claude-proxy.service` | 可选：Anthropic→OpenAI 翻译代理 :8790 |
 | TLS 代理 | `relay-tls-proxy.service` | 可选：仅 HTTPS 主机（有 relay-tls 证书才装），socat 回环明文 :8787→TLS :8788（仅本机健康检查兼容） |
+| store 台账 | —（CLI，`/usr/local/bin/store`） | 业务存储统一索引：磁盘为文件真身、PostgreSQL（relay 同库 `public` schema、`store_` 前缀）为权威索引与血缘、`index/manifest.jsonl` 为降级快照。存储根＝relay 的 `shared_dir`（同址是刻意的，见 `boot.env.example` 的 `STORE_ROOT` 说明）；约定见 workspace `AGENTS.md`「共享区约定」 |
 
 ## 新服务器一键安装
 
@@ -43,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 5. 可选：本机私有检查写 `/opt/team/relay-boot/provision-local.sh`（可执行，参数=模式；
    适合放内网 MCP 连通性等不进 git 的检查，失败只 WARN；PG 连通性已是原生清单项）
 
-## 清单项目（PG 模式 36 项 / SQLite 模式 35 项，顺序执行）
+## 清单项目（顺序执行；项数随组件与主机角色浮动，以运行输出的 `[NN]` 编号与末尾 `PASS=/WARN=/FAIL=` 汇总为准）
 
 | # | 项目 | 缺失时动作 | 级别 |
 |---|---|---|---|
@@ -65,6 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 24b | 基础技能：仅仓库 `skills/` 内人为标记入库的（机队共享，git 为真源），逐文件比对安装位同名技能（安装位由技能内 `.dest` 指定：钉钉套件→`/root/.agents/skills`、dws→`/opt/team/skills`，缺省 `shared/skills/`） | 缺失/漂移 → 本地旧版备份 `*.bak-provision-*` 后同步仓库版；未入库的本地/实验技能不碰 | 软 |
 | 24c | opencode 全局语境 `/root/.config/opencode/AGENTS.md`（模板 `boot/opencode-global-AGENTS.md`，git 为真源；所有会话默认加载 GitHub 项目指向等语境） | 缺失/漂移 → 备份后同步模板 | 软 |
 | 24d | team-agent-relay 安装位 `ca.pem`（公开 CA 证书，不入 git；统一从 `RELAY_CA_SRC`（缺省 `127.0.0.1:8788`，即所在服务器本机 TLS 链）TLS 链提取，自签校验后写入） | 缺失/漂移 → 备份后提取写入；源不可达且已有现存 → 沿用 | 软 |
+| 24e | store 台账 CLI（`boot/store/store`，业务存储统一索引）：装 `/opt/team/store/store` + 软链 `/usr/local/bin/store`；建目录骨架与 `index/` 配置（纯文件系统、幂等）；`store ping` 探活 DB 与 5 张 `store_*` 表。**建表（`store init`）属有副作用操作，install 不自动执行**，首次需人工跑 | CLI 同步 / 骨架自建 / 探活仅报告 | 软 |
 | 25-26 | claude-proxy / relay-tls-proxy | 缺则装（tls 仅证书存在时） | 软 |
 | 27 | 首装引导（无现役 release → boot.sh boot 完整部署） | 自动 | 硬 |
 | 28 | relay active+healthy | enable/start/restart | 硬 |
@@ -95,6 +97,37 @@ RELAY_DB=postgresql://USER:PASSWORD@HOST:5432/DBNAME   # 密码 URL 编码：@ �
 - PG 后端测试：`RELAY_TEST_PG_URL=<pg_url> pytest -m pg`（服务器上建临时库，测完即删；
   部署门禁 `-m "not integration and not pg"` 不依赖外部库）
 - 注意：多台机器指向同一 PG 库会共享成员与任务队列（调度器会互相抢任务）；多机部署请分库
+
+## store 台账（业务存储统一索引）
+
+三层架构：**磁盘**为文件真身、**PostgreSQL**（relay 同库 `public` schema、`store_` 前缀）为权威索引与血缘、`index/manifest.jsonl` 为 PG 导出的降级快照。CLI 真源 `boot/store/store`，provision 24e 装到 `/opt/team/store/store` 并软链 `/usr/local/bin/store`。
+
+**首次初始化（人工，provision 不自动做）**：
+
+```bash
+store init      # 建 pg_trgm 扩展 + 5 张 store_* 表 + 目录骨架 + 域/发送人种子
+store ping      # 探活：DB 可连且 5 张表在（缺表退出码 1）
+```
+
+`init` 会建表，属有副作用操作，所以 install 模式只同步 CLI、建目录骨架、跑 `ping` 探活；表缺失时 WARN 并提示人工执行。需要 `RELAY_DB` 指向的库有建表权限（`pg_trgm` 需 superuser 或对该库有 CREATE）。
+
+**日常用法**（约定详见 workspace `AGENTS.md`「共享区约定」）：
+
+```bash
+store today                                  # 今天该往哪写
+store scan [--src DIR] [--kind K] [--prefix P] [--root-name store|workspace]
+store add <path> --kind data --sender 20102 --task 67 --topic 门店日销
+store q --kind report --domain 会议纪要 --since 2026-09-01
+store q --task 67                            # JOIN relay tasks，一个任务的输入+输出
+store lineage <id> / store link <src> <dst>  # 血缘
+store dup / store doctor / store export      # 去重 / 对账体检 / 导出快照
+store sync tags|scan|push|verify|backfill    # jingboWiki 同步
+```
+
+- **存储根＝relay 的 `shared_dir`**（`STORE_ROOT`，缺省 `$WORKSPACE/shared`）。同址是刻意的：relay 的 `_snap` 用 `os.walk` 默认不跟随符号链接，若把 store 放别处再用软链做兼容，`knowledge`/`report` 会整个从基线快照消失、静默破坏冲突检测。改 `STORE_ROOT` 必须同步改 `RELAY_SHARED`。
+- 扫描按相对路径前缀排除非台账区（`secrets`/`skills`/`mcp`/`memory`/`tmp`/`venv*`/`models`/`index`/`work`/`tools/dingtalk-skills`），否则 `secrets/` 下数千文件全成 orphan。
+- `scan` 的人工标注粘滞：`stub`/`junk`/`archived`/`done` 等判定与 `domain`/`topic`/`sender_id` 等人工字段不会被重扫清空，只有 `legacy`/`indexed`/`raw` 三个自动态会刷新。
+- 多机部署若分库（见上节），store 台账也随之分库；跨机汇总需另建视图，`manifest.jsonl` 可作为交换格式。
 
 ## 基础技能（仓库 skills/，机队共享）
 
@@ -144,6 +177,8 @@ curl -s 127.0.0.1:8787/health          # ok:true, version=远端 sha
 systemctl list-timers relay-boot.timer relay-backup.timer --no-pager
 systemctl start relay-backup           # /mnt/vol-eltaah12/backup/ 出新包
 bash /opt/team/relay-deploy/current/../boot/provision.sh check   # 全 PASS（current 指向 relay-service，boot 在上一层）
+store ping                               # ok:true，5 张 store_* 表在（缺表则先 store init）
+store doctor                             # ok:true，problems=0（台账↔磁盘零漂移、零命名违规、零重复）
 ```
 
 ## 切流与旧机收尾
