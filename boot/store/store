@@ -48,7 +48,10 @@ RUNTIME_SKIP = {"venv", ".venv", "models", "tmp", "__pycache__", ".git", "node_m
 # 不是 store 台账管理的内容，扫描与对账都要跳过，否则 secrets/ 下 2000+ 文件全成 orphan。
 # 按「相对 store 根的路径」匹配，故既可排顶层名也可排嵌套路径。
 UNMANAGED = {"secrets", "skills", "mcp", "memory", "tmp",
-             "venv", "venv_funasr", "models", "tools/dingtalk-skills"}
+             "venv", "venv_funasr", "models", "tools/dingtalk-skills",
+             # index/ 是台账自身（manifest.jsonl 由 export 生成，索引它会自我引用）；
+             # work/ 是任务中间态，7 天即清，索引只会制造噪声
+             "index", "work"}
 KB_ID = "8c0e68ab-a401-432b-aeda-676383b629d0"
 AGENT_ID = "3a38b83e-59e6-4f85-b737-618952038366"
 MODEL_ID = "823c0ae2-f0e5-4f13-bfaa-fcf838f3c606"
@@ -233,9 +236,14 @@ def parse_fname(fn: str) -> dict:
 
 
 def infer_kind(rel: str) -> str:
+    """kind 是封闭词表 data|report|knowledge|shared|work|archive。
+
+    顶层目录名不直接当 kind：tools/ skills-proposed/ templates/ 等都属「非经营共享」，
+    一律归 shared，否则每次 scan 都会用目录名覆盖掉既有 kind。
+    """
     top = rel.split("/")[0]
     return {"data": "data", "report": "report", "work": "work",
-            ".archive": "archive"}.get(top, "shared" if top == "shared" else top)
+            ".archive": "archive", "knowledge": "knowledge"}.get(top, "shared")
 
 
 def infer_domain(rel: str, kind: str) -> str:
@@ -385,15 +393,22 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT(path) DO UPDATE SET
                      kind=EXCLUDED.kind, fname=EXCLUDED.fname, ext=EXCLUDED.ext,
-                     domain=EXCLUDED.domain, topic=EXCLUDED.topic, variant=EXCLUDED.variant,
-                     fdate=EXCLUDED.fdate, period=EXCLUDED.period, sender_id=EXCLUDED.sender_id,
-                     task_id=EXCLUDED.task_id, version=EXCLUDED.version, size=EXCLUDED.size,
+                     -- 推断为空时保留既有值：存量文件名不合约定，scan 推不出域/主题/发送人，
+                     -- 直接覆盖会把 store set 或迁移时人工填的字段清空。
+                     domain=COALESCE(NULLIF(EXCLUDED.domain,''), store_files.domain),
+                     topic=COALESCE(NULLIF(EXCLUDED.topic,''), store_files.topic),
+                     variant=COALESCE(NULLIF(EXCLUDED.variant,''), store_files.variant),
+                     sender_id=COALESCE(NULLIF(EXCLUDED.sender_id,''), store_files.sender_id),
+                     fdate=EXCLUDED.fdate, period=EXCLUDED.period,
+                     task_id=COALESCE(EXCLUDED.task_id, store_files.task_id),
+                     version=EXCLUDED.version, size=EXCLUDED.size,
                      sha256=EXCLUDED.sha256,
                      -- 人工标注粘滞：scan 只刷新自动态，不覆盖 stub/junk/archived/done 等判定，
                      -- 否则重扫一次就把 store set 的结论冲掉。
                      status=CASE WHEN store_files.status IN ('legacy','indexed','raw')
                                  THEN EXCLUDED.status ELSE store_files.status END,
-                     sensitivity=EXCLUDED.sensitivity, authority=EXCLUDED.authority,
+                     sensitivity=COALESCE(NULLIF(EXCLUDED.sensitivity,''), store_files.sensitivity),
+                     authority=EXCLUDED.authority,
                      wiki_status=CASE WHEN store_files.wiki_status NOT IN ('none','')
                                       THEN store_files.wiki_status ELSE EXCLUDED.wiki_status END,
                      archived=EXCLUDED.archived, root=EXCLUDED.root,
