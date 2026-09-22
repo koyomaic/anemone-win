@@ -889,10 +889,19 @@ curl 'http://10.200.3.235:18082/api/v1/knowledge-bases/<知识库ID>/hybrid-sear
 
 **PUT `/api/v1/knowledge/tags`**
 
-| 字段      | 类型                       | 必填 | 说明                                                                       |
-| --------- | -------------------------- | ---- | -------------------------------------------------------------------------- |
-| `updates` | object<string, string\|null> | 是   | 知识 ID → 标签 ID 的映射；值为 `null` 表示清除该条知识的标签                |
-| `kb_id`   | string                     | 否   | 限定知识库范围；指定时按该 KB 校验编辑权限（共享 KB 场景必填）             |
+| 字段      | 类型                        | 必填 | 说明                                                                       |
+| --------- | --------------------------- | ---- | -------------------------------------------------------------------------- |
+| `updates` | object<string, []string\|null> | 是   | 知识 ID → 标签 ID **数组**的映射；值为 `null`/`[]` 表示清除该条知识的标签   |
+| `kb_id`   | string                      | 否   | 限定知识库范围；指定时按该 KB 校验编辑权限（共享 KB 场景必填）             |
+
+> ⚠️ **实测坑（2026-09-22，服务端 jingboWiki）**：`updates` 的值必须是**字符串数组**，
+> 不能是裸字符串。传 `{"<知识ID>": "tag-xxx"}` 会返回
+> `400 {"error":{"code":1000,"details":"json: cannot unmarshal string into Go struct field knowledgeTagBatchRequest.updates of type []string"}}`。
+> 本表早期版本按 `object<string, string|null>` 记录，是错的。
+>
+> 另：`GET /knowledge-bases/{id}/knowledge` 返回的条目里，标签字段是 **`tags`（对象数组，
+> 含 `id`/`name`/`color`/`sort_order`）**，不是 `tag_id`；按 `tag_id` 取值会恒为 `None`，
+> 容易误判成"没打上标签"。`PUT /knowledge/{id}` 的单条接口才用 `tag_id` 单值。
 
 请求示例：
 
@@ -900,7 +909,7 @@ curl 'http://10.200.3.235:18082/api/v1/knowledge-bases/<知识库ID>/hybrid-sear
 {
   "kb_id": "kb-00000001",
   "updates": {
-    "4c4e7c1a-09cf-485b-a7b5-24b8cdc5acf5": "tag-00000001",
+    "4c4e7c1a-09cf-485b-a7b5-24b8cdc5acf5": ["tag-00000001"],
     "9c8af585-ae15-44ce-8f73-45ad18394651": null
   }
 }

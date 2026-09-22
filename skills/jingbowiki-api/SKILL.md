@@ -23,6 +23,7 @@ description: 查询、调用和维护 jingboWiki 18082 端口的 HTTP 接口，�
 
 - 上传：`POST /knowledge-bases/{id}/knowledge/file`，multipart 字段 `file`；标签为 `tag_ids`（逗号分隔），多模态字段拼写为 `enable_multimodel`。不要手动拼 multipart boundary。**HTTP 200 且知识记录创建即算"上传成功"，立即向用户报告；解析在后台异步进行，不要阻塞等待解析完成**（wiki_flow.py 的 upload 默认受理即返回，确需等待才显式传 `--wait-seconds N`）。
 - 解析状态：`GET /knowledge/{id}`；区分两级报告——"上传成功"（受理即报，默认只报这一级并注明解析后台进行中）与"解析完成"（仅 `parse_status=completed` 且 `enable_status=enabled` 时才可报告"处理完成并已启用"）。仅在用户明确要求确认解析结果、或后续问答依赖该文件时才查解析：单次查 `GET /knowledge/{id}`，持续跟踪用 wait 子命令；不要默认长轮询。失败读取 `error_message`；等待超时不等于解析失败。
+- 标签：建/查/改用 `/{id}/tags` 与 `PUT /knowledge/tags`。**读**标签要看条目里的 `tags`（对象数组，含 `id`/`name`），不是 `tag_id`——按 `tag_id` 取值恒为 `None`，会误判成"没打上标签"。**批量改**的 `updates` 值必须是**字符串数组** `{"<知识ID>": ["tag-xxx"]}`，传裸字符串会 400 `cannot unmarshal string into ... of type []string`（单条接口 `PUT /knowledge/{id}` 才用 `tag_id` 单值）。上传时的 `tag_ids` 是逗号分隔字符串，实测生效。检索限域用 `hybrid-search` 的 `scope_tag_ids`。
 - 查库：`GET /knowledge-bases`、`GET /knowledge-bases/{id}`；查文件清单：`GET /knowledge-bases/{id}/knowledge`。
 - 快速检索：`POST /knowledge-search` 使用 `query`，指定知识库 ID 或知识 ID 范围；`knowledge_base_id` 和 `knowledge_base_ids` 会合并去重。不要往此接口添加未声明的 `top_k` 或 `match_count`。
 - 混合检索：`POST /knowledge-bases/{id}/hybrid-search` 使用 `query_text` 与 `match_count` 等参数；不要与快速检索的参数名混用。
