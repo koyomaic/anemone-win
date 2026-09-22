@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""store —— 机队业务存储统一台账 CLI。
+
+三层架构：磁盘 store/ 树是文件真身，PG（public + store_ 前缀）是权威索引与血缘，
+index/manifest.jsonl 是 PG 导出的降级快照。表由本 CLI 幂等自建，不依赖 relay-service 发版。
+
+常用：
+  store init                      建扩展/表/索引 + 目录骨架 + 种子（域、发送人）
+  store scan [--root R] [--kind K] [--status S]   扫描入库（按 path 幂等 upsert）
+  store q --kind report --domain 会议纪要 --since 2026-09-01
+  store q --task 67               一个任务的全部输入输出
+  store dup                       sha256 重复检测
+  store doctor                    DB↔磁盘对账 + 命名违规 + 缺口
+  store export                    PG → index/manifest.jsonl
+  store lineage <id>              血缘树
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ModuleNotFoundError:  # psycopg2 只在机队 venv 里，缺失则换解释器重执行自身
+    _py = os.environ.get("STORE_PYTHON") or "/mnt/vol-eltaah12/finaagent/.venv/bin/python"
+    # 注意：venv 的 python 通常是指向系统解释器的符号链接，realpath 会判成同一个，
+    # 必须按字面路径比较——venv 生效靠的是 argv[0] 路径而非真实二进制。
+    if os.path.exists(_py) and os.path.abspath(sys.executable) != os.path.abspath(_py):
+        os.execv(_py, [_py, os.path.abspath(__file__), *sys.argv[1:]])
+    raise SystemExit("需要 psycopg2：设 STORE_PYTHON 指向带 psycopg2 的解释器")
+
+import argparse
+import hashlib
+import json
+import re
+import time
+from datetime import date, datetime
+
+DEFAULT_ROOT = "/mnt/vol-eltaah12/workspace/store"
+DEFAULT_WORKSPACE = "/mnt/vol-eltaah12/workspace"
+DEFAULT_ENV = "/mnt/vol-eltaah12/workspace/relay.env"
+KB_ID = "8c0e68ab-a401-432b-aeda-676383b629d0"
+AGENT_ID = "3a38b83e-59e6-4f85-b737-618952038366"
+MODEL_ID = "823c0ae2-f0e5-4f13-bfaa-fcf838f3c606"
+
+# 正式目录里出现即视为违规（备份/临时产物必须进 .archive/ 或 work/）
+BAD_NAME = re.compile(r"(\.bak|\.old|\.tmp|~$|\.swp$)", re.I)
+BAD_CHAR = re.compile(r"[ #%&]")
+
+DDL = [
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+    """CREATE TABLE IF NOT EXISTS store_files(
+      id BIGSERIAL PRIMARY KEY,
+      kind TEXT NOT NULL,
+      path TEXT NOT NULL UNIQUE,
+      fname TEXT NOT NULL,
+      ext TEXT NOT NULL DEFAULT '',
+      domain TEXT NOT NULL DEFAULT '',
+      topic TEXT NOT NULL DEFAULT '',
+      variant TEXT NOT NULL DEFAULT '',
+      fdate TEXT NOT NULL DEFAULT '',
+      period TEXT NOT NULL DEFAULT '',
+      sender_id TEXT NOT NULL DEFAULT '',
+      task_id BIGINT,
+      version INT NOT NULL DEFAULT 1,
+      size BIGINT NOT NULL DEFAULT 0,
+      sha256 TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'raw',
+      source TEXT NOT NULL DEFAULT 'manual',
+      sensitivity TEXT NOT NULL DEFAULT 'internal',
+      authority TEXT NOT NULL DEFAULT 'local',
+      wiki_page_id TEXT NOT NULL DEFAULT '',
+      wiki_tag TEXT NOT NULL DEFAULT '',
+      wiki_status TEXT NOT NULL DEFAULT 'none',
+      wiki_synced_at DOUBLE PRECISION,
+      archived BOOLEAN NOT NULL DEFAULT FALSE,
+      note TEXT NOT NULL DEFAULT '',
+      root TEXT NOT NULL DEFAULT 'store',
+      created_at DOUBLE PRECISION NOT NULL,
+      updated_at DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sf_date ON store_files(fdate)",
+    "CREATE INDEX IF NOT EXISTS idx_sf_sender ON store_files(sender_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sf_task ON store_files(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sf_kd ON store_files(kind,domain)",
+    "CREATE INDEX IF NOT EXISTS idx_sf_sha ON store_files(sha256)",
+    "CREATE INDEX IF NOT EXISTS idx_sf_wiki ON store_files(wiki_status) WHERE wiki_page_id<>''",
+    "CREATE INDEX IF NOT EXISTS idx_sf_topic_trgm ON store_files USING gin(topic gin_trgm_ops)",
+    """CREATE TABLE IF NOT EXISTS store_refs(
+      src_id BIGINT NOT NULL,
+      dst_id BIGINT NOT NULL,
+      rel TEXT NOT NULL DEFAULT 'derived_from',
+      PRIMARY KEY(src_id,dst_id,rel)
+    )""",
+    """CREATE TABLE IF NOT EXISTS store_senders(
+      sender_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'unknown',
+      open_dingtalk_id TEXT NOT NULL DEFAULT '',
+      note TEXT NOT NULL DEFAULT ''
+    )""",
+    """CREATE TABLE IF NOT EXISTS store_domains(
+      domain TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      wiki_tag TEXT NOT NULL DEFAULT '',
+      promote TEXT NOT NULL DEFAULT 'skip',
+      period_fmt TEXT NOT NULL DEFAULT 'YYYY-MM',
+      sensitivity TEXT NOT NULL DEFAULT 'internal'
+    )""",
+    """CREATE TABLE IF NOT EXISTS store_wiki_sync(
+      id BIGSERIAL PRIMARY KEY,
+      file_id BIGINT NOT NULL,
+      action TEXT NOT NULL,
+      wiki_page_id TEXT NOT NULL DEFAULT '',
+      wiki_status TEXT NOT NULL DEFAULT '',
+      detail TEXT NOT NULL DEFAULT '',
+      created_at DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sws_file ON store_wiki_sync(file_id)",
+]
+
+# domain, kind, wiki_tag, promote, period_fmt, sensitivity
+DOMAINS = [
+    ("会议纪要", "report", "会议纪要", "wiki", "YYYY-MM", "internal"),
+    ("市场分析", "report", "经营分析", "wiki", "YYYY-MM", "internal"),
+    ("调价预期", "report", "经营分析", "wiki", "YYYY-MM", "internal"),
+    ("周报", "report", "经营分析", "wiki", "YYYY-Www", "internal"),
+    ("能力清单", "report", "工具运维", "wiki", "YYYY-MM", "internal"),
+    ("自检报告", "report", "工具运维", "skip", "YYYY-MM", "internal"),
+    ("项目进度", "report", "工具运维", "skip", "YYYY-MM", "internal"),
+    ("工作总结", "report", "", "skip", "YYYY-MM", "internal"),
+    ("经营汇报", "report", "", "skip", "YYYY-MM", "sensitive"),
+    ("口径方法论", "knowledge", "口径方法论", "wiki", "", "internal"),
+    ("组织制度", "knowledge", "组织制度", "wiki", "", "internal"),
+    ("工具运维", "knowledge", "工具运维", "wiki", "", "internal"),
+    ("外部资料", "knowledge", "外部资料", "wiki", "", "internal"),
+]
+
+# sender_id, name, role, open_dingtalk_id, note
+SENDERS = [
+    ("20102", "崔成东", "superadmin", "DJiSwuXtsf0KMa6fEkz0vxWVZZG4c4SxTc", "鲁大师分身超管"),
+    ("18434", "王洪彬", "guest", "", ""),
+    ("15369", "刘升健", "guest", "", ""),
+    ("133187", "姜腾飞", "pending", "", "已提交分身授权申请，待崔成东审批"),
+    ("18377", "毕倩", "unknown", "", "二级AI数智化管理担当"),
+    ("37505774", "鲁大师", "bot", "Dazjj0jiPiSPzGlw1N4AwE35MXbrar0TiSCB", "中鲁经营利润运营大脑"),
+    ("1", "马韵升", "blacklist", "", "铁律：绝不发任何钉钉消息"),
+    ("TBD-mazhongjian", "马忠建", "unknown", "", "仅见于 .bak-马忠建-1734，待补 userId"),
+    ("TBD-jinguangchuan", "靳光传", "unknown", "", "relay users 表在册，待补 userId"),
+    ("TBD-bailu", "白露", "unknown", "", "relay users 表在册，待补 userId"),
+    ("TBD-zhonglu", "中鲁运营", "service", "", "relay 服务账号"),
+]
+
+# 目录骨架
+SKELETON = [
+    "data/inbox", "report", "work", "index",
+    "shared/knowledge", "shared/templates", "shared/tools/packages",
+    "shared/mcp", "shared/memory", "shared/skills-proposed",
+    ".archive/bak", ".archive/dup", ".archive/probe", ".archive/data",
+]
+
+# 文件名约定：YYYYMMDD_[senderId_][Ttask_]topic[-variant]_vN.ext
+FNAME = re.compile(
+    r"^(?P<date>\d{8})_(?:(?P<sender>\d+)_)?(?P<task>T\d+)_(?P<topic>.+?)"
+    r"(?:-(?P<variant>[a-z0-9]+))?_v(?P<ver>\d+)\.(?P<ext>[A-Za-z0-9]+)$")
+
+
+def out(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
+
+
+def load_db_url() -> str:
+    url = os.environ.get("RELAY_DB", "").strip()
+    if url:
+        return url
+    p = os.environ.get("STORE_ENV", DEFAULT_ENV)
+    if os.path.isfile(p):
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if line.startswith("RELAY_DB="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    raise SystemExit("找不到 RELAY_DB（环境变量或 relay.env）")
+
+
+def connect():
+    c = psycopg2.connect(load_db_url(), connect_timeout=10,
+                         cursor_factory=psycopg2.extras.RealDictCursor)
+    c.autocommit = True
+    return c
+
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def iso_week(d: date) -> str:
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def parse_fname(fn: str) -> dict:
+    """按命名约定解析文件名；不合约定返回空 dict（存量文件走人工映射表）。"""
+    m = FNAME.match(fn)
+    if not m:
+        return {}
+    g = m.groupdict()
+    ds = g["date"]
+    d = date(int(ds[:4]), int(ds[4:6]), int(ds[6:]))
+    return {"fdate": d.isoformat(), "sender_id": g["sender"] or "",
+            "task_id": int(g["task"][1:]) if g["task"] and g["task"] != "T0" else None,
+            "topic": g["topic"], "variant": g["variant"] or "",
+            "version": int(g["ver"]), "ext": g["ext"]}
+
+
+def infer_kind(rel: str) -> str:
+    top = rel.split("/")[0]
+    return {"data": "data", "report": "report", "work": "work",
+            ".archive": "archive"}.get(top, "shared" if top == "shared" else top)
+
+
+def infer_domain(rel: str, kind: str) -> str:
+    """从路径推域名。只有 report / knowledge 有域层，data 按日期+发送人分层无域。
+
+    兼容两种布局：
+      相对 kind 根（存量盘点 --src shared/reports）：会议纪要/2026-09/x.md
+      相对 store 根（正常扫描）：              report/会议纪要/2026-09/x.md
+    """
+    if kind not in ("report", "knowledge"):
+        return ""
+    parts = [p for p in rel.split("/") if p]
+    if parts and parts[0] in ("report", "data", "work", "shared"):
+        parts = parts[1:]
+    if parts and parts[0] == "knowledge":
+        parts = parts[1:]
+    # 至少要有「域/文件」两段，否则说明文件直接位于 kind 根下，无域层
+    return parts[0] if len(parts) >= 2 else ""
+
+
+def period_of(fdate: str, fmt: str) -> str:
+    if not fdate:
+        return ""
+    d = date.fromisoformat(fdate)
+    return iso_week(d) if fmt == "YYYY-Www" else fdate[:7]
+
+
+def write_today(root: str) -> dict:
+    d = date.today()
+    info = {"date": d.isoformat(), "month": d.strftime("%Y-%m"), "week": iso_week(d),
+            "data_dir": f"data/{d:%Y}/{d:%Y-%m}/{d:%Y-%m-%d}"}
+    ip = os.path.join(root, "index")
+    os.makedirs(ip, exist_ok=True)
+    with open(os.path.join(ip, "today.json"), "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    return info
+
+
+def write_kbmap(root: str, tags: dict | None = None) -> None:
+    ip = os.path.join(root, "index")
+    os.makedirs(ip, exist_ok=True)
+    p = os.path.join(ip, "kb-map.json")
+    cur = {}
+    if os.path.isfile(p):
+        try:
+            cur = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            cur = {}
+    cur.update({"kb_id": KB_ID, "kb_name": "纯Wiki资料知识库", "agent_id": AGENT_ID,
+                "model_id": MODEL_ID,
+                "knowledge_dir_to_tag": {d: t for d, k, t, *_ in DOMAINS if k == "knowledge" and t}})
+    if tags is not None:
+        cur["tags"] = tags
+    cur.setdefault("tags", {})
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------- 子命令
+
+# 加列（幂等）：表已建过的库靠这里补齐，沿用 relay-service/app/db.py 的 information_schema 模式
+ADD_COLUMNS = [("store_files", "root", "TEXT NOT NULL DEFAULT 'store'")]
+
+
+def ensure_columns(cur) -> list[str]:
+    added = []
+    for table, col, decl in ADD_COLUMNS:
+        cur.execute("""SELECT 1 FROM information_schema.columns
+                       WHERE table_schema='public' AND table_name=%s AND column_name=%s""",
+                    (table, col))
+        if not cur.fetchone():
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            added.append(f"{table}.{col}")
+    return added
+
+
+def resolve_base(a, root_name: str) -> str:
+    """DB 里 path 是相对路径，按 root 列决定基准目录。"""
+    return a.workspace if root_name == "workspace" else a.root
+
+
+def cmd_init(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    for ddl in DDL:
+        cur.execute(ddl)
+    added = ensure_columns(cur)
+    for d, k, t, p, pf, s in DOMAINS:
+        cur.execute("""INSERT INTO store_domains(domain,kind,wiki_tag,promote,period_fmt,sensitivity)
+                       VALUES(%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT(domain) DO UPDATE SET kind=EXCLUDED.kind,
+                         wiki_tag=EXCLUDED.wiki_tag, promote=EXCLUDED.promote,
+                         period_fmt=EXCLUDED.period_fmt, sensitivity=EXCLUDED.sensitivity""",
+                    (d, k, t, p, pf, s))
+    for sid, name, role, odid, note in SENDERS:
+        cur.execute("""INSERT INTO store_senders(sender_id,name,role,open_dingtalk_id,note)
+                       VALUES(%s,%s,%s,%s,%s)
+                       ON CONFLICT(sender_id) DO UPDATE SET name=EXCLUDED.name,
+                         role=EXCLUDED.role, open_dingtalk_id=EXCLUDED.open_dingtalk_id,
+                         note=EXCLUDED.note""", (sid, name, role, odid, note))
+    made = []
+    for d in SKELETON:
+        p = os.path.join(a.root, d)
+        if not os.path.isdir(p):
+            os.makedirs(p, exist_ok=True)
+            made.append(d)
+    for dom, k, *_ in DOMAINS:
+        p = os.path.join(a.root, "report" if k == "report" else "shared/knowledge", dom)
+        if not os.path.isdir(p):
+            os.makedirs(p, exist_ok=True)
+            made.append(os.path.relpath(p, a.root))
+    info = write_today(a.root)
+    write_kbmap(a.root)
+    cur.execute("SELECT count(*) n FROM store_files")
+    n = cur.fetchone()["n"]
+    conn.close()
+    out({"ok": True, "db": "zhonglu/public(store_*)", "tables": 5, "extension": "pg_trgm",
+         "columns_added": added,
+         "domains_seeded": len(DOMAINS), "senders_seeded": len(SENDERS),
+         "dirs_created": made, "today": info, "store_files_rows": n})
+
+
+def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
+                domain: str = "", note: str = "", sender_id: str = "",
+                task_id=None, sensitivity: str = "", authority: str = "",
+                wiki_status: str = "", hash_it: bool = True,
+                infer_rel: str = "", root_name: str = "store") -> str:
+    st = os.stat(abspath)
+    fn = os.path.basename(rel)
+    parsed = parse_fname(fn)
+    ext = parsed.get("ext") or (fn.rsplit(".", 1)[-1].lower() if "." in fn else "")
+    fdate = parsed.get("fdate") or ""
+    if not fdate:  # 无日期线索：按 mtime 归日
+        fdate = date.fromtimestamp(st.st_mtime).isoformat()
+    # 域推断必须用「相对扫描源」的路径：存量盘点带 --prefix 时，rel 已含 shared/ 前缀，
+    # 直接推断会把前缀段（reports/knowledge）误当成域名。
+    dom = domain or parsed.get("domain") or infer_domain(infer_rel or rel, kind)
+    cur.execute("SELECT period_fmt,sensitivity FROM store_domains WHERE domain=%s", (dom,))
+    r = cur.fetchone()
+    pf = r["period_fmt"] if r else "YYYY-MM"
+    sens = sensitivity or (r["sensitivity"] if r else "internal")
+    now = time.time()
+    sha = sha256(abspath) if hash_it else ""
+    cur.execute("""INSERT INTO store_files(kind,path,fname,ext,domain,topic,variant,fdate,period,
+                     sender_id,task_id,version,size,sha256,status,sensitivity,authority,
+                     wiki_status,archived,note,root,created_at,updated_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(path) DO UPDATE SET
+                     kind=EXCLUDED.kind, fname=EXCLUDED.fname, ext=EXCLUDED.ext,
+                     domain=EXCLUDED.domain, topic=EXCLUDED.topic, variant=EXCLUDED.variant,
+                     fdate=EXCLUDED.fdate, period=EXCLUDED.period, sender_id=EXCLUDED.sender_id,
+                     task_id=EXCLUDED.task_id, version=EXCLUDED.version, size=EXCLUDED.size,
+                     sha256=EXCLUDED.sha256,
+                     -- 人工标注粘滞：scan 只刷新自动态，不覆盖 stub/junk/archived/done 等判定，
+                     -- 否则重扫一次就把 store set 的结论冲掉。
+                     status=CASE WHEN store_files.status IN ('legacy','indexed','raw')
+                                 THEN EXCLUDED.status ELSE store_files.status END,
+                     sensitivity=EXCLUDED.sensitivity, authority=EXCLUDED.authority,
+                     wiki_status=CASE WHEN store_files.wiki_status NOT IN ('none','')
+                                      THEN store_files.wiki_status ELSE EXCLUDED.wiki_status END,
+                     archived=EXCLUDED.archived, root=EXCLUDED.root,
+                     note=CASE WHEN EXCLUDED.note<>'' THEN EXCLUDED.note ELSE store_files.note END,
+                     updated_at=EXCLUDED.updated_at""",
+                (kind, rel, fn, ext, dom, parsed.get("topic") or "", parsed.get("variant") or "",
+                 fdate, period_of(fdate, pf), parsed.get("sender_id") or sender_id,
+                 parsed.get("task_id", task_id) if parsed else task_id,
+                 parsed.get("version") or 1, st.st_size, sha, status, sens,
+                 authority or ("jingbowiki" if kind == "knowledge" else "local"),
+                 wiki_status or ("skip" if kind == "archive" else "none"),
+                 kind == "archive", note, root_name, now, now))
+    return rel
+
+
+def _walk_rel(base: str):
+    """列出 base 下所有文件的相对路径（不哈希，纯枚举）。"""
+    if not os.path.isdir(base):
+        return
+    for dp, dn, fn in os.walk(base):
+        dn[:] = [d for d in dn if d not in ("__pycache__", ".git")]
+        for f in sorted(fn):
+            p = os.path.join(dp, f)
+            if os.path.isfile(p):
+                yield os.path.relpath(p, base)
+
+
+def walk_files(root: str):
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in ("__pycache__", ".git")]
+        for f in sorted(fn):
+            p = os.path.join(dp, f)
+            if os.path.isfile(p):
+                yield p, os.path.relpath(p, root)
+
+
+def cmd_scan(a) -> None:
+    src = os.path.abspath(a.src or a.root)
+    conn = connect()
+    cur = conn.cursor()
+    n = skip = 0
+    for abspath, rel in walk_files(src):
+        if a.pattern and not re.search(a.pattern, rel):
+            skip += 1
+            continue
+        kind = a.kind or infer_kind(rel)
+        if a.skip_archive and kind == "archive":
+            skip += 1
+            continue
+        # --prefix 用于存量盘点：旧路径带 shared/ 前缀入库，不与迁移后的 store 路径撞 UNIQUE
+        key = f"{a.prefix.rstrip('/')}/{rel}" if a.prefix else rel
+        try:
+            upsert_file(cur, src, abspath, key, kind, a.status, domain=a.domain or "",
+                        infer_rel=rel, root_name=a.root_name)
+            n += 1
+        except OSError as e:
+            print(f"WARN 跳过 {rel}: {e}", file=sys.stderr)
+    write_today(a.root)
+    conn.close()
+    out({"ok": True, "src": src, "prefix": a.prefix or None, "root_name": a.root_name,
+         "indexed": n, "skipped": skip, "status": a.status})
+
+
+def cmd_add(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    p = os.path.abspath(a.path)
+    rel = os.path.relpath(p, a.root) if p.startswith(a.root) else a.rel
+    kind = a.kind or infer_kind(rel)
+    upsert_file(cur, a.root, p, rel, kind, a.status, domain=a.domain or "",
+                note=a.note or "", sender_id=a.sender or "",
+                task_id=a.task, sensitivity=a.sensitivity or "",
+                authority=a.authority or "", wiki_status=a.wiki_status or "")
+    cur.execute("SELECT id,path FROM store_files WHERE path=%s", (rel,))
+    r = cur.fetchone()
+    conn.close()
+    out({"ok": True, "id": r["id"], "path": r["path"]})
+
+
+SETTABLE = ("kind", "domain", "topic", "variant", "fdate", "period", "sender_id",
+            "status", "source", "sensitivity", "authority", "wiki_page_id",
+            "wiki_tag", "wiki_status", "note", "path")
+
+
+def cmd_set(a) -> None:
+    """改台账字段（迁移重映射域、登记 wiki page_id、标注缺口都走这里）。"""
+    sets, params = [], []
+    for f in SETTABLE:
+        v = getattr(a, f, None)
+        if v is not None:
+            sets.append(f"{f}=%s")
+            params.append(v)
+    if a.task_id is not None:
+        sets.append("task_id=%s")
+        params.append(a.task_id or None)
+    if a.archived is not None:
+        sets.append("archived=%s")
+        params.append(a.archived)
+    if not sets:
+        raise SystemExit("没有要改的字段")
+    if any(getattr(a, f, None) for f in ("wiki_page_id", "wiki_status", "wiki_tag")):
+        sets.append("wiki_synced_at=%s")
+        params.append(time.time())
+    sets.append("updated_at=%s")
+    params.append(time.time())
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE store_files SET {', '.join(sets)} WHERE id=%s", (*params, a.id))
+    if cur.rowcount != 1:
+        conn.close()
+        raise SystemExit(f"id={a.id} 不存在（rowcount={cur.rowcount}）")
+    if a.log_wiki:
+        cur.execute("""INSERT INTO store_wiki_sync(file_id,action,wiki_page_id,wiki_status,detail,created_at)
+                       VALUES(%s,%s,%s,%s,%s,%s)""",
+                    (a.id, a.log_wiki, a.wiki_page_id or "", a.wiki_status or "",
+                     a.note or "", time.time()))
+    cur.execute("""SELECT id,path,domain,status,wiki_page_id,wiki_tag,wiki_status,note
+                   FROM store_files WHERE id=%s""", (a.id,))
+    r = dict(cur.fetchone())
+    conn.close()
+    out({"ok": True, "updated": r})
+
+
+def _where(a) -> tuple[str, list]:
+    # 列名一律加 f. 限定：q 会 JOIN store_senders(s) 与 tasks(t)，
+    # sender_id / status 等在三张表里同名，不限定直接 AmbiguousColumn。
+    w, p = [], []
+    for col, val in (("kind", a.kind), ("domain", a.domain), ("status", a.status),
+                     ("wiki_status", a.wiki_status), ("variant", a.variant),
+                     ("sensitivity", a.sensitivity), ("authority", a.authority)):
+        if val:
+            w.append(f"f.{col}=%s")
+            p.append(val)
+    if a.sender:
+        w.append("(f.sender_id=%s OR f.sender_id IN"
+                 " (SELECT sender_id FROM store_senders WHERE name=%s))")
+        p += [a.sender, a.sender]
+    if a.task:
+        w.append("f.task_id=%s")
+        p.append(a.task)
+    if a.topic:
+        w.append("f.topic LIKE %s")
+        p.append(f"%{a.topic}%")
+    if a.path:
+        w.append("f.path LIKE %s")
+        p.append(f"%{a.path}%")
+    if a.since:
+        w.append("f.fdate>=%s")
+        p.append(a.since)
+    if a.until:
+        w.append("f.fdate<=%s")
+        p.append(a.until)
+    if not a.include_archived:
+        w.append("f.archived=FALSE")
+    return (" WHERE " + " AND ".join(w) if w else ""), p
+
+
+def cmd_q(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    clause, params = _where(a)
+    cur.execute(f"""SELECT f.id,f.kind,f.path,f.domain,f.topic,f.variant,f.fdate,f.sender_id,
+                     f.task_id,f.version,f.size,f.status,f.sensitivity,f.authority,
+                     f.wiki_status,f.wiki_page_id,f.note,s.name AS sender_name,
+                     t.status AS task_status
+                    FROM store_files f
+                    LEFT JOIN store_senders s ON s.sender_id=f.sender_id
+                    LEFT JOIN tasks t ON t.id=f.task_id
+                    {clause} ORDER BY f.fdate DESC, f.id DESC LIMIT %s""",
+                (*params, a.limit))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    if a.format == "json":
+        out({"count": len(rows), "rows": rows})
+        return
+    if not rows:
+        print("（无匹配）")
+        return
+    for r in rows:
+        tag = f" wiki={r['wiki_status']}" if r["wiki_page_id"] or r["wiki_status"] not in ("none", "") else ""
+        who = r["sender_name"] or r["sender_id"] or "-"
+        print(f"#{r['id']:<4} {r['fdate']} {r['kind']:<9} {r['domain'] or '-':<8} "
+              f"{who:<6} T{r['task_id'] or 0:<4} {r['status']:<6}{tag}  {r['path']}")
+        if r["note"]:
+            print(f"      note: {r['note']}")
+
+
+def cmd_dup(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""SELECT sha256, count(*) n, array_agg(id ORDER BY id) ids,
+                     array_agg(path ORDER BY id) paths
+                   FROM store_files WHERE sha256<>'' AND archived=FALSE
+                   GROUP BY sha256 HAVING count(*)>1 ORDER BY n DESC""")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    out({"duplicate_groups": len(rows),
+         "wasted_bytes": sum(int(r["n"]) - 1 for r in rows),
+         "groups": rows})
+
+
+def cmd_doctor(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    bases = {"store": os.path.abspath(a.root), "workspace": os.path.abspath(a.workspace)}
+    rep: dict = {"bases": bases}
+
+    cur.execute("SELECT id,path,sha256,root FROM store_files WHERE archived=FALSE")
+    dbrows = {(r["root"], r["path"]): r for r in cur.fetchall()}
+
+    # workspace 侧只盘点已登记的前两级前缀：否则会扫进 venv/models/tasks 等
+    # 十万级无关文件（实测 shared/ 下 venv+models 就有 7.3 万个），orphan 列表直接失真。
+    cur.execute("""SELECT DISTINCT substring(path from '^[^/]+/[^/]+') p
+                   FROM store_files WHERE root='workspace' AND path LIKE %s""", ("%/%",))
+    scopes = sorted({r["p"] for r in cur.fetchall() if r["p"]})
+    rep["workspace_scopes"] = scopes
+
+    disk: set[tuple[str, str]] = set()
+    for rel in _walk_rel(bases["store"]):
+        if rel.startswith("index/"):   # 台账自身（manifest/today/kb-map），不是内容
+            continue
+        disk.add(("store", rel))
+    for sc in scopes:
+        for rel in _walk_rel(os.path.join(bases["workspace"], sc)):
+            disk.add(("workspace", f"{sc}/{rel}"))
+
+    rep["db_rows"] = len(dbrows)
+    rep["disk_files"] = len(disk)
+    rep["orphan_db"] = sorted(f"{r}:{p}" for (r, p) in set(dbrows) - disk)[:50]
+    rep["orphan_disk"] = sorted(f"{r}:{p}" for (r, p) in disk - set(dbrows))[:50]
+
+    bad_name, bad_char = [], []
+    for rn, rel in sorted(disk):
+        if rn == "store" and (rel.startswith(".archive/") or rel.startswith("work/")):
+            continue
+        fn = os.path.basename(rel)
+        if BAD_NAME.search(fn):
+            bad_name.append(f"{rn}:{rel}")
+        if BAD_CHAR.search(fn):
+            bad_char.append(f"{rn}:{rel}")
+    rep["violations"] = {"bak_in_production_dirs": bad_name[:50],
+                         "bad_chars": bad_char[:50], "count": len(bad_name) + len(bad_char)}
+
+    cur.execute("""SELECT sha256,count(*) n,array_agg(path ORDER BY id) paths
+                   FROM store_files WHERE sha256<>'' AND archived=FALSE
+                   GROUP BY sha256 HAVING count(*)>1""")
+    rep["duplicate_sha_groups"] = [dict(r) for r in cur.fetchall()]
+
+    cur.execute("""SELECT id,path,note,status FROM store_files
+                   WHERE status IN ('stub','gap','failed') OR note<>'' ORDER BY id""")
+    rep["gaps"] = [dict(r) for r in cur.fetchall()]
+
+    cur.execute("""SELECT wiki_status,count(*) n FROM store_files
+                   WHERE kind='knowledge' AND archived=FALSE GROUP BY wiki_status ORDER BY n DESC""")
+    rep["wiki_status"] = {r["wiki_status"]: r["n"] for r in cur.fetchall()}
+
+    cur.execute("""SELECT d.domain, count(f.id) n FROM store_domains d
+                   LEFT JOIN store_files f ON f.domain=d.domain AND f.archived=FALSE
+                   GROUP BY d.domain ORDER BY n DESC""")
+    rep["domains"] = {r["domain"]: r["n"] or 0 for r in cur.fetchall()}
+
+    cur.execute("""SELECT kind,count(*) n,COALESCE(sum(size),0) bytes FROM store_files
+                   WHERE archived=FALSE GROUP BY kind ORDER BY n DESC""")
+    rep["by_kind"] = {r["kind"]: {"files": r["n"], "bytes": r["bytes"]} for r in cur.fetchall()}
+
+    conn.close()
+    problems = (len(rep["orphan_db"]) + len(rep["orphan_disk"])
+                + rep["violations"]["count"] + len(rep["duplicate_sha_groups"]))
+    rep["ok"] = problems == 0
+    rep["problem_count"] = problems
+    out(rep)
+
+
+def cmd_export(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM store_files ORDER BY id")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    p = a.out or os.path.join(a.root, "index", "manifest.jsonl")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    out({"ok": True, "path": p, "rows": len(rows),
+         "note": "PG 为权威索引，本文件是降级/审计快照"})
+
+
+def cmd_lineage(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""WITH RECURSIVE down AS (
+                     SELECT src_id,dst_id,rel,1 depth FROM store_refs WHERE src_id=%s
+                   UNION ALL
+                     SELECT r.src_id,r.dst_id,r.rel,d.depth+1 FROM store_refs r
+                       JOIN down d ON r.src_id=d.dst_id WHERE d.depth<8),
+                   up AS (
+                     SELECT src_id,dst_id,rel,1 depth FROM store_refs WHERE dst_id=%s
+                   UNION ALL
+                     SELECT r.src_id,r.dst_id,r.rel,d.depth+1 FROM store_refs r
+                       JOIN up d ON r.dst_id=d.src_id WHERE d.depth<8)
+                   SELECT 'downstream' dir,src_id,dst_id,rel FROM down
+                   UNION ALL SELECT 'upstream',src_id,dst_id,rel FROM up""", (a.id, a.id))
+    edges = [dict(r) for r in cur.fetchall()]
+    ids = {a.id} | {e["src_id"] for e in edges} | {e["dst_id"] for e in edges}
+    cur.execute("SELECT id,path,kind,domain,status FROM store_files WHERE id = ANY(%s)",
+                (list(ids),))
+    nodes = {r["id"]: dict(r) for r in cur.fetchall()}
+    conn.close()
+    out({"root": a.id, "nodes": nodes,
+         "edges": [{"dir": e["dir"], "rel": e["rel"],
+                    "src": nodes.get(e["src_id"], {}).get("path", e["src_id"]),
+                    "dst": nodes.get(e["dst_id"], {}).get("path", e["dst_id"])} for e in edges]})
+
+
+def cmd_link(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("""INSERT INTO store_refs(src_id,dst_id,rel) VALUES(%s,%s,%s)
+                   ON CONFLICT DO NOTHING""", (a.src, a.dst, a.rel))
+    conn.close()
+    out({"ok": True, "src": a.src, "dst": a.dst, "rel": a.rel})
+
+
+def cmd_today(a) -> None:
+    out(write_today(a.root))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="store", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=os.environ.get("STORE_ROOT", DEFAULT_ROOT))
+    ap.add_argument("--workspace",
+                    default=os.environ.get("STORE_WORKSPACE", DEFAULT_WORKSPACE),
+                    help="存量盘点基准根（root='workspace' 的行按此解析）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="建扩展/表/索引 + 目录骨架 + 种子").set_defaults(f=cmd_init)
+
+    p = sub.add_parser("scan", help="扫描入库（按 path 幂等 upsert）")
+    p.add_argument("--src", default="", help="要扫描的目录（默认 store 根）")
+    p.add_argument("--kind", default="")
+    p.add_argument("--domain", default="")
+    p.add_argument("--status", default="indexed")
+    p.add_argument("--pattern", default="")
+    p.add_argument("--prefix", default="", help="入库 path 前缀（存量盘点用，如 shared/data）")
+    p.add_argument("--root-name", dest="root_name", default="store",
+                   choices=("store", "workspace"),
+                   help="path 的基准根：store=新存储根，workspace=存量盘点")
+    p.add_argument("--skip-archive", action="store_true")
+    p.set_defaults(f=cmd_scan)
+
+    p = sub.add_parser("add", help="登记单个文件")
+    p.add_argument("path")
+    p.add_argument("--rel", default="")
+    p.add_argument("--kind", default="")
+    p.add_argument("--domain", default="")
+    p.add_argument("--status", default="indexed")
+    p.add_argument("--sender", default="")
+    p.add_argument("--task", type=int, default=None)
+    p.add_argument("--sensitivity", default="")
+    p.add_argument("--authority", default="")
+    p.add_argument("--wiki-status", default="")
+    p.add_argument("--note", default="")
+    p.set_defaults(f=cmd_add)
+
+    p = sub.add_parser("set", help="改台账字段（迁移重映射/登记 wiki/标注缺口）")
+    p.add_argument("id", type=int)
+    for _f in SETTABLE:
+        p.add_argument("--" + _f.replace("_", "-"), dest=_f, default=None)
+    p.add_argument("--task-id", dest="task_id", type=int, default=None)
+    p.add_argument("--archived", dest="archived", default=None,
+                   type=lambda s: s.lower() in ("1", "true", "yes"))
+    p.add_argument("--log-wiki", dest="log_wiki", default="",
+                   help="同时写 store_wiki_sync 流水：push|verify|pull|tag|skip")
+    p.set_defaults(f=cmd_set)
+
+    p = sub.add_parser("q", help="查询")
+    for k in ("kind", "domain", "status", "wiki_status", "variant", "sensitivity",
+              "authority", "sender", "topic", "path", "since", "until"):
+        p.add_argument(f"--{k.replace('_','-')}", dest=k, default="")
+    p.add_argument("--task", type=int, default=None)
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--include-archived", action="store_true")
+    p.add_argument("--format", default="table", choices=("table", "json"))
+    p.set_defaults(f=cmd_q)
+
+    sub.add_parser("dup", help="sha256 重复检测").set_defaults(f=cmd_dup)
+    sub.add_parser("doctor", help="DB↔磁盘对账 + 命名违规 + 缺口").set_defaults(f=cmd_doctor)
+
+    p = sub.add_parser("export", help="PG → index/manifest.jsonl")
+    p.add_argument("--out", default="")
+    p.set_defaults(f=cmd_export)
+
+    p = sub.add_parser("lineage", help="血缘树")
+    p.add_argument("id", type=int)
+    p.set_defaults(f=cmd_lineage)
+
+    p = sub.add_parser("link", help="登记血缘边")
+    p.add_argument("src", type=int)
+    p.add_argument("dst", type=int)
+    p.add_argument("--rel", default="derived_from")
+    p.set_defaults(f=cmd_link)
+
+    sub.add_parser("today", help="刷新并输出 index/today.json").set_defaults(f=cmd_today)
+
+    a = ap.parse_args()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
