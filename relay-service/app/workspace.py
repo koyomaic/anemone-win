@@ -8,16 +8,20 @@ import shutil
 import time
 
 SKIP_DIRS = {".baseline", ".result", "home", "data", ".git", "node_modules", "__pycache__",
-             "venv", ".venv", "models", ".archive"}
+             "venv", ".venv", "models", ".archive",
+             # store 台账与任务中间态：由 store CLI 而非任务写入，纳入基线会把
+             # manifest.jsonl 的正常刷新误判成任务产出（进而误报冲突）
+             "index", "work"}
 
 
 def is_runtime_dir(dirpath: str, name: str) -> bool:
-    """目录是否属运行时环境（虚拟环境、模型缓存、归档），不应纳入基线快照。
+    """目录是否属运行时环境或非任务产出区，不应纳入基线快照。
 
-    这类目录动辄数万文件/数 GB，逐文件 sha256 会让 prepare() 空耗：实测 shared/
-    下 venv+venv_funasr+models 共 5.2 万文件、10.5G，快照 ~76s，而业务文件仅 2300 个。
-    它们也永远不是任务产出。pyvenv.cfg 是虚拟环境的确定标记，据此泛化识别，
-    避免把站点特有的 venv 目录名硬编码进机队共用的仓库。
+    覆盖三类：虚拟环境/模型缓存（动辄数万文件、数 GB，逐文件 sha256 会让 prepare()
+    空耗——实测 shared/ 下 venv+venv_funasr+models 共 5.2 万文件、10.5G，快照 ~76s，
+    而业务文件仅 2300 个）；归档与台账/中间态（由 store CLI 而非任务写入）。
+    pyvenv.cfg 是虚拟环境的确定标记，据此泛化识别，避免把站点特有的 venv 目录名
+    硬编码进机队共用的仓库。
     """
     if name in SKIP_DIRS:
         return True

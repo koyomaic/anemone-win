@@ -43,16 +43,19 @@ def test_is_volatile_matches_tool_caches():
 
 
 def test_snap_skips_runtime_dirs(tmp_path):
-    """虚拟环境/模型缓存/归档不进基线快照，否则每任务要哈希数万无关文件（实测 ~76s）。"""
+    """虚拟环境/模型缓存/归档/台账不进基线快照，否则每任务要哈希数万无关文件（实测 ~76s）。"""
     _write(tmp_path, "shared/knowledge/调价.md", "口径")
-    _write(tmp_path, "shared/reports/日报.md", "产出")
+    _write(tmp_path, "shared/report/日报.md", "产出")
     _write(tmp_path, "shared/venv/bin/python", "#!/x")
     _write(tmp_path, "shared/venv_funasr/pyvenv.cfg", "home = /usr")
     _write(tmp_path, "shared/venv_funasr/lib/site.py", "y")
     _write(tmp_path, "shared/models/modelscope/m.bin", "weights")
     _write(tmp_path, "shared/.archive/bak/a.md.bak-x", "old")
+    # index/ 由 store CLI 刷新，若进基线会把 manifest 更新误判成任务产出
+    _write(tmp_path, "shared/index/manifest.jsonl", "{}")
+    _write(tmp_path, "shared/work/T1/scratch.tmp", "x")
     snap = _snap(str(tmp_path / "shared"), str(tmp_path))
-    assert sorted(snap) == ["shared/knowledge/调价.md", "shared/reports/日报.md"]
+    assert sorted(snap) == ["shared/knowledge/调价.md", "shared/report/日报.md"]
 
 
 def test_is_runtime_dir_detects_venv_by_marker(tmp_path):
@@ -65,8 +68,11 @@ def test_is_runtime_dir_detects_venv_by_marker(tmp_path):
     assert is_runtime_dir(root, "venv")
     assert is_runtime_dir(root, "models")
     assert is_runtime_dir(root, ".archive")
+    assert is_runtime_dir(root, "index")
+    assert is_runtime_dir(root, "work")
     assert not is_runtime_dir(root, "venture-notes")
     assert not is_runtime_dir(root, "knowledge")
+    assert not is_runtime_dir(root, "report")
 
 
 def test_scan_excludes_volatile_from_changed_files(tmp_path):
