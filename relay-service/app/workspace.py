@@ -162,14 +162,38 @@ class Workspace:
         return {"created": created, "modified": modified, "deleted": deleted,
                 "all": all_changed, "volatile": volatile}
 
-    def backup_version(self, other_task: dict, rel_file: str) -> str | None:
-        """把 other_task 产出的 rel_file 版本备份为 <文件>.bak-<用户>-HHMM，绝不静默覆盖。"""
+    def _in_runtime_dir(self, rel_file: str) -> bool:
+        """rel_file 的任一目录段是否属运行时/非任务产出区（虚拟环境、模型缓存、台账等）。"""
+        parts = [p for p in rel_file.replace(os.sep, "/").split("/") if p]
+        acc = self.cfg.workspace_root
+        for p in parts[:-1]:  # 最后一段是文件名，只判目录段
+            if is_runtime_dir(acc, p):
+                return True
+            acc = os.path.join(acc, p)
+        return False
+
+    def backup_version(self, other_task: dict, rel_file: str) -> tuple[str, str]:
+        """把 other_task 产出的 rel_file 版本备份为 <文件>.bak-<用户>-HHMM，绝不静默覆盖。
+
+        返回 (备份路径, 跳过原因)；路径为空即未备份，原因写进 conflicts 供人核查。
+        两道护栏——历史事故：无上限的 copy2 让一个声明宽 target 的任务把 venv/models
+        整棵树备份成 18972 个 .bak、4.92G（单个 model.bin.bak 1.5G，还拷了两份）：
+          1. 单文件超过 cfg.backup_max_mb 不拷（RELAY_BACKUP_MAX_MB 可调）
+          2. 位于运行时目录（venv/models/.archive/index/work/data 等）不拷
+        """
         src = os.path.join(other_task["workdir"], ".result", rel_file)
         if not os.path.isfile(src):
-            return None
+            return "", ""
+        limit = self.cfg.backup_max_mb * 1024 * 1024
+        size = os.path.getsize(src)
+        if size > limit:
+            return "", (f"文件 {size / 2 ** 20:.0f}MB 超过备份上限 "
+                        f"{self.cfg.backup_max_mb:g}MB，已跳过拷贝，需人工核查")
+        if self._in_runtime_dir(rel_file):
+            return "", "位于运行时目录（虚拟环境/模型缓存/台账等），不参与冲突备份"
         dst_file = os.path.join(self.cfg.workspace_root, rel_file)
         os.makedirs(os.path.dirname(dst_file), exist_ok=True)
         hm = time.strftime("%H%M", time.localtime(other_task["finished_at"] or time.time()))
         dst = f"{dst_file}.bak-{other_task['user']}-{hm}"
         shutil.copy2(src, dst)
-        return dst
+        return dst, ""

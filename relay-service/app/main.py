@@ -657,9 +657,14 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                     "note": f"两个任务在 {win_h:g}h 时间窗内都改动了同一文件",
                 }
                 if other.get("finished_at") and other["finished_at"] < finished_at:
-                    entry["backup"] = ws.backup_version(other, rel) or ""
-                    entry["note"] = (f"任务 #{other['id']}（{other['user']}）先完成，"
-                                     f"其版本已备份，磁盘保留后写入版本")
+                    bak, why = ws.backup_version(other, rel)
+                    entry["backup"] = bak
+                    if bak:
+                        entry["note"] = (f"任务 #{other['id']}（{other['user']}）先完成，"
+                                         f"其版本已备份，磁盘保留后写入版本")
+                    else:
+                        entry["note"] = (f"任务 #{other['id']}（{other['user']}）先完成，未备份"
+                                         f"（{why or '源版本已不在 .result 中'}）")
                 else:
                     entry["note"] = f"任务 #{other['id']}（{other['user']}）同时段也在改动该文件，完成时将互相备份"
                 if not any(c["with_task"] == other["id"] and c["file"] == rel for c in conflicts):

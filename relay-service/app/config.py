@@ -106,6 +106,9 @@ class Settings:
     cleanup_runtime: bool = True  # 任务终态后自动清理 workdir 临时目录（home/data）；置 0 关闭
     shared_venv: str = ""         # 任务级共享 venv（默认 shared_dir/venv）；bin 前置进任务 PATH，
     #                               pip install 落这里——沙箱下系统/服务 venv 只读，安装能力保留但碰不到中转运行时
+    backup_max_mb: float = 50.0   # 冲突备份的单文件体积上限；超过则只记 conflicts 不拷贝。
+    #                               历史事故：无上限的 copy2 让一个宽 target 任务把 venv/models 整棵树
+    #                               备份成 18972 个 .bak、4.92G（单个 model.bin.bak 1.5G 还拷了两份）
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -141,4 +144,5 @@ class Settings:
             cleanup_runtime=os.environ.get("RELAY_CLEANUP_RUNTIME", "1").strip().lower()
             in ("1", "true", "on", "yes"),
             shared_venv=os.environ.get("RELAY_SHARED_VENV", "").strip(),
+            backup_max_mb=float(os.environ.get("RELAY_BACKUP_MAX_MB", "50")),
         )

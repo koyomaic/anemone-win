@@ -150,6 +150,45 @@ def _fake_relay(relay_factory, tmp_path, **overrides) -> dict:
     return relay_factory(agent_bin=str(script), task_timeout=60, **overrides)
 
 
+def test_backup_version_skips_oversize_and_runtime(tmp_path):
+    """护栏：超大文件与运行时目录不备份。
+
+    历史事故——backup_version 无上限 copy2，一个声明宽 target 的任务把 venv/models
+    整棵树备份成 18972 个 .bak、4.92G（单个 model.bin.bak 1.5G 还拷了两份）。
+    """
+    cfg = _cfg(tmp_path, backup_max_mb=1)
+    ws = Workspace(cfg, DB(cfg.db_path))
+    other = {"id": 9, "workdir": str(tmp_path / "tasks" / "9"),
+             "user": "崔成东", "finished_at": time.time()}
+
+    # 1) 小文件 + 业务目录 → 正常备份
+    _write(tmp_path, "tasks/9/.result/shared/report/a.md", "v1")
+    p, why = ws.backup_version(other, "shared/report/a.md")
+    assert p and why == "" and os.path.isfile(p)
+
+    # 2) 超过 backup_max_mb → 跳过并给出原因
+    big = tmp_path / "tasks/9/.result/shared/report/big.bin"
+    big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_bytes(b"\0" * (2 * 1024 * 1024))
+    p, why = ws.backup_version(other, "shared/report/big.bin")
+    assert p == "" and "超过备份上限" in why
+
+    # 3) 运行时目录（SKIP_DIRS 名单）→ 跳过
+    for rel in ("shared/venv/lib/x.py", "shared/models/m.bin", "shared/.archive/bak/o.md"):
+        _write(tmp_path, f"tasks/9/.result/{rel}", "y")
+        p, why = ws.backup_version(other, rel)
+        assert p == "" and "运行时目录" in why, rel
+
+    # 4) 任意名字的虚拟环境（靠 pyvenv.cfg 标记识别）→ 跳过
+    _write(tmp_path, "shared/asr_env/pyvenv.cfg", "home = /usr")
+    _write(tmp_path, "tasks/9/.result/shared/asr_env/lib/x.py", "y")
+    p, why = ws.backup_version(other, "shared/asr_env/lib/x.py")
+    assert p == "" and "运行时目录" in why
+
+    # 5) 源不存在 → 空路径空原因（调用方据此写"源版本已不在 .result 中"）
+    assert ws.backup_version(other, "shared/report/nope.md") == ("", "")
+
+
 def test_volatile_rewrite_never_conflicts(relay_factory, tmp_path):
     """线上误报复现：连续多个任务调用 dws，凭据缓存每次被重写 → 全部 done，不判冲突。"""
     r = _fake_relay(relay_factory, tmp_path)
