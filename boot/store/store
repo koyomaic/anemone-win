@@ -499,7 +499,8 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
                 domain: str = "", note: str = "", sender_id: str = "",
                 task_id=None, sensitivity: str = "", authority: str = "",
                 wiki_status: str = "", hash_it: bool = True,
-                infer_rel: str = "", root_name: str = "store") -> str:
+                infer_rel: str = "", root_name: str = "store",
+                wiki_tag: str = "") -> str:
     st = os.stat(abspath)
     fn = os.path.basename(rel)
     parsed = parse_fname(fn)
@@ -518,8 +519,8 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
     sha = sha256(abspath) if hash_it else ""
     cur.execute("""INSERT INTO store_files(kind,path,fname,ext,domain,topic,variant,fdate,period,
                      sender_id,task_id,version,size,sha256,status,sensitivity,authority,
-                     wiki_status,archived,note,root,created_at,updated_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     wiki_tag,wiki_status,archived,note,root,created_at,updated_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT(path) DO UPDATE SET
                      kind=EXCLUDED.kind, fname=EXCLUDED.fname, ext=EXCLUDED.ext,
                      -- 推断为空时保留既有值：存量文件名不合约定，scan 推不出域/主题/发送人，
@@ -537,9 +538,10 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
                      status=CASE WHEN store_files.status IN ('legacy','indexed','raw')
                                  THEN EXCLUDED.status ELSE store_files.status END,
                      sensitivity=COALESCE(NULLIF(EXCLUDED.sensitivity,''), store_files.sensitivity),
-                     authority=EXCLUDED.authority,
-                     wiki_status=CASE WHEN store_files.wiki_status NOT IN ('none','')
-                                      THEN store_files.wiki_status ELSE EXCLUDED.wiki_status END,
+                      authority=EXCLUDED.authority,
+                      wiki_tag=COALESCE(NULLIF(EXCLUDED.wiki_tag,''), store_files.wiki_tag),
+                      wiki_status=CASE WHEN store_files.wiki_status NOT IN ('none','')
+                                       THEN store_files.wiki_status ELSE EXCLUDED.wiki_status END,
                      archived=EXCLUDED.archived, root=EXCLUDED.root,
                      note=CASE WHEN EXCLUDED.note<>'' THEN EXCLUDED.note ELSE store_files.note END,
                      updated_at=EXCLUDED.updated_at""",
@@ -547,9 +549,10 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
                  fdate, period_of(fdate, pf), parsed.get("sender_id") or sender_id,
                  parsed.get("task_id", task_id) if parsed else task_id,
                  parsed.get("version") or 1, st.st_size, sha, status, sens,
-                 authority or ("jingbowiki" if kind == "knowledge" else "local"),
-                 wiki_status or ("skip" if kind == "archive" else "none"),
-                 kind == "archive", note, root_name, now, now))
+                  authority or ("jingbowiki" if kind == "knowledge" else "local"),
+                  wiki_tag or (dom if kind == "knowledge" else ""),
+                  wiki_status or ("skip" if kind == "archive" else "none"),
+                  kind == "archive", note, root_name, now, now))
     return rel
 
 
@@ -633,7 +636,8 @@ def cmd_add(a) -> None:
     upsert_file(cur, a.root, p, rel, kind, a.status, domain=a.domain or "",
                 note=a.note or "", sender_id=a.sender or "",
                 task_id=a.task, sensitivity=a.sensitivity or "",
-                authority=a.authority or "", wiki_status=a.wiki_status or "")
+                authority=a.authority or "", wiki_status=a.wiki_status or "",
+                wiki_tag=a.wiki_tag or "")
     cur.execute("SELECT id,path FROM store_files WHERE path=%s", (rel,))
     r = cur.fetchone()
     conn.close()
@@ -1165,6 +1169,8 @@ def main() -> None:
     p.add_argument("--task", type=int, default=None)
     p.add_argument("--sensitivity", default="")
     p.add_argument("--authority", default="")
+    p.add_argument("--wiki-tag", dest="wiki_tag", default="",
+                   help="jingboWiki 标签名（knowledge 类缺省取 domain）")
     p.add_argument("--wiki-status", default="")
     p.add_argument("--note", default="")
     p.set_defaults(f=cmd_add)
