@@ -7,7 +7,7 @@ import httpx
 
 from app.config import DEFAULT_VOLATILE_PATTERNS, Settings
 from app.db import DB
-from app.workspace import Workspace, is_volatile
+from app.workspace import Workspace, _snap, is_runtime_dir, is_volatile
 from conftest import submit, wait_task
 
 DWS_TOKEN = "shared/secrets/dws-cli-seed/dws-cli/auth-token_test.enc"
@@ -40,6 +40,33 @@ def test_is_volatile_matches_tool_caches():
     assert is_volatile("shared/reports/a.md.bak-崔成东-1212", pats)
     assert not is_volatile("shared/knowledge/调价.md", pats)
     assert not is_volatile("shared/reports/日报.md", pats)
+
+
+def test_snap_skips_runtime_dirs(tmp_path):
+    """虚拟环境/模型缓存/归档不进基线快照，否则每任务要哈希数万无关文件（实测 ~76s）。"""
+    _write(tmp_path, "shared/knowledge/调价.md", "口径")
+    _write(tmp_path, "shared/reports/日报.md", "产出")
+    _write(tmp_path, "shared/venv/bin/python", "#!/x")
+    _write(tmp_path, "shared/venv_funasr/pyvenv.cfg", "home = /usr")
+    _write(tmp_path, "shared/venv_funasr/lib/site.py", "y")
+    _write(tmp_path, "shared/models/modelscope/m.bin", "weights")
+    _write(tmp_path, "shared/.archive/bak/a.md.bak-x", "old")
+    snap = _snap(str(tmp_path / "shared"), str(tmp_path))
+    assert sorted(snap) == ["shared/knowledge/调价.md", "shared/reports/日报.md"]
+
+
+def test_is_runtime_dir_detects_venv_by_marker(tmp_path):
+    """按 pyvenv.cfg 泛化识别虚拟环境，不依赖站点特有的目录名。"""
+    _write(tmp_path, "shared/asr_env_2026/pyvenv.cfg", "home = /usr")
+    _write(tmp_path, "shared/asr_env_2026/bin/python", "#!/x")
+    _write(tmp_path, "shared/venture-notes/a.md", "业务")
+    root = str(tmp_path / "shared")
+    assert is_runtime_dir(root, "asr_env_2026")
+    assert is_runtime_dir(root, "venv")
+    assert is_runtime_dir(root, "models")
+    assert is_runtime_dir(root, ".archive")
+    assert not is_runtime_dir(root, "venture-notes")
+    assert not is_runtime_dir(root, "knowledge")
 
 
 def test_scan_excludes_volatile_from_changed_files(tmp_path):

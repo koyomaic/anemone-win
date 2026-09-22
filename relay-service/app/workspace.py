@@ -7,7 +7,21 @@ import os
 import shutil
 import time
 
-SKIP_DIRS = {".baseline", ".result", "home", "data", ".git", "node_modules", "__pycache__"}
+SKIP_DIRS = {".baseline", ".result", "home", "data", ".git", "node_modules", "__pycache__",
+             "venv", ".venv", "models", ".archive"}
+
+
+def is_runtime_dir(dirpath: str, name: str) -> bool:
+    """目录是否属运行时环境（虚拟环境、模型缓存、归档），不应纳入基线快照。
+
+    这类目录动辄数万文件/数 GB，逐文件 sha256 会让 prepare() 空耗：实测 shared/
+    下 venv+venv_funasr+models 共 5.2 万文件、10.5G，快照 ~76s，而业务文件仅 2300 个。
+    它们也永远不是任务产出。pyvenv.cfg 是虚拟环境的确定标记，据此泛化识别，
+    避免把站点特有的 venv 目录名硬编码进机队共用的仓库。
+    """
+    if name in SKIP_DIRS:
+        return True
+    return os.path.isfile(os.path.join(dirpath, name, "pyvenv.cfg"))
 
 
 def is_volatile(rel: str, patterns: list[str]) -> bool:
@@ -32,7 +46,7 @@ def _snap(root: str, base: str) -> dict[str, tuple[int, int, str]]:
     if not os.path.isdir(root):
         return out
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if not is_runtime_dir(dirpath, d)]
         for fn in filenames:
             p = os.path.join(dirpath, fn)
             rel = os.path.relpath(p, base)
