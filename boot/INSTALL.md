@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 24b | 基础技能：仅仓库 `skills/` 内人为标记入库的（机队共享，git 为真源），逐文件比对安装位同名技能（安装位由技能内 `.dest` 指定：钉钉套件→`/root/.agents/skills`、dws→`/opt/team/skills`，缺省 `shared/skills/`） | 缺失/漂移 → 本地旧版备份 `*.bak-provision-*` 后同步仓库版；未入库的本地/实验技能不碰 | 软 |
 | 24c | opencode 全局语境 `/root/.config/opencode/AGENTS.md`（模板 `boot/opencode-global-AGENTS.md`，git 为真源；所有会话默认加载 GitHub 项目指向等语境） | 缺失/漂移 → 备份后同步模板 | 软 |
 | 24d | team-agent-relay 安装位 `ca.pem`（公开 CA 证书，不入 git；统一从 `RELAY_CA_SRC`（缺省 `127.0.0.1:8788`，即所在服务器本机 TLS 链）TLS 链提取，自签校验后写入） | 缺失/漂移 → 备份后提取写入；源不可达且已有现存 → 沿用 | 软 |
-| 24e | store 台账 CLI（`boot/store/store`，业务存储统一索引）：装 `/opt/team/store/store` + 软链 `/usr/local/bin/store`；建目录骨架与 `index/` 配置（纯文件系统、幂等）；`store ping` 探活 DB 与 5 张 `store_*` 表。**建表（`store init`）属有副作用操作，install 不自动执行**，首次需人工跑 | CLI 同步 / 骨架自建 / 探活仅报告 | 软 |
+| 24e | store 台账 CLI（`boot/store/store`，业务存储统一索引）：装 `/opt/team/store/store` + 软链 `/usr/local/bin/store`；建目录骨架与 `index/` 配置（纯文件系统、幂等）；`store ping` 探活 DB 与 5 张 `store_*` 表。**建表（`store init`）属有副作用操作，install 不自动执行**，首次需人工跑 | CLI 同步 / 骨架自建 / 探活：缺表 WARN、**DB 不可达 FAIL（触发钉钉预警）** | 软（DB 不可达时硬） |
 | 25-26 | claude-proxy / relay-tls-proxy | 缺则装（tls 仅证书存在时） | 软 |
 | 27 | 首装引导（无现役 release → boot.sh boot 完整部署） | 自动 | 硬 |
 | 28 | relay active+healthy | enable/start/restart | 硬 |
@@ -110,6 +110,22 @@ store ping      # 探活：DB 可连且 5 张表在（缺表退出码 1）
 ```
 
 `init` 会建表，属有副作用操作，所以 install 模式只同步 CLI、建目录骨架、跑 `ping` 探活；表缺失时 WARN 并提示人工执行。需要 `RELAY_DB` 指向的库有建表权限（`pg_trgm` 需 superuser 或对该库有 CREATE）。
+
+**任务侧连库（最小权限角色）**：任务环境拿不到 `RELAY_DB`（`executor._scrubbed_environ` 滤掉 `RELAY_*` 前缀），也读不到 `relay.env`（`relay.service` 的 `InaccessiblePaths` 物理屏蔽），所以 `store init` 会另建 PG 角色 `store_task` 并把连接串写进 `index/store-task.env`（644，任务可读）。CLI 的解析顺序是 `RELAY_DB` env → `relay.env` → `STORE_DB` env → `index/store-task.env`，宿主自动走全权限、任务自动降到最小权限，同一条命令两边都能用。
+
+授权范围（`GRANTS` 常量）：
+
+| 对象 | 权限 |
+|---|---|
+| `store_files` / `store_refs` / `store_wiki_sync` | SELECT, INSERT, UPDATE |
+| `store_senders` / `store_domains` | SELECT |
+| `tasks` | **仅 `id`, `status` 两列**（列级授权，供 `store q --task` 的 JOIN） |
+| `users` / `devices` | **REVOKE ALL**（成员 token 与设备密钥不可见） |
+| DDL / DELETE / TRUNCATE | 无 |
+
+另设 `statement_timeout=60s` 防跑飞。密码默认不轮换（避免打断在途任务），需要时 `store init --rotate-task-role`。台账允许任务写，但 `store doctor` 以磁盘为准对账，篡改可被发现。
+
+**探活与预警**：`store ping` 退出码 `0`=正常、`1`=连上了但缺表（首次未 init，provision 记 WARN）、`2`=**DB 不可达**（relay 依赖同一个库，通常意味着服务已瘫，provision 记 FAIL → `boot.sh` 走 `notify_failure` 钉钉预警 `ALERT_TO`）。
 
 **日常用法**（约定详见 workspace `AGENTS.md`「共享区约定」）：
 

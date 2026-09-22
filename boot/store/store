@@ -187,18 +187,48 @@ def out(obj) -> None:
 
 
 def load_db_url() -> str:
+    """DB 连接串解析顺序（宿主＝全权限，任务＝最小权限，自动选择）：
+
+    1. `RELAY_DB` 环境变量        —— 宿主 shell / provision
+    2. `relay.env` 里的 RELAY_DB  —— 宿主默认；任务侧该文件被 relay.service 的
+                                    InaccessiblePaths 物理屏蔽，读不到
+    3. `STORE_DB` 环境变量        —— 显式指定
+    4. `index/store-task.env`     —— 任务侧唯一可用路径：store init 生成的最小权限
+                                    角色（只授 store_* 表 + tasks 的 id/status 两列），
+                                    拿不到 users/devices 里的 token 与设备密钥
+
+    任务环境里 RELAY_* 被 executor._scrubbed_environ 整体滤掉，故 1、2 必然落空，
+    自动降到 4；宿主侧 1/2 命中，init 建角色/建扩展需要的超级用户权限也就有了。
+    """
     url = os.environ.get("RELAY_DB", "").strip()
     if url:
         return url
     p = os.environ.get("STORE_ENV", DEFAULT_ENV)
     if os.path.isfile(p):
-        for line in open(p, encoding="utf-8"):
+        try:
+            for line in open(p, encoding="utf-8"):
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if line.startswith("RELAY_DB="):
+                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if v:
+                        return v
+        except OSError:
+            pass  # 任务侧 relay.env 不可见，属预期，继续降级
+    url = os.environ.get("STORE_DB", "").strip()
+    if url:
+        return url
+    task_env = os.path.join(os.environ.get("STORE_ROOT", DEFAULT_ROOT), "index", "store-task.env")
+    if os.path.isfile(task_env):
+        for line in open(task_env, encoding="utf-8"):
             line = line.strip()
-            if line.startswith("export "):
-                line = line[7:].strip()
-            if line.startswith("RELAY_DB="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    raise SystemExit("找不到 RELAY_DB（环境变量或 relay.env）")
+            if line.startswith("STORE_DB="):
+                v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if v:
+                    return v
+    raise SystemExit("找不到 DB 连接串：宿主需 RELAY_DB（或 relay.env），任务需 index/store-task.env"
+                     "（由 store init 生成）")
 
 
 def connect():
@@ -349,17 +379,69 @@ def cmd_skeleton(a) -> None:
          "note": "仅建目录与 index 配置，未触碰数据库"})
 
 
+TASK_ROLE = "store_task"
+
+# 任务侧最小权限：只给 store_* 表与 tasks 的 id/status 两列。
+# users/devices（成员 token 与设备密钥）明确不授权，REVOKE 兜底防默认权限泄漏。
+# 台账允许任务写（add/set），但 doctor 以磁盘为准对账，篡改可被发现。
+GRANTS = [
+    "GRANT USAGE ON SCHEMA public TO store_task",
+    "GRANT SELECT, INSERT, UPDATE ON store_files, store_refs, store_wiki_sync TO store_task",
+    "GRANT SELECT ON store_senders, store_domains TO store_task",
+    "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO store_task",
+    "GRANT SELECT (id, status) ON tasks TO store_task",
+    "REVOKE ALL ON users, devices FROM store_task",
+]
+
+
+def ensure_task_role(cur, root: str, rotate: bool = False) -> dict:
+    """建/更新任务侧最小权限角色，连接串写进 index/store-task.env（任务可读）。
+
+    任务环境拿不到 RELAY_DB（executor 滤掉 RELAY_* 前缀）也读不到 relay.env
+    （relay.service 的 InaccessiblePaths 物理屏蔽），所以必须有一条独立的、
+    权限受限的连库路径，否则 store 在任务内完全不可用。
+    """
+    import secrets as _sec
+    from urllib.parse import urlparse, quote
+
+    u = urlparse(load_db_url())
+    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (TASK_ROLE,))
+    existed = bool(cur.fetchone())
+    env_p = os.path.join(root, "index", "store-task.env")
+    # 已有角色且凭据文件在 → 不轮换密码，避免打断在途任务；--rotate-task-role 强制轮换
+    if existed and os.path.isfile(env_p) and not rotate:
+        pw = None
+    else:
+        pw = _sec.token_urlsafe(24)
+        cur.execute((f"ALTER ROLE {TASK_ROLE} WITH LOGIN PASSWORD %s" if existed
+                     else f"CREATE ROLE {TASK_ROLE} WITH LOGIN PASSWORD %s"), (pw,))
+    cur.execute(f"ALTER ROLE {TASK_ROLE} SET statement_timeout = '60s'")
+    for g in GRANTS:
+        cur.execute(g)
+    if pw:
+        netloc = f"{TASK_ROLE}:{quote(pw, safe='')}@{u.hostname}" + (f":{u.port}" if u.port else "")
+        os.makedirs(os.path.dirname(env_p), exist_ok=True)
+        with open(env_p, "w", encoding="utf-8") as f:
+            f.write("# store 任务侧最小权限连接串（store init 生成；勿手改、勿外发、勿入 git）\n"
+                    "# 权限边界靠 PG 角色授权（只 store_* 表 + tasks 的 id/status 两列），不靠文件模式\n"
+                    f"STORE_DB=postgresql://{netloc}{u.path}\n")
+        os.chmod(env_p, 0o644)  # 任务需可读
+    return {"role": TASK_ROLE, "created": not existed, "password_rotated": bool(pw),
+            "env": env_p if pw else "(沿用现有)"}
+
+
 def cmd_ping(a) -> None:
     """探活：DB 可连 + 5 张表在 + 台账行数。供 provision 检查项用，绝不建表。
 
-    ok=False 时退出码 1，便于 shell 直接判断。
+    退出码：0=正常；1=连上了但缺表（首次需 store init）；2=DB 不可达（relay 本身也已瘫，
+    属需要钉钉预警的故障）。provision 据此区分 WARN 与 FAIL。
     """
     try:
         conn = connect()
     except Exception as e:
         out({"ok": False, "stage": "connect", "error": str(e).splitlines()[0],
-             "hint": "RELAY_DB 不可达或缺失"})
-        sys.exit(1)
+             "hint": "DB 不可达或凭据缺失——relay 依赖同一个库，通常意味着服务已瘫，需预警"})
+        sys.exit(2)
     cur = conn.cursor()
     missing = []
     for t in ("store_files", "store_refs", "store_senders", "store_domains", "store_wiki_sync"):
@@ -367,13 +449,15 @@ def cmd_ping(a) -> None:
                        WHERE table_schema='public' AND table_name=%s""", (t,))
         if not cur.fetchone():
             missing.append(t)
-    n = None
+    n = role_ok = None
     if not missing:
         cur.execute("SELECT count(*) n FROM store_files")
         n = cur.fetchone()["n"]
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (TASK_ROLE,))
+        role_ok = bool(cur.fetchone())
     conn.close()
     out({"ok": not missing, "missing_tables": missing, "store_files_rows": n,
-         "root": a.root,
+         "task_role": TASK_ROLE if role_ok else None, "root": a.root,
          "hint": "" if not missing else "首次需人工执行: store init（会建表，属有副作用操作）"})
     if missing:
         sys.exit(1)
@@ -401,13 +485,14 @@ def cmd_init(a) -> None:
     made = make_skeleton(a.root)
     info = write_today(a.root)
     write_kbmap(a.root)
+    role = ensure_task_role(cur, a.root, rotate=a.rotate_task_role)
     cur.execute("SELECT count(*) n FROM store_files")
     n = cur.fetchone()["n"]
     conn.close()
     out({"ok": True, "db": "zhonglu/public(store_*)", "tables": 5, "extension": "pg_trgm",
          "columns_added": added,
          "domains_seeded": len(DOMAINS), "senders_seeded": len(SENDERS),
-         "dirs_created": made, "today": info, "store_files_rows": n})
+         "dirs_created": made, "today": info, "store_files_rows": n, "task_role": role})
 
 
 def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
@@ -1049,7 +1134,11 @@ def main() -> None:
                     help="存量盘点基准根（root='workspace' 的行按此解析）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("init", help="建扩展/表/索引 + 目录骨架 + 种子").set_defaults(f=cmd_init)
+    p = sub.add_parser("init", help="建扩展/表/索引 + 目录骨架 + 种子 + 任务侧最小权限角色")
+    p.add_argument("--rotate-task-role", dest="rotate_task_role", action="store_true",
+                   help=f"强制轮换 {TASK_ROLE} 角色密码（默认已有角色且凭据文件在则不轮换，"
+                        "避免打断在途任务）")
+    p.set_defaults(f=cmd_init)
     sub.add_parser("skeleton", help="只建目录骨架与 index 配置，不碰数据库").set_defaults(f=cmd_skeleton)
     sub.add_parser("ping", help="探活：DB 可连 + 5 张表在（不建表；缺表退出码 1）").set_defaults(f=cmd_ping)
 

@@ -496,12 +496,17 @@ else
   elif heal; then ln -sfn "$STORE_BIN" /usr/local/bin/store; fi
   # 目录骨架 + index 配置（纯文件系统，幂等，无 DB 副作用）
   [ -f "$STORE_BIN" ] && "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" skeleton >/dev/null 2>&1
-  # 台账探活：DB 可连且 5 张表在（缺表时 ping 退出码 1）
-  if [ ! -f "$STORE_BIN" ]; then bad "store CLI 安装失败"
-  elif "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" ping >/dev/null 2>&1; then
-    ok "CLI+骨架+台账就绪（root=$STORE_ROOT）"
+  # 台账探活：区分「缺表」（首次未 init，WARN）与「DB 不可达」（relay 依赖同一个库，
+  # 通常意味着服务已瘫，记 FAIL → boot.sh 钉钉预警）
+  if [ ! -f "$STORE_BIN" ]; then
+    bad "store CLI 安装失败"
   else
-    warn "台账未初始化或 DB 不可达；首次需人工执行: $STORE_BIN init（会建表，故不自动跑）"
+    "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" ping >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" = 0 ]; then ok "CLI+骨架+台账就绪（root=$STORE_ROOT）"
+    elif [ "$rc" = 2 ]; then bad "PG 不可达——relay 依赖同一个库，通常意味着服务已瘫，需人工介入"
+    else warn "台账表未建；首次需人工执行: $STORE_BIN init（会建表，故不自动跑）"
+    fi
   fi
 fi
 
