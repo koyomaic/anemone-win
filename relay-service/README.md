@@ -113,7 +113,7 @@ team_agent.py users list / delete <名>
 
 # 成员：提交任务（异步，拿到 task_id 即可走人）
 export TEAM_AGENT_TOKEN=ta_xxx
-team_agent.py run "写一份9月经营月报" --targets shared/reports/9月 --wait
+team_agent.py run "写一份9月经营月报" --targets shared/report/市场分析/2026-09 --wait
 team_agent.py run "补充结论" --resume 42          # 追任务，续接原会话
 
 # 查询 / 实时流 / 取消 / 变更 / 确认

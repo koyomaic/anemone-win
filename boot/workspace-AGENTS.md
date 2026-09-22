@@ -3,11 +3,12 @@
 ## 动手前（共享知识检索顺序）
 
 1. **优先权威源：jingboWiki**——用 `jingbowiki-api` 技能检索（快速检索 `POST /knowledge-search`；凭据 `shared/secrets/jingbowiki.env`，健康检查 `http://10.200.3.235:18082/health`）。团队知识以 jingboWiki 为准。
-2. 本地兜底：`/mnt/vol-eltaah12/workspace/shared/knowledge/` 对应主题目录（《中转服务使用说明.md》《team-agent-relay-SKILL.md》等）；jingboWiki 不可达或未命中时再查。
+2. 本地兜底：`/mnt/vol-eltaah12/workspace/shared/knowledge/` 按 tag 域分目录（`口径方法论/` `组织制度/` `工具运维/` `外部资料/`）；jingboWiki 不可达或未命中时再查。找具体文件用 `store q`，不要递归 `find`。
 3. 两处内容冲突时，以 jingboWiki 为准。有现成经验就用，不要重复摸索。
 
 ## 可用 CLI
 
+- `store`：业务存储台账（查文件/登记/血缘/对账/jingboWiki 同步），见下文「共享区约定」
 - `dws`：钉钉工作套件（发消息/查通讯录/日程/表格/文档/审批/待办），用法与坑位见 dws skill
 - `python3`
 - 常规 shell 工具（bash、curl 等）
@@ -18,12 +19,59 @@
 - 检查更新：`cd /mnt/vol-eltaah12/finaagent/relay-dev && git fetch origin && git log --oneline HEAD..origin/main`（无输出＝已最新；有输出＝汇报新提交后等指示）
 - 任务里默认只检查/汇报；pull、部署、push、重启服务需任务明确要求（部署走 `/opt/team/relay-boot/boot.sh`，机队文档 `relay-dev/boot/INSTALL.md`）
 
-## 共享区约定（shared/）
+## 共享区约定（shared/ ＝ store 存储根）
 
-- `shared/` 是团队共享区，**不要静默覆盖他人文件**；改动已有共享文件前先保留原版本
-- 任务产生的可复用经验写入 `shared/knowledge/` 对应主题目录
+`shared/` 既是团队共享区，也是业务存储根（store）。三类内容分开放：
+
+| 目录 | 放什么 | 分层 |
+| --- | --- | --- |
+| `shared/data/` | 待加工的经营数据（入站原件） | `<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/<senderId>/` |
+| `shared/report/` | 大脑生成的报告（出站成品） | `<域>/<YYYY-MM 或 YYYY-Www>/` |
+| `shared/knowledge/` `templates/` `tools/` `skills/` `mcp/` `memory/` `secrets/` | 非经营共享 | `knowledge/` 按 tag 域分：`口径方法论/` `组织制度/` `工具运维/` `外部资料/` |
+
+另有 `shared/index/`（台账，CLI 维护，**不要手写**）、`shared/work/`（任务中间态，7 天清）、`shared/.archive/`（备份/去重/残留，**不要读也不要写**）。
+
+### 命名约定（让路径可推导，不用先搜索再决定放哪）
+
+```
+data   : <YYYYMMDD>_<senderId>_<taskId>_<topic>_v<N>.<ext>
+report : <YYYYMMDD>_<taskId>_<topic>[-<variant>]_v<N>.<ext>
+例：20260921_20102_T0_能源局座谈会-录音2分片01_v1.m4a
+    20260921_T0_能源局座谈会-录音2逐字稿-funasr_v1.md
+```
+
+- 日期一律 `YYYYMMDD`（目录 `YYYY-MM-DD` / `YYYY-MM` / `YYYY-Www`），**禁** `2026.9.20` 这类
+- `taskId` 用 relay 任务号 `T57`，无关联写 `T0`；`senderId` 是钉钉 userId 纯数字，姓名不进路径
+- `variant` 区分同一产出的不同实现（如 ASR 引擎 `funasr`/`whisper`），与 `vN`（迭代版次）正交
+- `topic` 可用中文，禁空格（用 `-`）与 `# % &`；路径段一律 ASCII
+- **禁同名覆盖**，改版就 `vN+1`
+
+### 硬规则
+
+- **不要静默覆盖他人文件**；改动已有共享文件前先保留原版本
+- 备份/中间产物写 `shared/work/` 或 `.archive/`，**禁止**在正式目录留 `.bak-*`/`~`/`.tmp`/`旧版备份`
+- **禁止**同一内容出中英双份目录或双份文件（历史上 `20260921能源局座谈会/` 与 `20260921_energy_meeting/`、`jingbo-data-api-能力清单.md` 与 `-capability-list.md` 都是这么来的）；中文为准，需要英文名时在台账记 alias
+- 任务产生的可复用经验写入 `shared/knowledge/<tag域>/` 对应主题目录
 - **知识归档双写（硬性）**：凡归档进 `shared/knowledge/` 的知识文件（报告/文档/摘要/经验，无论任务产出还是用户上传），**必须在同一任务内经 `jingbowiki-api` 同步上传 jingboWiki**（权威源，全员可检索）。双写是归档动作的一部分，任务描述里"只改动 shared/knowledge/ 下文件""不要修改其他文件"之类范围限定**不豁免**本条；仅当任务明确写"不要上传 jingboWiki"时才跳过
 - 上传**受理即成功**（不阻塞等解析，解析后台异步），在任务结果里报告 knowledge_id；需确认解析完成时用技能的 wait 子命令后查，不要长轮询
+- 报告升格为知识的判定：**进 wiki**＝口径/方法论/能力清单/组织架构/纪要结论/策略矩阵；**不进**＝一次性数值报表、日报周报原始数据、`report/经营汇报/`（敏感）、自检与进度类过程文档。大文件原件（m4a/xlsx/docx）永不进 wiki 正文，只存结论并在台账用 refs 指回原件
+
+### 台账 CLI（`store`）
+
+文件真身在磁盘，权威索引在 PostgreSQL（relay 同库 `public` schema、`store_` 前缀）。**找文件先查台账，不要递归 `find`**：
+
+```bash
+store today                                   # 今天该往哪写（不用自己算日期）
+store q --kind report --domain 会议纪要 --since 2026-09-01
+store q --task 67                             # 一个任务的全部输入输出（JOIN relay tasks）
+store q --path 调价                            # 存量文件 topic 为空，按路径子串查
+store add <path> --kind data --sender 20102 --task 67 --topic 门店日销
+store lineage <id>                            # 血缘：原始数据 → 报告 → 知识
+store doctor                                  # 磁盘↔台账对账、命名违规、重复、缺口
+store sync scan|push|verify|backfill          # jingboWiki 同步
+```
+
+落盘新文件后**必须** `store add`（或 `store scan`）登记一行，否则台账与磁盘漂移。
 
 ## 共享知识（取消隔离，个人上传即全员可用）
 

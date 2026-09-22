@@ -3,7 +3,7 @@
 
 用法示例：
   team-agent --server http://10.0.0.5:8787 --token ta_xxx run "写一份9月经营月报" \
-      --targets shared/reports/9月 --priority normal --wait
+      --targets shared/report/市场分析/2026-09 --priority normal --wait
   team-agent task 12
   team-agent stream 12
   team-agent cancel 12
@@ -135,7 +135,7 @@ def main():
     p = sub.add_parser("run", help="提交任务")
     p.add_argument("description")
     p.add_argument("--project", default="")
-    p.add_argument("--targets", default="", help="逗号分隔，如 shared/reports/9月,shared/data")
+    p.add_argument("--targets", default="", help="逗号分隔，如 shared/report/市场分析/2026-09,shared/data")
     p.add_argument("--priority", choices=["normal", "urgent"], default="normal")
     p.add_argument("--force", action="store_true", help="目标重叠时强制提交")
     p.add_argument("--resume", default="", help="接续任务 id")

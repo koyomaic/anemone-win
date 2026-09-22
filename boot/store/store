@@ -37,12 +37,26 @@ import re
 import time
 from datetime import date, datetime
 
-DEFAULT_ROOT = "/mnt/vol-eltaah12/workspace/store"
+DEFAULT_ROOT = "/mnt/vol-eltaah12/workspace/shared"
 DEFAULT_WORKSPACE = "/mnt/vol-eltaah12/workspace"
 DEFAULT_ENV = "/mnt/vol-eltaah12/workspace/relay.env"
+
+# store 根与 relay 的 shared_dir 同址，根下混有运行时环境，扫描时必须排除
+RUNTIME_SKIP = {"venv", ".venv", "models", "tmp", "__pycache__", ".git", "node_modules"}
+
+# 这些目录属 relay/机队的凭据、技能、配置与工具检出（真源分别是本机 secrets、git、relay），
+# 不是 store 台账管理的内容，扫描与对账都要跳过，否则 secrets/ 下 2000+ 文件全成 orphan。
+# 按「相对 store 根的路径」匹配，故既可排顶层名也可排嵌套路径。
+UNMANAGED = {"secrets", "skills", "mcp", "memory", "tmp",
+             "venv", "venv_funasr", "models", "tools/dingtalk-skills"}
 KB_ID = "8c0e68ab-a401-432b-aeda-676383b629d0"
 AGENT_ID = "3a38b83e-59e6-4f85-b737-618952038366"
 MODEL_ID = "823c0ae2-f0e5-4f13-bfaa-fcf838f3c606"
+
+# 方案 B：单库多 tag。一条知识只挂一个 tag（PUT /knowledge/tags 的 updates 是 知识ID→单个标签ID）
+WIKI_TAGS = [("口径方法论", "#1890ff", 1), ("经营分析", "#52c41a", 2),
+             ("组织制度", "#722ed1", 3), ("会议纪要", "#13c2c2", 4),
+             ("工具运维", "#faad14", 5), ("外部资料", "#8c8c8c", 6)]
 
 # 正式目录里出现即视为违规（备份/临时产物必须进 .archive/ 或 work/）
 BAD_NAME = re.compile(r"(\.bak|\.old|\.tmp|~$|\.swp$)", re.I)
@@ -155,8 +169,7 @@ SENDERS = [
 # 目录骨架
 SKELETON = [
     "data/inbox", "report", "work", "index",
-    "shared/knowledge", "shared/templates", "shared/tools/packages",
-    "shared/mcp", "shared/memory", "shared/skills-proposed",
+    "knowledge", "templates", "tools/packages", "skills-proposed",
     ".archive/bak", ".archive/dup", ".archive/probe", ".archive/data",
 ]
 
@@ -330,7 +343,7 @@ def cmd_init(a) -> None:
             os.makedirs(p, exist_ok=True)
             made.append(d)
     for dom, k, *_ in DOMAINS:
-        p = os.path.join(a.root, "report" if k == "report" else "shared/knowledge", dom)
+        p = os.path.join(a.root, "report" if k == "report" else "knowledge", dom)
         if not os.path.isdir(p):
             os.makedirs(p, exist_ok=True)
             made.append(os.path.relpath(p, a.root))
@@ -396,12 +409,35 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
     return rel
 
 
+def _is_runtime(dirpath: str, name: str) -> bool:
+    """运行时目录（虚拟环境/模型缓存/临时区）不属业务存储，一律不扫不索引。
+
+    store 根与 relay 的 shared_dir 同址后，根下就有 venv/venv_funasr/models
+    共 7.3 万文件、10.5G；不排除的话 scan/doctor 每次都要遍历它们。
+    pyvenv.cfg 是虚拟环境的确定标记，据此泛化识别，不硬编码站点特有目录名。
+    """
+    if name in RUNTIME_SKIP:
+        return True
+    return os.path.isfile(os.path.join(dirpath, name, "pyvenv.cfg"))
+
+
+def _prune(dp: str, dn: list[str], base: str) -> None:
+    """就地过滤待遍历子目录：排除运行时目录，以及 UNMANAGED 里列出的非台账路径。
+
+    UNMANAGED 按相对 base 的路径匹配，因此顶层名（secrets）与嵌套路径
+    （tools/dingtalk-skills）都能排掉。
+    """
+    rel = os.path.relpath(dp, base)
+    pre = "" if rel == "." else rel.replace(os.sep, "/") + "/"
+    dn[:] = [d for d in dn if (pre + d) not in UNMANAGED and not _is_runtime(dp, d)]
+
+
 def _walk_rel(base: str):
     """列出 base 下所有文件的相对路径（不哈希，纯枚举）。"""
     if not os.path.isdir(base):
         return
     for dp, dn, fn in os.walk(base):
-        dn[:] = [d for d in dn if d not in ("__pycache__", ".git")]
+        _prune(dp, dn, base)
         for f in sorted(fn):
             p = os.path.join(dp, f)
             if os.path.isfile(p):
@@ -410,7 +446,7 @@ def _walk_rel(base: str):
 
 def walk_files(root: str):
     for dp, dn, fn in os.walk(root):
-        dn[:] = [d for d in dn if d not in ("__pycache__", ".git")]
+        _prune(dp, dn, root)
         for f in sorted(fn):
             p = os.path.join(dp, f)
             if os.path.isfile(p):
@@ -588,7 +624,8 @@ def cmd_doctor(a) -> None:
     bases = {"store": os.path.abspath(a.root), "workspace": os.path.abspath(a.workspace)}
     rep: dict = {"bases": bases}
 
-    cur.execute("SELECT id,path,sha256,root FROM store_files WHERE archived=FALSE")
+    # 含 archived 行：.archive/ 下的文件同样要对账，否则归档即被视为 orphan
+    cur.execute("SELECT id,path,sha256,root,archived FROM store_files")
     dbrows = {(r["root"], r["path"]): r for r in cur.fetchall()}
 
     # workspace 侧只盘点已登记的前两级前缀：否则会扫进 venv/models/tasks 等
@@ -629,9 +666,13 @@ def cmd_doctor(a) -> None:
                    GROUP BY sha256 HAVING count(*)>1""")
     rep["duplicate_sha_groups"] = [dict(r) for r in cur.fetchall()]
 
-    cur.execute("""SELECT id,path,note,status FROM store_files
-                   WHERE status IN ('stub','gap','failed') OR note<>'' ORDER BY id""")
+    # 缺口＝明确标为 stub/gap/failed 的行（即使已归档也要持续可见，如「录音1 从未转写」）；
+    # 普通备注不算缺口，单独计数，否则 gaps 会被迁移说明淹没。
+    cur.execute("""SELECT id,path,note,status,archived FROM store_files
+                   WHERE status IN ('stub','gap','failed') ORDER BY id""")
     rep["gaps"] = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT count(*) n FROM store_files WHERE note<>''")
+    rep["annotated"] = cur.fetchone()["n"]
 
     cur.execute("""SELECT wiki_status,count(*) n FROM store_files
                    WHERE kind='knowledge' AND archived=FALSE GROUP BY wiki_status ORDER BY n DESC""")
@@ -707,6 +748,237 @@ def cmd_link(a) -> None:
 
 def cmd_today(a) -> None:
     out(write_today(a.root))
+
+
+# ---------------------------------------------------------------- jingboWiki 同步
+# 只用 stdlib（urllib）+ curl 处理 multipart：机队 venv 没有 requests，
+# 而技能文档明确警告不要手拼 multipart boundary，故上传交给 curl。
+
+WIKI_BASE = os.environ.get("JINGBOWIKI_BASE", "http://10.200.3.235:18082") + "/api/v1"
+WIKI_ENV = "/mnt/vol-eltaah12/workspace/shared/secrets/jingbowiki.env"
+
+
+def _wiki_creds() -> tuple[str, str]:
+    email = pw = ""
+    p = os.environ.get("JINGBOWIKI_ENV", WIKI_ENV)
+    if os.path.isfile(p):
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].strip()
+            for k, v in (("JINGBOWIKI_EMAIL=", "email"), ("JINGBOWIKI_PASSWORD=", "pw")):
+                if line.startswith(k):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if v == "email":
+                        email = val
+                    else:
+                        pw = val
+    return (os.environ.get("JINGBOWIKI_EMAIL") or email,
+            os.environ.get("JINGBOWIKI_PASSWORD") or pw)
+
+
+def _wiki_login() -> str:
+    import urllib.request
+    email, pw = _wiki_creds()
+    if not email or not pw:
+        raise SystemExit("缺 JINGBOWIKI_EMAIL / JINGBOWIKI_PASSWORD（查 shared/secrets/jingbowiki.env）")
+    req = urllib.request.Request(WIKI_BASE + "/auth/login",
+                                 data=json.dumps({"email": email, "password": pw}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    d = json.load(urllib.request.urlopen(req, timeout=40))
+    tok = d.get("token") or (d.get("data") or {}).get("token")
+    if not tok:
+        raise SystemExit("登录未返回 token")
+    return tok
+
+
+def _wiki(tok: str, method: str, path: str, body=None):
+    import urllib.request
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(WIKI_BASE + path, data=data, method=method,
+                                 headers={"Authorization": "Bearer " + tok,
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        return json.load(r)
+
+
+def _wiki_rows(tok: str, kb: str) -> list[dict]:
+    d = _wiki(tok, "GET", f"/knowledge-bases/{kb}/knowledge?page=1&page_size=500")
+    data = d.get("data")
+    return data if isinstance(data, list) else ((data or {}).get("data") or [])
+
+
+def _wiki_upload(tok: str, kb: str, path: str, tag_id: str, meta: dict) -> dict:
+    import subprocess
+    cmd = ["curl", "-s", "-m", "240", "-X", "POST",
+           f"{WIKI_BASE}/knowledge-bases/{kb}/knowledge/file",
+           "-H", f"Authorization: Bearer {tok}",
+           "-F", f"file=@{path}", "-F", "channel=api", "-F", "enable_multimodel=false"]
+    if tag_id:
+        cmd += ["-F", f"tag_ids={tag_id}"]
+    if meta:  # 键值均须为字符串
+        cmd += ["-F", "metadata=" + json.dumps({k: str(v) for k, v in meta.items()},
+                                               ensure_ascii=False)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=260)
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        return {"success": False, "raw": r.stdout[:300], "err": r.stderr[:300]}
+
+
+def _load_tags(a) -> dict:
+    p = os.path.join(a.root, "index", "kb-map.json")
+    if not os.path.isfile(p):
+        raise SystemExit("缺 index/kb-map.json，先跑 store init")
+    d = json.load(open(p, encoding="utf-8"))
+    return d.get("tags") or {}
+
+
+def _log_sync(cur, file_id: int, action: str, page_id: str, status: str, detail: str = "") -> None:
+    cur.execute("""INSERT INTO store_wiki_sync(file_id,action,wiki_page_id,wiki_status,detail,created_at)
+                   VALUES(%s,%s,%s,%s,%s,%s)""",
+                (file_id, action, page_id, status, detail[:500], time.time()))
+
+
+def cmd_sync(a) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    tags = _load_tags(a)
+    kb = a.kb
+    tok = _wiki_login()
+
+    if a.action == "tags":  # 建缺失的 tag 并写回 kb-map.json
+        remote = {t["name"]: t["id"] for t in
+                  (_wiki(tok, "GET", f"/knowledge-bases/{kb}/tags?page_size=100").get("data") or {}).get("data", [])}
+        created = []
+        for name, color, so in WIKI_TAGS:
+            if name not in remote:
+                r = _wiki(tok, "POST", f"/knowledge-bases/{kb}/tags",
+                          {"name": name, "color": color, "sort_order": so})
+                remote[name] = (r.get("data") or {}).get("id")
+                created.append(name)
+        write_kbmap(a.root, tags=remote)
+        conn.close()
+        return out({"ok": True, "created": created, "tags": remote})
+
+    cur.execute("""SELECT id,path,domain,wiki_tag,wiki_page_id,wiki_status,sha256,topic,
+                          sender_id,task_id,sensitivity
+                   FROM store_files
+                   WHERE kind='knowledge' AND archived=FALSE ORDER BY id""")
+    local = [dict(r) for r in cur.fetchall()]
+    remote = _wiki_rows(tok, kb)
+    by_name = {r.get("file_name"): r for r in remote}
+
+    if a.action == "scan":
+        miss, have, drift = [], [], []
+        for r in local:
+            fn = os.path.basename(r["path"])
+            hit = by_name.get(fn)
+            if r["wiki_status"] == "skip":
+                continue
+            if not r["wiki_page_id"] and not hit:
+                miss.append(r["path"])
+            elif hit:
+                # 服务端返回的是 tags 数组（[{id,name,...}]），不是 api.md 里写的 tag_id 单值
+                tids = [t.get("id") for t in (hit.get("tags") or [])]
+                want = tags.get(r["wiki_tag"] or r["domain"], "")
+                have.append({"path": r["path"], "page_id": hit.get("id"),
+                             "parse": hit.get("parse_status") or hit.get("status"),
+                             "tags": [t.get("name") for t in (hit.get("tags") or [])],
+                             "want_tag_id": want, "tag_ok": (not want) or want in tids})
+        conn.close()
+        return out({"kb": kb, "local_knowledge": len(local), "wiki_items": len(remote),
+                    "missing": miss, "present": have,
+                    "need_tag_backfill": [h["path"] for h in have if not h["tag_ok"]]})
+
+    if a.action == "push":
+        pushed, failed = [], []
+        for r in local:
+            if r["wiki_status"] == "skip" or r["wiki_page_id"]:
+                continue
+            fn = os.path.basename(r["path"])
+            if by_name.get(fn):  # 已在 wiki 但台账没登记 → 只补映射，不重复上传
+                hit = by_name[fn]
+                cur.execute("""UPDATE store_files SET wiki_page_id=%s, wiki_status='indexed',
+                               wiki_tag=COALESCE(NULLIF(wiki_tag,''),domain), wiki_synced_at=%s,
+                               updated_at=%s WHERE id=%s""",
+                            (hit["id"], time.time(), time.time(), r["id"]))
+                _log_sync(cur, r["id"], "adopt", hit["id"], "indexed", "wiki 已有同名条目，仅补映射")
+                pushed.append({"path": r["path"], "page_id": hit["id"], "mode": "adopt"})
+                continue
+            tag_id = tags.get(r["wiki_tag"] or r["domain"], "")
+            abs_p = os.path.join(a.root, r["path"])
+            meta = {"store_path": r["path"], "sha256": r["sha256"], "domain": r["domain"],
+                    "topic": r["topic"] or "", "sender_id": r["sender_id"] or "",
+                    "task_id": str(r["task_id"] or ""), "sensitivity": r["sensitivity"],
+                    "authority": "jingbowiki", "synced_by": "store-sync/1.0"}
+            res = _wiki_upload(tok, kb, abs_p, tag_id, meta)
+            pid = ((res.get("data") or {}).get("id") if isinstance(res.get("data"), dict) else "") or ""
+            if res.get("success") and pid:
+                # 受理即成功：解析在后台异步，不阻塞等待
+                cur.execute("""UPDATE store_files SET wiki_page_id=%s, wiki_status='accepted',
+                               wiki_tag=COALESCE(NULLIF(wiki_tag,''),domain), wiki_synced_at=%s,
+                               updated_at=%s WHERE id=%s""",
+                            (pid, time.time(), time.time(), r["id"]))
+                _log_sync(cur, r["id"], "push", pid, "accepted", fn)
+                pushed.append({"path": r["path"], "page_id": pid, "mode": "upload", "tag": tag_id})
+            else:
+                _log_sync(cur, r["id"], "push", "", "failed", json.dumps(res, ensure_ascii=False)[:400])
+                failed.append({"path": r["path"], "res": res})
+        conn.close()
+        return out({"ok": not failed, "pushed": pushed, "failed": failed})
+
+    if a.action == "verify":
+        upd = []
+        for r in local:
+            if not r["wiki_page_id"]:
+                continue
+            hit = next((x for x in remote if x.get("id") == r["wiki_page_id"]), None)
+            if not hit:
+                cur.execute("UPDATE store_files SET wiki_status='missing', updated_at=%s WHERE id=%s",
+                            (time.time(), r["id"]))
+                upd.append({"path": r["path"], "wiki_status": "missing", "why": "wiki 侧已不存在"})
+                continue
+            st = (hit.get("parse_status") or hit.get("status") or "").lower()
+            new = {"completed": "indexed", "success": "indexed", "done": "indexed",
+                   "failed": "failed", "error": "failed"}.get(st, "parsing")
+            cur.execute("UPDATE store_files SET wiki_status=%s, updated_at=%s WHERE id=%s",
+                        (new, time.time(), r["id"]))
+            _log_sync(cur, r["id"], "verify", r["wiki_page_id"], new, st)
+            upd.append({"path": r["path"], "wiki_status": new, "parse": st,
+                        "tags": [t.get("name") for t in (hit.get("tags") or [])]})
+        conn.close()
+        return out({"ok": True, "checked": len(upd), "rows": upd})
+
+    if a.action == "backfill":  # 给已存在但服务端 tag 为空/不符的条目补 tag
+        updates = {}
+        for r in remote:
+            fn = r.get("file_name")
+            row = next((x for x in local if os.path.basename(x["path"]) == fn), None)
+            if not row:
+                continue
+            want = tags.get(row["wiki_tag"] or row["domain"], "")
+            tids = [t.get("id") for t in (r.get("tags") or [])]
+            # 实测契约：updates 的值必须是 []string（api.md 写的 string|null 是错的，
+            # 传字符串会 400 "cannot unmarshal string into ... of type []string"）
+            if want and want not in tids:
+                updates[r["id"]] = [want]
+        if updates:
+            res = _wiki(tok, "PUT", "/knowledge/tags", {"kb_id": kb, "updates": updates})
+            for pid, tid in updates.items():
+                cur.execute("""UPDATE store_files SET wiki_synced_at=%s, updated_at=%s
+                               WHERE wiki_page_id=%s""", (time.time(), time.time(), pid))
+                row = next((x for x in local if x["wiki_page_id"] == pid), None)
+                if row:
+                    _log_sync(cur, row["id"], "tag", pid, row["wiki_status"], f"tag_ids={tid}")
+            conn.close()
+            return out({"ok": bool(res.get("success")), "tagged": len(updates),
+                        "updates": updates, "res": res})
+        conn.close()
+        return out({"ok": True, "tagged": 0, "note": "无需补 tag"})
+
+    conn.close()
+    raise SystemExit(f"未知 sync 动作: {a.action}")
 
 
 def main() -> None:
@@ -786,6 +1058,11 @@ def main() -> None:
     p.set_defaults(f=cmd_link)
 
     sub.add_parser("today", help="刷新并输出 index/today.json").set_defaults(f=cmd_today)
+
+    p = sub.add_parser("sync", help="jingboWiki 同步")
+    p.add_argument("action", choices=("tags", "scan", "push", "verify", "backfill"))
+    p.add_argument("--kb", default=os.environ.get("STORE_KB_ID", KB_ID))
+    p.set_defaults(f=cmd_sync)
 
     a = ap.parse_args()
     a.f(a)

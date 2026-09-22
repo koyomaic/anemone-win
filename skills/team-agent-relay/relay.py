@@ -600,7 +600,7 @@ def main() -> None:
 
     def add_task_args(p, waitable=False):
         p.add_argument("-t", "--targets", default="",
-                       help="逗号分隔，如 shared/reports/9月")
+                       help="逗号分隔，如 shared/report/市场分析/2026-09")
         p.add_argument("--urgent", action="store_true")
         p.add_argument("--resume", type=int, default=None)
         p.add_argument("--force", action="store_true")

@@ -58,7 +58,7 @@ token 只接受用户本人提供，绝不猜测/复用示例值；token 不落�
 
 | 场景 | 命令 |
 |---|---|
-| **一步到位（最常用）**：提交并等完成 | `S run "任务描述" -t "shared/reports/9月"` |
+| **一步到位（最常用）**：提交并等完成 | `S run "任务描述" -t "shared/report/市场分析/2026-09"` |
 | 仅提交（异步拿 task_id） | `S submit "描述" -t "目录" [--urgent] [--resume N] [--force]` |
 | 等某任务到终态 | `S wait 42` |
 | 查状态 / 列表 | `S status 42` ／ `S tasks --status running` |
@@ -103,5 +103,5 @@ token 只接受用户本人提供，绝不猜测/复用示例值；token 不落�
 
 - 单任务 30 分钟超时；**review 不是终点**，diff 给用户看过并 confirm 才算 done
 - 同文件被两任务改动不会静默覆盖：先完成者版本自动备份 `.bak-用户-HHMM`，后完成者标 conflict
-- 共享区约定：`shared/knowledge/`（知识库，先查）、其余按业务分目录
+- 共享区约定：`shared/` 即 store 存储根——`data/`（经营数据入站，按 `<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/<senderId>/`）、`report/`（报告出站，按 `<域>/<YYYY-MM 或 YYYY-Www>/`）、`knowledge/`（知识，先查，按 tag 域分）；找文件用 `store q` 不要递归 find，落盘后 `store add` 登记
 - **钉钉发送门控**：服务器侧对 dws 外发消息二次确认——1:1 单聊放行；群聊/多接收人/命中敏感对象 → 任务停 `pending_approval`，须 `S approve` 放行。`run`/`wait` 到此即返回（不再挂到超时），把 `blocked_cmd` 告知用户后走 approve。
