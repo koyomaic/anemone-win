@@ -702,7 +702,11 @@ else
     elif heal; then bad "unit 安装失败"
     else warn "未安装（install 模式自动安装）"; fi
   fi
-  [ -f "$WORKSPACE/shared/secrets/relay-avatar.env" ] || warn "relay-avatar.env 缺失（启用前需填 RELAY_DEVICE_ID/SECRET，见 relay-avatar/README.md）"
+  AVA_ENV="$WORKSPACE/shared/secrets/relay-avatar.env"
+  if [ ! -f "$AVA_ENV" ]; then warn "relay-avatar.env 缺失（启用前需填 RELAY_DEVICE_ID/SECRET，见 relay-avatar/README.md）"
+  elif ! grep -q '^RELAY_DEVICE_ID=.' "$AVA_ENV" || ! grep -q '^RELAY_DEVICE_SECRET=.' "$AVA_ENV"; then
+    warn "relay-avatar.env 设备凭据为空（启用前需在 relay 面板注册设备并填入 RELAY_DEVICE_ID/SECRET）"
+  fi
 fi
 
 # ---------- 29c im-bridge 退役（状态已迁移 relay-avatar；旧代码/状态目录留痕不删） ----------

@@ -39,25 +39,27 @@ self_poll_interval_sec = 5
 # --text "收到啦，马上为你办～"` 创建后回填（账号维度，一次创建长期有效；背景色由
 # 服务端分配、请求值仅供参考，多摇几次可拿到互不相同的底色）；留空则回落 ack_emoji。
 # 三态三色约定：处理中/办妥/出错各用不同 background_id，一眼可辨。
+# 下面三枚模板 ID 为王洪彬账号（机队共享 dws 种子）账号级模板，机群通用；
+# 换账号的机器需自建替换（ID 无效时自动回落 ack_emoji，不会报错刷屏）。
 # 注意：TOML 子表必须放在 [ingress] 全部简单键之后，否则后续键会被卷进子表。
-emotion_id = ""
+emotion_id = "23494072"
 emotion_name = "马上办"
 text = "收到啦，马上为你办～"
-background_id = ""
+background_id = "im_bg_1"
 
 [ingress.done_text_emotion]
 # 完成态换图标：撤「马上办」贴「办妥啦」（不同模板=不同背景色，一眼区分终态）
-emotion_id = ""
+emotion_id = "23482558"
 emotion_name = "办妥啦"
 text = "办妥啦，请查收～"
-background_id = ""
+background_id = "im_bg_3"
 
 [ingress.fail_text_emotion]
 # 失败态换图标
-emotion_id = ""
+emotion_id = "23491095"
 emotion_name = "出错了"
 text = "❌ 出错了"
-background_id = ""
+background_id = "im_bg_5"
 
 [keywords]
 submit = ["提交", "开始执行"]
