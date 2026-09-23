@@ -22,6 +22,22 @@ from pathlib import Path
 from .storage import atomic_write_text
 
 
+def card_biz_id(resp) -> str:
+    """从 card_create 响应提取 bizId（兼容测试桩直接返回字符串）。"""
+    if isinstance(resp, str):
+        return resp
+    if not isinstance(resp, dict):
+        return ""
+    try:
+        return str(((resp.get("cardRef") or {}).get("bizId")
+                    or ((resp.get("created") or {}).get("result")
+                        or {}).get("bizId")
+                    or (resp.get("result") or {}).get("bizId")
+                    or resp.get("bizId") or ""))
+    except Exception:
+        return ""
+
+
 def md_hardbreak(text: str) -> str:
     """钉钉 Markdown 硬换行：非表格/代码块的行尾补两个空格。"""
     lines = (text or "").split("\n")
@@ -149,8 +165,9 @@ class Dws:
                         timeout=15)
 
     # ── 流式卡片（提交即开卡，状态跳变更新，完成 flow-status=3 定格） ──
-    def card_create(self, target: dict) -> str:
-        """创建流式卡片返回 bizId（失败空串）。群 --group / 单聊优先
+    def card_create(self, target: dict):
+        """创建流式卡片，返回原始响应（bizId 用 card_biz_id 提取；原始响应
+        含 openTaskId，供回执落档/撤回）。群 --group / 单聊优先
         --receiver-open-dingtalk-id 直传（--receiver 走通讯录解析，慢且可能歧义）。"""
         if target.get("is_group"):
             args = ["chat", "+messages-send-card", "--group",
@@ -163,16 +180,8 @@ class Dws:
             args = ["chat", "+messages-send-card", "--receiver",
                     str(target["user_id"])]
         else:
-            return ""
-        r = self.run(args + ["--yes", "--format", "json"], timeout=30)
-        try:
-            return str(((r.get("cardRef") or {}).get("bizId")
-                        or ((r.get("created") or {}).get("result")
-                            or {}).get("bizId")
-                        or (r.get("result") or {}).get("bizId")
-                        or r.get("bizId") or ""))
-        except Exception:
-            return ""
+            return {}
+        return self.run(args + ["--yes", "--format", "json"], timeout=30)
 
     def card_update(self, biz_id: str, content: str, flow_status: int) -> bool:
         """更新卡片。flow_status: 1处理中/2输入中/3完成/4执行中/5错误。"""

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import config as C
 from app import integrity
+from app import recall
 from app.audit import Audit
 from app.dashboard import Dashboard
 from app.exec_local import ExecLocal
@@ -30,7 +31,7 @@ from app.exec_relay import ExecRelay
 from app.file_inbox import FileInbox, extract_file_from_event, find_media_ids
 from app.group_watch import GroupWatch, parse_watch_cmd
 from app.ingress_dingtalk import (Dws, EventIngress, InboundHealth, SelfMark,
-                                  SelfPoller, md_hardbreak)
+                                  SelfPoller, card_biz_id, md_hardbreak)
 from app.ingress_relay import RelayClient
 from app.knowledge import Knowledge
 from app.monitor import Monitor
@@ -82,16 +83,22 @@ class Avatar:
                        f"{sender}: {str(content)[:60]}")
 
     # ── 发送 ──
-    def _notify(self, target: dict, text: str):
+    def _notify(self, target: dict, text: str, task_id=None):
         try:
-            self.dws.send_text(target, md_hardbreak(
+            r = self.dws.send_text(target, md_hardbreak(
                 self.selfmark.append(text, self.sign)))
+            recall.record(self.st, "text",
+                          target.get("user_id")
+                          or target.get("open_dingtalk_id")
+                          or target.get("conversation_id"), r,
+                          task_id=task_id, snippet=text)
         except Exception as e:
             log("notify failed:", e)
 
     def _notify_session(self, s: dict, text: str):
         log(f"-> {s['reply'].get('sender')}: {text[:80]}")
-        self._notify(s["reply"], text)
+        self._notify(s["reply"], text,
+                     task_id=s.get("task_id") or s.get("last_task_id"))
 
     def _dm(self, uid: str, text: str):
         self._notify({"user_id": str(uid)}, text)
@@ -552,12 +559,17 @@ class Avatar:
         if not self.cfg.get("ingress", "use_card", True):
             return
         try:
-            biz = self.dws.card_create(s["reply"])
+            resp = self.dws.card_create(s["reply"])
         except Exception as e:
             log("card create failed:", e)
             return
+        biz = card_biz_id(resp)
         if not biz:
             return
+        recall.record(self.st, "card",
+                      s["reply"].get("open_dingtalk_id")
+                      or s["reply"].get("conversation_id"), resp,
+                      task_id=tid, snippet=f"card:{biz}")
         s["card_biz"] = biz
         s["card_hint"] = (desc.splitlines() or [""])[0][:40]
         s["card_start"] = time.time()
@@ -683,7 +695,11 @@ class Avatar:
         fp = self.st.rounds / f"{tid}_result.md"
         try:
             fp.write_text(result, encoding="utf-8")
-            self.dws.send_file(s["reply"], str(fp))
+            r = self.dws.send_file(s["reply"], str(fp))
+            recall.record(self.st, "file",
+                          s["reply"].get("open_dingtalk_id")
+                          or s["reply"].get("conversation_id"), r,
+                          task_id=tid, snippet=fp.name)
         except Exception as e:
             log("send result file failed:", e)
 

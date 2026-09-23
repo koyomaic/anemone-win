@@ -60,7 +60,8 @@ B. relay API 客户端              monitor/ 心跳+入站健康+probe      loca
 | `app/monitor.py` / `dashboard.py` | 心跳/probe/告警 / 看板 :8791 |
 | `app/integrity.py` | 代码漂移检测+固化快照+告警（P3 基础版） |
 | `app/migrate.py` | im-bridge 状态迁移（幂等） |
-| `avatar-cli` | 本机直提 + `--status` 运维快照 |
+| `app/recall.py` | 出站回执落档（run/outbox.jsonl）+ 撤回（openTaskId→query-send-status→recall） |
+| `avatar-cli` | 本机直提 + `--status` 运维快照 + `--recall [--n N] [--task TID]` 撤回出站消息 |
 | `tests/` | pytest（沿用 relay 门禁标记约定：not integration/pg） |
 
 ## 自测

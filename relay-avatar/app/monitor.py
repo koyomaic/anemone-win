@@ -242,6 +242,8 @@ class Monitor:
                     last_gc = time.time()
                     self.st.gc_events(30)
                     self.st.retry_pending()
+                    from .recall import gc_outbox
+                    gc_outbox(self.st)
             except Exception as e:
                 print("probe error:", e, flush=True)
             self.stop.wait(interval)

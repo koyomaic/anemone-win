@@ -6,6 +6,8 @@
   avatar-cli "描述" --resume 123     续任务 123 的会话上下文
   avatar-cli "描述" --no-follow      只提交不等待
   avatar-cli --status                心跳/入站健康/最近快照
+  avatar-cli --recall                撤回最近一条出站消息（--n 2 撤两条）
+  avatar-cli --recall --task 8       撤回任务 8 的出站消息（结果/卡片/附件）
 凭据走 shared/secrets/relay-avatar.env（与守护进程同源，设备鉴权）。
 """
 import argparse
@@ -18,7 +20,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import config as C
+from app import recall
+from app.audit import Audit
+from app.ingress_dingtalk import Dws
 from app.ingress_relay import RelayClient
+from app.storage import Storage
+
+
+def cmd_recall(cfg, n: int, task_id):
+    st = Storage(cfg)
+    dws = Dws(cfg, Audit(cfg.state))
+    results = recall.recall_recent(st, dws, n=n, task_id=task_id)
+    if not results:
+        print("outbox 无匹配回执（旧消息未落档则无法撤回，需客户端手动长按撤回）")
+        return
+    for r in results:
+        mark = "✅ 已撤回" if r["recalled"] else f"❌ 失败: {r['reason']}"
+        print(f'{mark} | {time.strftime("%H:%M:%S", time.localtime(r["ts"]))}'
+              f' | {r["type"]} → {r["to"]} | {r["snippet"]}')
 
 
 def cmd_status(cfg):
@@ -55,10 +74,16 @@ def main():
     ap.add_argument("--resume", type=int)
     ap.add_argument("--no-follow", action="store_true")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--recall", action="store_true",
+                    help="撤回最近出站消息（回执落档范围内）")
+    ap.add_argument("--n", type=int, default=1, help="撤回条数（默认1）")
+    ap.add_argument("--task", type=int, help="只撤指定 relay 任务的出站消息")
     args = ap.parse_args()
     cfg = C.load()
     if args.status:
         return cmd_status(cfg)
+    if args.recall:
+        return cmd_recall(cfg, args.n, args.task)
     if not args.description:
         ap.error("需要任务描述（或 --status）")
     relay = RelayClient(cfg.env)
