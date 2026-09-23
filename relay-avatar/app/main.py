@@ -86,28 +86,55 @@ class Avatar:
         self._notify({"user_id": str(uid)}, text)
 
     def _react(self, s: dict, cfg_key: str):
+        emoji = self.cfg.get("ingress", cfg_key)
         mid = s.get("last_msg_id") or ""
         cid = s.get("last_conv_id") or ""
-        if not mid or not cid:
-            return
-        if cfg_key == "ack_emoji":
-            te = self.cfg.section("ingress").get("ack_text_emotion") or {}
-            if te.get("emotion_id") and te.get("text"):
-                try:
-                    r = self.dws.react_text_emotion(cid, mid, te)
-                    if not (r.get("error") or r.get("errorMsg")):
-                        return
-                    log("text-emotion ack failed, fallback emoji:",
-                        str(r)[:120])
-                except Exception as e:
-                    log("text-emotion ack failed, fallback emoji:", e)
-        emoji = self.cfg.get("ingress", cfg_key)
-        if not emoji:
+        if not emoji or not mid or not cid:
             return
         try:
             self.dws.react(cid, mid, str(emoji))
         except Exception as e:
             log("react failed:", e)
+
+    def _ack_receive(self, s: dict):
+        """来件即时回执（越快越好，先贴图标再走重活）：
+        文字表情「正在疯狂处理中...」，未配置/失败回落 ack_emoji。"""
+        mid = s.get("last_msg_id") or ""
+        cid = s.get("last_conv_id") or ""
+        if not mid or not cid:
+            return
+        s["ack_mid"] = mid   # 本条已回执（emoji 回落也记，防 _on_message 双贴）
+        te = self.cfg.section("ingress").get("ack_text_emotion") or {}
+        if te.get("emotion_id") and te.get("text"):
+            try:
+                r = self.dws.react_text_emotion(cid, mid, te)
+                if not (r.get("error") or r.get("errorMsg")):
+                    s["ack_msg"] = [cid, mid]
+                    return
+                log("ack text-emotion failed, fallback emoji:", str(r)[:120])
+            except Exception as e:
+                log("ack text-emotion failed, fallback emoji:", e)
+        self._react(s, "ack_emoji")
+
+    def _swap_ack(self, s: dict, cfg_key: str):
+        """终态换图标：撤「正在疯狂处理中...」，按终态贴「已办好/出错了」
+        （不同表情模板=不同背景色，一眼区分）；cfg_key 空则只撤不贴。"""
+        ack = s.pop("ack_msg", None)
+        if not ack:
+            return
+        cid, mid = ack
+        ack_te = self.cfg.section("ingress").get("ack_text_emotion") or {}
+        try:
+            if ack_te.get("emotion_id"):
+                self.dws.remove_text_emotion(cid, mid, ack_te)
+        except Exception as e:
+            log("remove ack emotion failed:", e)
+        te = (self.cfg.section("ingress").get(cfg_key) or {}) if cfg_key else {}
+        if te.get("emotion_id") and te.get("text"):
+            try:
+                self.dws.react_text_emotion(cid, mid, te)
+            except Exception as e:
+                log("swap ack emotion failed:", e)
 
     # ── 事件入口 ──
     def handle_line(self, line: str):
@@ -195,10 +222,33 @@ class Avatar:
             if fb:
                 self._notify(s["reply"], fb)
             return
+        # 即时回执前置：先贴「正在疯狂处理中...」，再做已读回标/媒体下载等重活
+        quick = self._quick_text(content)
+        if (s["state"] == "IDLE" and quick.strip()
+                and not self._is_noise(quick)
+                and not any(self._kw(quick, k) for k in
+                            ("submit", "cancel", "confirm", "deny",
+                             "conflict"))):
+            self._ack_receive(s)
         self._mark_read(s)
         text = self._extract_text(ev, content, uid, sender)
         self._on_message(key, s, text.strip(), uid)
         self.sess.save()
+
+    def _quick_text(self, content) -> str:
+        """不下载媒体的廉价文本提取（即时回执预判噪音/关键词用）。"""
+        if isinstance(content, str):
+            c = content.strip()
+            if c[:1] in "[{":
+                try:
+                    d = json.loads(c)
+                    if isinstance(d, dict):
+                        return str(d.get("text") or d.get("content")
+                                   or d.get("title") or c)
+                except Exception:
+                    pass
+            return c
+        return str(content or "")
 
     def _mark_read(self, s: dict):
         if s.get("last_conv_id") and s.get("last_msg_id"):
@@ -360,14 +410,15 @@ class Avatar:
         if st == "WAIT_APPROVAL" and s.get("task_id"):
             if self._kw(text, "confirm"):
                 r = self.exec_relay.approve(s["task_id"], "approve", uid)
-                self._notify_session(s, f"已放行，任务 #{s['task_id']} 继续执行。")
+                self._notify_session(s, "✅ 已放行，继续执行。")
                 s["state"] = "RUNNING"
                 self.st.archive_round(s["task_id"], "approve", r)
                 return
             if self._kw(text, "deny"):
                 r = self.exec_relay.approve(s["task_id"], "deny", uid)
-                self._notify_session(s, f"已拒绝，任务 #{s['task_id']} 终止。")
+                self._notify_session(s, "🚫 已拒绝，任务终止。")
                 s["state"] = "IDLE"
+                self._swap_ack(s, "")
                 self.st.archive_round(s["task_id"], "deny", r)
                 return
             self._reprompt(s)
@@ -375,20 +426,20 @@ class Avatar:
         if st == "WAIT_REVIEW" and s.get("task_id"):
             if self._kw(text, "confirm"):
                 r = self.exec_relay.confirm(s["task_id"], "done", uid)
-                self._notify_session(s, f"任务 #{s['task_id']} 已确认完成。")
+                self._notify_session(s, "✅ 已确认完成。")
                 s["state"] = "IDLE"
                 self.st.archive_round(s["task_id"], "confirm-done", r)
                 return
             if self._kw(text, "conflict") or self._kw(text, "deny"):
                 r = self.exec_relay.confirm(s["task_id"], "conflict", uid)
-                self._notify_session(s, f"任务 #{s['task_id']} 已标记冲突。")
+                self._notify_session(s, "已标记文件冲突，请人工复核。")
                 s["state"] = "IDLE"
                 self.st.archive_round(s["task_id"], "confirm-conflict", r)
                 return
             self._reprompt(s)
             return
         if self._is_noise(text):
-            self._react(s, "ack_emoji")
+            self._react(s, "noise_emoji")
             return
         if st == "BUFFERING":
             if self._kw(text, "submit"):
@@ -397,6 +448,7 @@ class Avatar:
             if self._kw(text, "cancel"):
                 s["buffer"] = []
                 s["state"] = "IDLE"
+                self._swap_ack(s, "")
                 self._notify_session(s, "已放弃本轮内容。")
                 return
             s["buffer"].append(text)
@@ -410,25 +462,27 @@ class Avatar:
                     r = self.exec_relay.cancel(tid, uid)
                     self.st.archive_round(tid, "cancel-by-user", r)
                     self._notify_session(
-                        s, f"已取消任务 #{tid}，补充内容一并丢弃。")
+                        s, "🚫 已取消任务，补充内容一并丢弃。")
                 else:
                     self._notify_session(s, "已放弃待提交的追问内容。")
                 s["task_id"] = None
                 s["followups"] = []
                 s["buffer"] = []
                 s["state"] = "IDLE"
+                self._swap_ack(s, "")
                 return
             s["followups"].append(text)
             if not s.get("notified_followup"):
                 s["notified_followup"] = True
-                self._react(s, "ack_emoji")
+                self._react(s, "followup_emoji")
             return
         # IDLE
         if any(self._kw(text, k) for k in
                ("submit", "cancel", "confirm", "deny", "conflict")):
             return
+        if s.get("ack_mid") != s.get("last_msg_id"):
+            self._ack_receive(s)   # 即时回执已贴过则不重复
         self.sess.start_buffering(s, text)
-        self._react(s, "ack_emoji")
 
     def _flush(self, s: dict, followup: bool = False, uid: str = ""):
         items = s["followups"] if followup else s["buffer"]
@@ -447,9 +501,10 @@ class Avatar:
         resume = self.sess.resume_candidate(s)
         r = self.exec_relay.submit(desc, resume_from=resume, uid=uid)
         if "_error" in r:
-            self._notify_session(s, f"提交 relay 失败：{r['_error']} "
-                                    f"{str(r.get('_detail', ''))[:120]}")
+            self._notify_session(s, f"⚠️ 提交失败了：{r['_error']} "
+                                    f"{str(r.get('_detail', ''))[:120]}，稍后再试～")
             s["state"] = "IDLE"
+            self._swap_ack(s, "fail_text_emotion")
             return
         tid = r["task_id"]
         s["task_id"] = tid
@@ -468,7 +523,7 @@ class Avatar:
         self._card_open(s, tid, desc)
         log(f"task #{tid} submitted (resume={resume})")
 
-    # ── 流式卡片（提交即开卡，状态跳变更新，完成定格） ──
+    # ── 流式卡片（fenshen 样式：叶子+粗体名+引用行；提交即开卡，跳变更新，完成定格） ──
     def _card_open(self, s: dict, tid, desc: str):
         if not self.cfg.get("ingress", "use_card", True):
             return
@@ -484,14 +539,14 @@ class Avatar:
         s["card_start"] = time.time()
         s["card_upd"] = time.time()
         try:
-            self.dws.card_update(
-                biz, self._card_progress(s, tid, "已提交，正在排队执行…"), 1)
+            self.dws.card_update(biz, self._card_frame(
+                s, "正在为你办，稍等一下～"), 1)
         except Exception as e:
             log("card first frame failed:", e)
 
-    def _card_progress(self, s: dict, tid, note: str) -> str:
-        return (f"🍂 **{self.cfg.avatar_name}正在疯狂处理中…**\n\n"
-                f"> 📥 {s.get('card_hint') or ''}\n> ⏳ 任务 #{tid}：{note}")
+    def _card_frame(self, s: dict, note: str) -> str:
+        return (f"🍂 **{self.cfg.avatar_name}正在处理…**\n\n"
+                f"> 📥 已收到：{s.get('card_hint') or ''}\n> ⏳ {note}")
 
     def _card_beat(self, s: dict, tid, status: str):
         """运行中进度刷新（节流 card_progress_sec，防钉钉客户端合并帧）。"""
@@ -504,10 +559,10 @@ class Avatar:
             return
         s["card_upd"] = now
         used = int(now - s.get("card_start", now))
-        word = "排队中" if status == "queued" else "执行中"
+        word = "已排队，马上开始" if status == "queued" else "正在为你办"
         try:
             self.dws.card_update(
-                biz, self._card_progress(s, tid, f"{word}…（已用 {used}s）"), 1)
+                biz, self._card_frame(s, f"{word}…（已用 {used}s）"), 1)
         except Exception:
             pass
 
@@ -543,15 +598,17 @@ class Avatar:
             if status == "pending_approval" and s["state"] != "WAIT_APPROVAL":
                 s["state"] = "WAIT_APPROVAL"
                 s["gate_cmd"] = row.get("blocked_cmd") or ""
-                self._notify_session(s, self._approval_text(tid, s))
+                self._notify_session(s, self._approval_text(s))
                 if s.get("card_biz"):
                     cmd = (s.get("gate_cmd") or "").splitlines()
                     cmd = (cmd[0] if cmd else "")[:60]
                     try:
                         # 不销卡：放行后任务继续，卡片随后续状态刷新
-                        self.dws.card_update(s["card_biz"], self._card_progress(
-                            s, tid,
-                            f"待审批：`{cmd}…` 回复「确认」放行，「拒绝」终止"), 4)
+                        self.dws.card_update(
+                            s["card_biz"],
+                            f"🍂 **{self.cfg.avatar_name}等你拍板…**\n\n"
+                            f"> 🚧 门禁拦截：`{cmd}…`\n"
+                            "> 回复「确认」放行 /「拒绝」终止", 4)
                     except Exception:
                         pass
                 self.st.archive_round(tid, "pending_approval",
@@ -559,23 +616,27 @@ class Avatar:
                 continue
             if status == "review" and s["state"] != "WAIT_REVIEW":
                 s["state"] = "WAIT_REVIEW"
-                self._send_result(s, row, prefix=f"任务 #{tid} 待人工确认。")
+                self._send_result(s, row, prefix="👀 办完了，等你过目"
+                                                 "（回复「确认」完成 /「冲突」标记文件冲突）")
                 self.st.archive_round(tid, "review",
                                       {"result": (row.get("result") or "")[:500]})
                 continue
             if status in ("done", "conflict", "failed", "cancelled"):
                 self._finish(s, row)
 
-    def _approval_text(self, tid, s: dict) -> str:
+    def _approval_text(self, s: dict) -> str:
         cmd = (s.get("gate_cmd") or "").splitlines()
         cmd = (cmd[0] if cmd else "")[:60]
-        return (f"任务 #{tid} 待审批：门禁拦截命令 `{cmd}…`\n\n"
+        if cmd:
+            return (f"🚧 门禁拦截了任务里的高危命令：`{cmd}…`\n\n"
+                    "回复「确认」放行，「拒绝」终止。")
+        return ("🚧 任务里有高危操作待审批。\n\n"
                 "回复「确认」放行，「拒绝」终止。")
 
     def _send_result(self, s: dict, row: dict, prefix: str = ""):
         tid = row.get("id")
         result = (row.get("result") or "").strip()
-        head = prefix or f"任务 #{tid} 完成。"
+        head = prefix or f"🍂 **{self.cfg.avatar_name}办好了 ✅**"
         limit = int(self.cfg.get("ingress", "result_max_chars", 3000))
         long = len(result) > limit
         if s.get("card_biz"):
@@ -610,19 +671,23 @@ class Avatar:
             "error": row.get("error")})
         if status == "done":
             self._send_result(s, row)
+            self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
         elif status == "conflict":
-            self._send_result(s, row, prefix=f"任务 #{tid} 完成但检测到文件"
-                                             "冲突，请人工复核。")
+            self._send_result(s, row, prefix="✅ 办好了，但检测到文件冲突，"
+                                             "请人工复核。")
+            self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
         elif status == "failed":
-            msg = (f"任务 #{tid} 执行失败："
-                   f"{(row.get('error') or '未知错误')[:300]}")
-            if not self._card_final(s, "❌ " + msg, 5):
-                self._notify_session(s, msg)
+            err = (row.get("error") or "未知错误")[:300]
+            if not self._card_final(
+                    s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n> {err}", 5):
+                self._notify_session(s, f"❌ 没办成：{err}")
+            self._swap_ack(s, "fail_text_emotion")
         elif status == "cancelled":
-            if not self._card_final(s, f"🚫 任务 #{tid} 已取消。", 3):
-                self._notify_session(s, f"任务 #{tid} 已取消。")
+            if not self._card_final(s, "🍂 **已取消 🚫**", 3):
+                self._notify_session(s, "🚫 已取消。")
+            self._swap_ack(s, "")
         s["task_id"] = None
         if s.get("followups"):
             self.sess.start_followup_window(s)
@@ -636,11 +701,10 @@ class Avatar:
         if now - s.get("last_reprompt", 0) < cooldown:
             return
         s["last_reprompt"] = now
-        tid = s.get("task_id")
         if s["state"] == "WAIT_APPROVAL":
-            self._notify_session(s, self._approval_text(tid, s))
+            self._notify_session(s, self._approval_text(s))
         else:
-            self._notify_session(s, f"任务 #{tid} 待人工确认：回复「确认」完成，"
+            self._notify_session(s, "👀 办完了待你确认：回复「确认」完成，"
                                     "「冲突」标记文件冲突。")
 
     # ── 定时 ──

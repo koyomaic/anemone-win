@@ -33,7 +33,12 @@ class FakeDws:
     def react_text_emotion(self, cid, mid, te):
         if self.te_fail:
             return {"error": "mock fail"}
-        self.text_emotions.append(te)
+        self.text_emotions.append((mid, te))
+        return {"ok": True}
+
+    def remove_text_emotion(self, cid, mid, te):
+        self.removed_emotions = getattr(self, "removed_emotions", [])
+        self.removed_emotions.append((mid, te))
         return {"ok": True}
 
     def card_create(self, target):
@@ -180,7 +185,7 @@ def test_authorized_buffer_submit_done(avatar):
     avatar.on_event(ev("提交", n="12"))
     assert s["state"] == "RUNNING" and s["task_id"] == 1
     assert "按大区汇总" in avatar.exec_relay.submitted[0]["desc"]
-    assert avatar.dws.reacts[-1] == "赞"
+    assert "赞" not in avatar.dws.reacts   # 提交不再莫名点「赞」，开卡即回执
     # 轮询到 done → 结果回钉钉
     avatar.exec_relay.tasks[1] = {"id": 1, "status": "done",
                                   "result": "汇总完成"}
@@ -198,7 +203,8 @@ def test_gate_passthrough(avatar):
     avatar._poll_sessions()
     s = avatar.sess.sessions["o:sid200"]
     assert s["state"] == "WAIT_APPROVAL"
-    assert any("待审批" in t and "rm -rf" in t for t in texts(avatar))
+    assert any("门禁拦截" in t and "rm -rf" in t for t in texts(avatar))
+    assert not any("任务 #" in t for t in texts(avatar))   # 不展示任务编号
     avatar.dws.sent.clear()
     avatar.on_event(ev("确认", n="14"))
     assert s["state"] == "RUNNING"
@@ -218,7 +224,7 @@ def test_cancel_running(avatar):
 def test_noise_ignored(avatar):
     avatar.on_event(ev("你好", n="17"))
     assert avatar.sess.sessions["o:sid200"]["state"] == "IDLE"
-    assert avatar.dws.reacts == ["奋斗"]
+    assert avatar.dws.reacts == ["打招呼"]   # 寒暄轻回执，不是「处理中」
     assert not avatar.dws.sent
 
 
@@ -260,7 +266,8 @@ def test_ack_text_emotion(cfg):
     av.exec_relay = FakeExec()
     av.on_event(ev("统计门店日销", n="40"))
     assert av.dws.text_emotions and not av.dws.reacts
-    te = av.dws.text_emotions[0]
+    assert len(av.dws.text_emotions) == 1   # 即时回执只贴一次，不双贴
+    te = av.dws.text_emotions[0][1]
     assert te["text"] == "正在疯狂处理中..."
     assert te["emotion_id"] == "23490385"
 
@@ -295,12 +302,15 @@ def test_card_flow_submit_to_done(cfg):
     s = av.sess.sessions["o:sid200"]
     assert s.get("card_biz") == "BIZ1"
     frames = av.dws.card_frames
-    assert frames[0][2] == 1 and "正在疯狂处理中" in frames[0][1]
+    assert frames[0][2] == 1 and "正在处理…" in frames[0][1]
+    assert "已收到：统计门店日销" in frames[0][1]
+    assert "任务 #" not in frames[0][1]
     # running → 节流进度帧（拨回 card_upd 触发）
     av.exec_relay.tasks[1]["status"] = "running"
     s["card_upd"] = 0
     av._poll_sessions()
-    assert any("执行中" in c for _, c, _ in av.dws.card_frames[1:])
+    assert any("正在为你办" in c and "已用" in c
+               for _, c, _ in av.dws.card_frames[1:])
     # done → 卡片定格结果，不再重复发文本
     av.exec_relay.tasks[1] = {"id": 1, "status": "done", "result": "汇总完成"}
     av.dws.sent.clear()
@@ -335,7 +345,8 @@ def test_card_gate_keeps_card(cfg):
                                 "blocked_cmd": "rm -rf /"}
     av._poll_sessions()
     assert s.get("card_biz") == "BIZ1"   # 门禁不销卡，放行后继续刷新
-    assert any(f[2] == 4 and "待审批" in f[1] for f in av.dws.card_frames)
+    assert any(f[2] == 4 and "等你拍板" in f[1] and "rm -rf" in f[1]
+               for f in av.dws.card_frames)
 
 
 def test_card_fail_fallback_text(cfg):
@@ -349,3 +360,55 @@ def test_card_fail_fallback_text(cfg):
     av.exec_relay.tasks[tid] = {"id": tid, "status": "done", "result": "结果X"}
     av._poll_sessions()
     assert any("结果X" in t for t in texts(av))
+
+
+def test_done_swaps_emotion(cfg):
+    """完成态换图标：撤「正在疯狂处理中...」贴「✅ 已办好」（不同背景色）。"""
+    ing = cfg._p.setdefault("ingress", {})
+    ing["ack_text_emotion"] = {"emotion_id": "E1", "emotion_name": "处理中",
+                               "text": "正在疯狂处理中...",
+                               "background_id": "im_bg_2"}
+    ing["done_text_emotion"] = {"emotion_id": "E2", "emotion_name": "已办好",
+                                "text": "✅ 已办好", "background_id": "im_bg_4"}
+    ing["fail_text_emotion"] = {"emotion_id": "E3", "emotion_name": "出错了",
+                                "text": "❌ 出错了", "background_id": "im_bg_5"}
+    av = Avatar(cfg, dry=True)
+    av.dws = FakeDws({"sid200": "200"})
+    av.inbox.dws = av.dws
+    av.exec_relay = FakeExec()
+    av.on_event(ev("统计门店日销", n="60"))
+    s = av.sess.sessions["o:sid200"]
+    assert s.get("ack_msg") == ["c60", "m60"]
+    av._flush(s, uid="200")
+    tid = s["task_id"]
+    av.exec_relay.tasks[tid] = {"id": tid, "status": "done", "result": "好了"}
+    av._poll_sessions()
+    removed = getattr(av.dws, "removed_emotions", [])
+    assert removed and removed[0][1]["emotion_id"] == "E1"   # 撤处理中
+    posted = [te for _, te in av.dws.text_emotions]
+    assert any(te["emotion_id"] == "E2" for te in posted)    # 贴已办好
+    assert "ack_msg" not in s
+
+
+def test_failed_swaps_to_error_emotion(cfg):
+    ing = cfg._p.setdefault("ingress", {})
+    ing["ack_text_emotion"] = {"emotion_id": "E1", "emotion_name": "处理中",
+                               "text": "正在疯狂处理中...",
+                               "background_id": "im_bg_2"}
+    ing["fail_text_emotion"] = {"emotion_id": "E3", "emotion_name": "出错了",
+                                "text": "❌ 出错了", "background_id": "im_bg_5"}
+    av = Avatar(cfg, dry=True)
+    av.dws = FakeDws({"sid200": "200"})
+    av.inbox.dws = av.dws
+    av.exec_relay = FakeExec()
+    av.on_event(ev("跑个活", n="61"))
+    s = av.sess.sessions["o:sid200"]
+    av._flush(s, uid="200")
+    tid = s["task_id"]
+    av.exec_relay.tasks[tid] = {"id": tid, "status": "failed",
+                                "error": "boom"}
+    av._poll_sessions()
+    posted = [te for _, te in av.dws.text_emotions]
+    assert any(te["emotion_id"] == "E3" for te in posted)
+    assert any("没办成" in t for _, t in av.dws.sent) or \
+        any("没办成" in c for _, c, _ in getattr(av.dws, "card_frames", []))

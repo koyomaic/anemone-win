@@ -130,6 +130,18 @@ class Dws:
                          "--background-id", str(te.get("background_id", "")),
                          "-y", "-f", "json"], timeout=15)
 
+    def remove_text_emotion(self, conv_id: str, msg_id: str,
+                            te: dict) -> dict:
+        """移除文字表情（完成态换图标用：先撤「处理中」再贴「已办好」）。"""
+        return self.run(["chat", "message", "remove-text-emotion",
+                         "--conversation-id", conv_id,
+                         "--message-id", msg_id,
+                         "--emotion-id", str(te.get("emotion_id", "")),
+                         "--emotion-name", str(te.get("emotion_name", "")),
+                         "--text", str(te.get("text", "")),
+                         "--background-id", str(te.get("background_id", "")),
+                         "-y", "-f", "json"], timeout=15)
+
     def mark_read(self, conv_id: str, msg_id: str) -> dict:
         return self.run(["chat", "+conversation-mark-read",
                          "--conversation-id", conv_id,

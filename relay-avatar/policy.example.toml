@@ -23,7 +23,9 @@ session_ttl_sec = 1800         # 会话上下文（resume_from）有效期
 poll_sec = 3                   # relay 任务状态轮询间隔
 result_max_chars = 3000        # 结果超长截断，全文走附件
 ack_emoji = "奋斗"              # 收到回执兜底表情（文字表情未配置/失败时用）
-submit_emoji = "赞"
+submit_emoji = ""              # 提交回执：留空=不贴（开流式卡片即是回执，不再莫名点「赞」）
+noise_emoji = "打招呼"          # 寒暄/噪音消息的轻回执
+followup_emoji = "OK"          # 任务运行中收到补充消息的回执
 use_card = true                # 流式卡片：提交即开卡「正在处理」，状态跳变更新，完成定格结果
 card_progress_sec = 30         # 运行中卡片进度刷新节流（秒）
 noise_ignore = ["你好", "您好", "在吗", "在么", "hi", "hello", "嗯", "嗯嗯",
@@ -39,6 +41,20 @@ self_poll_interval_sec = 5
 emotion_id = ""
 emotion_name = "处理中"
 text = "正在疯狂处理中..."
+background_id = ""
+
+[ingress.done_text_emotion]
+# 完成态换图标：撤「处理中」贴「已办好」（不同模板=不同背景色，一眼区分终态）
+emotion_id = ""
+emotion_name = "已办好"
+text = "✅ 已办好"
+background_id = ""
+
+[ingress.fail_text_emotion]
+# 失败态换图标
+emotion_id = ""
+emotion_name = "出错了"
+text = "❌ 出错了"
 background_id = ""
 
 [keywords]
