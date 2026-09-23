@@ -1,0 +1,102 @@
+# relay-avatar 策略配置（权限/约束/安全唯一真源，两入口共读）
+# 部署位：$AVATAR_STATE_DIR/policy.toml（provision 首装从本模板拷贝，之后本机演进不覆盖）
+# 铁律：凭据一律走 env 文件（shared/secrets/relay-avatar.env，600），本文件不出现任何密钥。
+
+[identity]
+avatar_name = "智微办"
+owner_name = "王洪彬"
+owner_userid = "18434"
+# 本人 openDingTalkId：事件流里自己发的消息直接丢弃（平台 self-loop 双保险之一）
+self_open_id = "D8YACgStfKBfWDE6Jwr6sZFGR45xXK0wc"
+# 多账号机必填（所有 dws 调用强制 --profile）；.35 单账号机留空=本机默认登录态
+dws_profile = ""
+# 出站消息末尾署名（可空）；SELF_MARK 隐形标识另由程序维护，不在此配
+sign = ""
+
+[ingress]
+# 群@ 事件（user_im_message_receive_at）仅在 [group] enabled=true 时订阅
+event_keys = ["user_im_message_receive_o2o_all"]
+idle_watchdog_sec = 270        # 事件流空闲多久强制重连（钉钉长连接 ~300s 静默断）
+debounce_sec = 20              # 聚合窗口
+followup_debounce_sec = 30     # 任务结束后追问聚合窗口
+session_ttl_sec = 1800         # 会话上下文（resume_from）有效期
+poll_sec = 3                   # relay 任务状态轮询间隔
+result_max_chars = 3000        # 结果超长截断，全文走附件
+ack_emoji = "收到"
+submit_emoji = "赞"
+noise_ignore = ["你好", "您好", "在吗", "在么", "hi", "hello", "嗯", "嗯嗯",
+                "好的", "好", "收到", "ok", "OK", "谢谢", "多谢", "辛苦了", "测试"]
+self_poll = false              # P2：轮询本人单聊（账号自发消息不进事件流的补充通道）
+self_poll_interval_sec = 5
+
+[keywords]
+submit = ["提交", "开始执行"]
+cancel = ["取消"]
+confirm = ["确认", "同意"]
+deny = ["拒绝", "不同意"]
+conflict = ["冲突"]
+
+[group]
+enabled = false                # 群@监听默认关；开启需显式改本文件（决策留痕）
+
+[permissions]
+default_mode = "whitelist"     # whitelist=名单外一律 guest（引导申请授权）；blacklist 需显式配置
+superadmin = ["18434"]         # super：全权 + 审批动态白名单
+admins = []                    # L1：管理员
+whitelist = []                 # L2：静态白名单
+blacklist = []                 # BLOCKED
+file_uploaders = []            # L3 静态：只能传文件+就自己文件问答
+grant_valid_days = 90          # 动态授权强制过期天数（修 fenshen P1 无过期）
+
+[execution]
+default_backend = "relay"      # 主执行走 relay 门禁体系
+local_enabled = false          # P2：local claude 后端（仅 self/L3，约束同表，升级不降级）
+local_allowed_for = ["self", "l3"]
+
+[claude]
+# tier → claude 权限映射（修 fenshen P0：L2 不再 bypassPermissions）
+permission_mode_super = "bypassPermissions"
+permission_mode_l2 = "default"
+l2_allowed_tools = ["Read", "Glob", "Grep", "LS"]
+permission_mode_l3 = "manual"
+l3_permission_prompts = "none"
+l3_disallowed_tools = "Bash Write Edit MultiEdit WebFetch WebSearch"
+session_ttl_sec = 3600
+
+[security]
+l2_lockdown = true             # L2 沙箱：cwd 限共享区 + 禁 Bash（fenshen 默认关→这里默认开）
+l2_sandbox_dir = "/mnt/vol-eltaah12/workspace/shared/work"
+profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
+sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
+rate_limit_daily_tasks = 100   # 每用户日任务数上限
+reprompt_cooldown_sec = 60     # 门禁无关消息重提示冷却
+bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt"]  # 「AI助理」类账号永久静默丢弃
+media_max_size_mb = 20
+media_allowed_ext = [".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml",
+                     ".docx", ".doc", ".pdf", ".xlsx", ".xls", ".pptx", ".ppt",
+                     ".png", ".jpg", ".jpeg", ".gif", ".m4a", ".mp3", ".wav",
+                     ".mp4", ".zip", ".tar", ".gz"]
+
+[store]
+root = "/mnt/vol-eltaah12/workspace/shared"   # store 存储根（=RELAY_SHARED 同址）
+cli = "/usr/local/bin/store"
+least_privilege = true         # 强制走 index/store-task.env 的 store_task 角色；禁读 relay.env 与 /proc/*/environ
+staging_fallback = true        # DB 不可达：先落 run/staging 暂存并回执，恢复后补登记（不静默绕过）
+
+[knowledge]
+local_dir = "/mnt/vol-eltaah12/workspace/shared/knowledge"
+wiki_enabled = false           # P2：jingboWiki 权威源检索（凭据走 env JINGBOWIKI_*）
+recall_max_files = 6
+recall_char_budget = 3000
+
+[group_watch]
+enabled = false                # P4：群监控采集/提炼全链路；开启需显式改本文件+评审
+retention_days = 30
+
+[monitor]
+heartbeat_sec = 30
+probe_interval_sec = 300
+dashboard_enabled = true
+dashboard_port = 8791          # .35 独立端口（87xx 段：8787 relay/8788 TLS/8790 proxy/8791 avatar）
+alert_to = "18434"             # critical 告警接收人（王洪彬）
+alert_repeat_hours = 6         # 同一持续异常最多每 6h 重提

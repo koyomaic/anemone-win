@@ -1,5 +1,10 @@
 # im-bridge — 钉钉消息 → relay 任务桥
 
+> **已弃用（2026-09-23）**：由 [`relay-avatar/`](../relay-avatar/README.md) 演进替代
+> （双入口统一分身网关，能力超集）。provision 29b/29c 负责安装 relay-avatar、
+> 迁移本组件状态（`app/migrate.py` 幂等）并回收旧 unit/marker；本目录仅留档，
+> 不再接受新功能。
+
 监听 dws 认证账号收到的钉钉单聊消息（群监听可选，默认关），聚合后提交本机
 relay 执行，结果以账号名义回复。默认**安装但不启用**，具备随时启动能力。
 

@@ -654,36 +654,67 @@ if [ -d "$DWS_SEED" ] && command -v dws >/dev/null; then
   rm -rf "$WORK"
 else warn "跳过（无种子或无 dws）"; fi
 
-# ---------- 29b IM Bridge（SOFT，默认不启用，marker 开关随时启动） ----------
-step "IM Bridge"
-IMB_SRC="$RES_ROOT/im-bridge"
-IMB_DIR=/opt/team/relay-im-bridge
-IMB_STATE="$WORKSPACE/im-bridge"
-IMB_UNIT=relay-im-bridge.service
-IMB_MARKER=/etc/relay-im-bridge.enabled
-if [ -d "$IMB_SRC" ]; then
+# ---------- 29b relay-avatar（SOFT，默认不启用，marker 开关随时启动；im-bridge 演进替代） ----------
+# 双入口统一分身网关：钉钉(dws)+relay API → 同一策略核（policy.toml）→ relay/local 双后端。
+# 首装自动迁移 im-bridge 状态（app/migrate.py 幂等：env/policy/state/rounds/events+integrity 基线）。
+# 启用语义沿用 31b：touch /etc/relay-avatar.enabled 后 install 轮自动 enable --now；
+# marker 在但服务不活/心跳不新鲜 = FAIL 预警。依赖：store CLI（21e）+ dws 登录态（19/29）。
+step "relay-avatar"
+AVA_SRC="$RES_ROOT/relay-avatar"
+AVA_DIR=/opt/team/relay-avatar
+AVA_STATE="$WORKSPACE/avatar"
+AVA_UNIT=relay-avatar.service
+AVA_MARKER=/etc/relay-avatar.enabled
+if [ ! -d "$AVA_SRC" ]; then warn "资源树无 relay-avatar 目录（旧版本？）"
+else
   if heal; then
-    mkdir -p "$IMB_DIR" "$IMB_STATE/rounds" "$IMB_STATE/media"
-    cp -f "$IMB_SRC/bridge.py" "$IMB_SRC/bridge-cli" "$IMB_DIR/"
-    chmod 755 "$IMB_DIR/bridge.py" "$IMB_DIR/bridge-cli"
-    [ -f "$IMB_STATE/config.json" ] || cp "$IMB_SRC/config.example.json" "$IMB_STATE/config.json"
-    sed -e "s|@VENV_PY@|$VENV/bin/python|" -e "s|@BRIDGE_DIR@|$IMB_DIR|" -e "s|@STATE_DIR@|$IMB_STATE|" \
-        "$IMB_SRC/relay-im-bridge.service.template" > "$UNIT_DIR/$IMB_UNIT"
+    mkdir -p "$AVA_DIR"
+    rm -rf "$AVA_DIR/app"
+    cp -r "$AVA_SRC/app" "$AVA_DIR/app"
+    cp -f "$AVA_SRC/avatar-cli" "$AVA_SRC/policy.example.toml" "$AVA_SRC/README.md" "$AVA_DIR/" 2>/dev/null
+    cp -f "$AVA_SRC/relay-avatar.service.template" "$AVA_DIR/" 2>/dev/null
+    find "$AVA_DIR" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+    chmod 755 "$AVA_DIR/avatar-cli"
+    "$VENV/bin/python" "$AVA_DIR/app/migrate.py" --workspace "$WORKSPACE" >/dev/null 2>&1 \
+      || warn "状态迁移失败（手动排查: $VENV/bin/python $AVA_DIR/app/migrate.py --workspace $WORKSPACE）"
+    sed -e "s|@VENV_PY@|$VENV/bin/python|" -e "s|@AVATAR_DIR@|$AVA_DIR|" -e "s|@STATE_DIR@|$AVA_STATE|" \
+        "$AVA_SRC/relay-avatar.service.template" > "$UNIT_DIR/$AVA_UNIT"
     systemctl daemon-reload
   fi
-  if [ -f "$IMB_MARKER" ]; then
-    if heal; then systemctl enable --now "$IMB_UNIT" 2>/dev/null; fi
-    if systemctl is-active --quiet "$IMB_UNIT"; then ok "enabled+active（名单/参数 $IMB_STATE/config.json）"
-    elif heal; then bad "marker 在但服务拉不起来（journalctl -u $IMB_UNIT）"
-    else bad "marker 在但服务未运行"; fi
+  if [ -f "$AVA_MARKER" ]; then
+    if heal; then systemctl enable --now "$AVA_UNIT" 2>/dev/null; fi
+    if ! systemctl is-active --quiet "$AVA_UNIT"; then
+      if heal; then bad "marker 在但服务拉不起来（journalctl -u $AVA_UNIT）"
+      else bad "marker 在但服务未运行"; fi
+    else
+      HB_AGE=999
+      [ -f "$AVA_STATE/run/heartbeat" ] && HB_AGE=$(( $(date +%s) - $(cat "$AVA_STATE/run/heartbeat" 2>/dev/null || echo 0) ))
+      DASH_PORT="$(sed -n 's/^.*dashboard_port = \([0-9]*\).*/\1/p' "$AVA_STATE/policy.toml" 2>/dev/null | tail -1)"
+      DASH_PORT="${DASH_PORT:-8791}"
+      if [ "$HB_AGE" -gt 120 ]; then bad "服务活但心跳不新鲜（age=${HB_AGE}s，判活=进程在+心跳新鲜）"
+      elif ! curl -sf -m 3 "http://127.0.0.1:$DASH_PORT/health" >/dev/null 2>&1; then
+        warn "服务活+心跳新鲜，但看板 :$DASH_PORT 不可达（dashboard_enabled=false 时属预期）"
+      else ok "enabled+active 心跳${HB_AGE}s前 看板:$DASH_PORT（策略 $AVA_STATE/policy.toml）"; fi
+    fi
   else
-    if heal; then systemctl disable --now "$IMB_UNIT" 2>/dev/null; fi
-    if [ -f "$UNIT_DIR/$IMB_UNIT" ]; then ok "已安装未启用（启用: touch $IMB_MARKER && systemctl enable --now $IMB_UNIT）"
+    if heal; then systemctl disable --now "$AVA_UNIT" 2>/dev/null; fi
+    if [ -f "$UNIT_DIR/$AVA_UNIT" ]; then ok "已安装未启用（启用: touch $AVA_MARKER && systemctl enable --now $AVA_UNIT）"
     elif heal; then bad "unit 安装失败"
     else warn "未安装（install 模式自动安装）"; fi
   fi
-  [ -f "$IMB_STATE/bridge.env" ] || warn "bridge.env 缺失（启用前需建 relay 用户+设备激活，见 im-bridge/README.md）"
-else warn "资源树无 im-bridge 目录（旧版本？）"; fi
+  [ -f "$WORKSPACE/shared/secrets/relay-avatar.env" ] || warn "relay-avatar.env 缺失（启用前需填 RELAY_DEVICE_ID/SECRET，见 relay-avatar/README.md）"
+fi
+
+# ---------- 29c im-bridge 退役（状态已迁移 relay-avatar；旧代码/状态目录留痕不删） ----------
+step "im-bridge退役"
+if [ -f "$UNIT_DIR/relay-im-bridge.service" ] || [ -f /etc/relay-im-bridge.enabled ]; then
+  if heal; then
+    systemctl disable --now relay-im-bridge.service 2>/dev/null
+    rm -f "$UNIT_DIR/relay-im-bridge.service" "$UNIT_DIR/relay-im-bridge.service.provision-bak" /etc/relay-im-bridge.enabled
+    systemctl daemon-reload
+    ok "unit/marker 已回收（代码 /opt/team/relay-im-bridge 与状态 $WORKSPACE/im-bridge 留痕）"
+  else warn "旧 unit/marker 待回收（install 模式自动）"; fi
+else ok "无残留"; fi
 
 # ---------- 30 本机私有附加检查（SOFT，可选 hook） ----------
 step "本机附加检查"

@@ -14,6 +14,7 @@
 | Claude 代理 | `claude-proxy.service` | 可选：Anthropic→OpenAI 翻译代理 :8790 |
 | TLS 代理 | `relay-tls-proxy.service` | 可选：仅 HTTPS 主机（有 relay-tls 证书才装），socat 回环明文 :8787→TLS :8788（仅本机健康检查兼容） |
 | store 台账 | —（CLI，`/usr/local/bin/store`） | 业务存储统一索引：磁盘为文件真身、PostgreSQL（relay 同库 `public` schema、`store_` 前缀）为权威索引与血缘、`index/manifest.jsonl` 为降级快照。存储根＝relay 的 `shared_dir`（同址是刻意的，见 `boot.env.example` 的 `STORE_ROOT` 说明）；约定见 workspace `AGENTS.md`「共享区约定」 |
+| 分身网关 | `relay-avatar.service` | 双入口统一分身网关（im-bridge 演进替代）：钉钉(dws)+relay API → 同一策略核 `policy.toml`（权限分层/审批流/限流/注入清洗/审计）→ relay 后端（默认，门禁透传）/local claude 后端（仅 self/L3，默认关）。代码 `/opt/team/relay-avatar`、状态 `workspace/avatar/`、看板 `:8791`（X-Token）、凭据 `shared/secrets/relay-avatar.env`（600）。**默认不启用**：`touch /etc/relay-avatar.enabled` 后 install 轮自动拉起；上传文件自动落 `shared/data/` store 台账（DB 不可达先暂存补登记）。详见 `relay-avatar/README.md` |
 
 ## 新服务器一键安装
 
@@ -74,7 +75,8 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 29b | GitHub 访问就绪：SSH（默认）→ config `accept-new` 固化、无密钥自动生成、认证实测；HTTPS（备用）→ 查 `/root/.git-credentials` | config/密钥自愈；认证失败 WARN 附公钥与 Deploy keys 登记指引 | 软 |
 | 30 | GitHub 远端可达且 remote==current | 仅报告 | 软 |
 | 31 | dws 种子登录态实测（contact user me） | 仅报告 | 软 |
-| 31b | IM Bridge（`im-bridge/`，钉钉消息→relay 任务桥）：代码装 `/opt/team/relay-im-bridge`、状态在 `workspace/im-bridge/`、unit 渲染安装；**默认不启用**，`touch /etc/relay-im-bridge.enabled` 后 install 轮自动 enable --now；marker 在但拉不起=FAIL | 安装/按 marker 启停 | 软 |
+| 31b | relay-avatar（`relay-avatar/`，双入口统一分身网关，im-bridge 演进替代）：代码装 `/opt/team/relay-avatar`、状态在 `workspace/avatar/`、unit 渲染安装；首装自动迁移 im-bridge 状态（`app/migrate.py` 幂等：bridge.env→`shared/secrets/relay-avatar.env` 补随机看板 token、config.json 名单→policy.toml、state/rounds/events 拷贝、integrity 基线）；**默认不启用**，`touch /etc/relay-avatar.enabled` 后 install 轮自动 enable --now；marker 在但拉不起/心跳不新鲜=FAIL，看板 :8791 不可达=WARN | 安装/迁移/按 marker 启停 | 软 |
+| 31c | im-bridge 退役：旧 unit/marker 回收（代码 `/opt/team/relay-im-bridge` 与状态 `workspace/im-bridge/` 留痕不删） | disable+rm unit/marker | 软 |
 | 32 | provision-local.sh 本机附加检查 | 执行 hook | 软 |
 
 硬项失败：install 模式立即中止（后续项依赖它），退出码 1；软项失败只 WARN，退出码不受影响。
