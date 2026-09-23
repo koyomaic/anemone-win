@@ -1,8 +1,27 @@
-"""tests/test_monitor.py —— 心跳/快照结构/告警跳变逻辑（dws mock）。"""
+"""tests/test_monitor.py —— 心跳/快照结构/告警跳变逻辑（dws mock）。
+
+hermetic：屏蔽真机 systemctl/relay 探活（机群门禁不受宿主机服务状态抖动影响），
+快照里 relay/timer 恒 ok，变量只剩心跳/入站/资源。
+"""
 import json
 import time
 
+import pytest
+
+import app.monitor as M
 from app.monitor import Monitor
+
+
+@pytest.fixture(autouse=True)
+def hermetic(monkeypatch):
+    monkeypatch.setattr(M, "_http_version",
+                        lambda url, timeout=5: (True, "testver"))
+    monkeypatch.setattr(M, "_run", lambda cmd, timeout=10: (0, "active"))
+    # 资源恒定安全区，避免宿主磁盘/内存水位引入额外 issue
+    monkeypatch.setattr(M, "_mem_pct", lambda: 42)
+    import shutil as _sh
+    monkeypatch.setattr(_sh, "disk_usage",
+                        lambda p: _sh._ntuple_diskusage(100, 42, 58))
 
 
 class FakeDws:

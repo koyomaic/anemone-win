@@ -50,6 +50,8 @@ def migrate(ws: Path, dry: bool = False) -> dict:
         have = {l.split("=", 1)[0] for l in lines if "=" in l}
         if "AVATAR_DASHBOARD_TOKEN" not in have:
             lines.append(f"AVATAR_DASHBOARD_TOKEN={pysecrets.token_hex(16)}")
+        if "AVATAR_DASHBOARD_PASSWORD" not in have:
+            lines.append(f"AVATAR_DASHBOARD_PASSWORD={pysecrets.token_hex(8)}")
         header = ["# relay-avatar 凭据（migrate.py 生成，600，不进 git）"]
         if not dry:
             secrets_dir.mkdir(parents=True, exist_ok=True)

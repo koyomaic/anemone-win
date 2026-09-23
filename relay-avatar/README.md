@@ -25,7 +25,9 @@ B. relay API 客户端              monitor/ 心跳+入站健康+probe      loca
   `index/store-task.env` 最小权限角色，禁读 relay.env 与 /proc/*/environ。
   DB 不可达时上传文件先落 `run/staging` 暂存，恢复后自动补登记。
 - **监控**：heartbeat 30s + inbound_health 三态（ok/bad_credentials/stalled）+
-  probe 快照 + 看板 `:8791`（X-Token）+ critical 钉钉告警（状态跳变才推，6h 重提）。
+  probe 快照 + 看板 `:8791`（人：口令登录页+会话 cookie 12h，防爆破同 IP 15 分钟
+  失败 5 次锁定；机：X-Token 走 `AVATAR_DASHBOARD_TOKEN`，probe POST /report 用）
+  + critical 钉钉告警（状态跳变才推，6h 重提）。
 - **安全默认收紧**（修 fenshen 审计 P0/P1）：L2 不再 bypassPermissions、
   注入清洗不可关、动态授权强制过期、bot 永久拉黑、profile 缺失留痕、
   凭据只进 env 文件（600）、integrity 漂移检测+告警+固化快照。
