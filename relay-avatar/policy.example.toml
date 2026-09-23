@@ -6,9 +6,10 @@
 avatar_name = "智微办"
 owner_name = "王洪彬"
 owner_userid = "18434"
-# 本人 openDingTalkId：事件流里自己发的消息直接丢弃（平台 self-loop 双保险之一）
-self_open_id = "D8YACgStfKBfWDE6Jwr6sZFGR45xXK0wc"
-# 多账号机必填（所有 dws 调用强制 --profile）；.35 单账号机留空=本机默认登录态
+# 本机 dws 登录账号的 openDingTalkId（`dws contact user me` 查询）——机队各机
+# 用自己的 dws 认证，此值必须按本机账号填；用于过滤本账号自发消息（self-loop 双保险）
+self_open_id = ""
+# 多账号机必填（所有 dws 调用强制 --profile）；单账号机留空=本机默认登录态
 dws_profile = ""
 # 出站消息末尾署名（可空）；SELF_MARK 隐形标识另由程序维护，不在此配
 sign = ""
@@ -35,12 +36,11 @@ self_poll_interval_sec = 5
 
 [ingress.ack_text_emotion]
 # 收到回执首选：钉钉文字表情（贴原消息的小图标，显示自定义文字）。
-# emotion_id/background_id 由 `dws chat message create-text-emotion --emotion-name 马上办
-# --text "收到啦，马上为你办～"` 创建后回填（账号维度，一次创建长期有效；背景色由
-# 服务端分配、请求值仅供参考，多摇几次可拿到互不相同的底色）；留空则回落 ack_emoji。
-# 三态三色约定：处理中/办妥/出错各用不同 background_id，一眼可辨。
-# 下面三枚模板 ID 为王洪彬账号（机队共享 dws 种子）账号级模板，机群通用；
-# 换账号的机器需自建替换（ID 无效时自动回落 ack_emoji，不会报错刷屏）。
+# 文字表情模板**机队共用**（同组织内 ID 通用；各机 dws 认证独立但直接用即可）。
+# 如需新模板：`dws chat message create-text-emotion --emotion-name 马上办
+# --text "收到啦，马上为你办～"`，背景色由服务端分配（--background-id 仅参考），
+# 多摇几次直到三态底色互不相同。ID 无效时自动回落 ack_emoji，不影响主流程。
+# 三态三色约定：处理中 im_bg_1 / 办妥 im_bg_3 / 出错 im_bg_5，一眼可辨。
 # 注意：TOML 子表必须放在 [ingress] 全部简单键之后，否则后续键会被卷进子表。
 emotion_id = "23494072"
 emotion_name = "马上办"

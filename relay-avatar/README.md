@@ -39,7 +39,12 @@ B. relay API 客户端              monitor/ 心跳+入站健康+probe      loca
 - 首装自动从 `im-bridge/` 迁移状态（`app/migrate.py`，幂等）：bridge.env →
   `shared/secrets/relay-avatar.env`（补随机看板 token）、config.json 名单 →
   policy.toml、state/rounds/events 拷贝；旧 unit/marker 由 provision 回收。
-- 依赖：store CLI（provision 21e）+ `store ping` 可达；dws 登录态种子。
+- 依赖：store CLI（provision 21e）+ `store ping` 可达；dws 登录态。
+- **机队各机用自己的 dws 认证（每服务器独立登录，非共享账号）**，启用前按本机补两处：
+  1. `policy.toml [identity] self_open_id`＝本机账号 openId（`dws contact user me`）
+  2. relay 面板注册本机设备 → 填 `relay-avatar.env` 的 `RELAY_DEVICE_ID/SECRET`
+- 文字表情模板（马上办/办妥啦/出错了）**机队共用**，example 已带 ID，各机直接用。
+- superadmin/alert_to 保持王洪彬（18434）：审批通知与告警跨账号按 userId 直发，同组织可达。
 
 ## 文件
 
