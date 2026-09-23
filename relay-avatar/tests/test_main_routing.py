@@ -11,7 +11,9 @@ class FakeDws:
         self.uids = uids or {}
         self.sent = []
         self.reacts = []
+        self.text_emotions = []
         self.reads = []
+        self.te_fail = False
 
     def resolve_userid(self, open_id, sender, cache):
         return self.uids.get(open_id, "")
@@ -27,6 +29,25 @@ class FakeDws:
     def react(self, cid, mid, emoji):
         self.reacts.append(emoji)
         return {"ok": True}
+
+    def react_text_emotion(self, cid, mid, te):
+        if self.te_fail:
+            return {"error": "mock fail"}
+        self.text_emotions.append(te)
+        return {"ok": True}
+
+    def card_create(self, target):
+        if self.te_fail:
+            return ""
+        self.cards = getattr(self, "cards", 0) + 1
+        return "BIZ1"
+
+    def card_update(self, biz, content, flow_status):
+        if self.te_fail:
+            return False
+        self.card_frames = getattr(self, "card_frames", [])
+        self.card_frames.append((biz, content, flow_status))
+        return True
 
     def mark_read(self, cid, mid):
         self.reads.append(mid)
@@ -153,7 +174,7 @@ def test_authorized_buffer_submit_done(avatar):
     avatar.on_event(ev("统计门店日销", n="10"))
     s = avatar.sess.sessions["o:sid200"]
     assert s["state"] == "BUFFERING"
-    assert avatar.dws.reacts == ["收到"]
+    assert avatar.dws.reacts == ["奋斗"]
     avatar.on_event(ev("按大区汇总", n="11"))
     assert len(s["buffer"]) == 2
     avatar.on_event(ev("提交", n="12"))
@@ -197,7 +218,7 @@ def test_cancel_running(avatar):
 def test_noise_ignored(avatar):
     avatar.on_event(ev("你好", n="17"))
     assert avatar.sess.sessions["o:sid200"]["state"] == "IDLE"
-    assert avatar.dws.reacts == ["收到"]
+    assert avatar.dws.reacts == ["奋斗"]
     assert not avatar.dws.sent
 
 
@@ -226,3 +247,105 @@ def test_events_persisted(avatar):
     avatar.handle_line(json.dumps(ev("存档测试", n="32"), ensure_ascii=False))
     files = list(avatar.cfg.state.glob("events-*.ndjson"))
     assert files and "存档测试" in files[0].read_text("utf-8")
+
+
+def test_ack_text_emotion(cfg):
+    """配置文字表情后：收到回执贴「正在疯狂处理中...」小图标，不再用默认 emoji。"""
+    cfg._p.setdefault("ingress", {})["ack_text_emotion"] = {
+        "emotion_id": "23490385", "emotion_name": "处理中",
+        "text": "正在疯狂处理中...", "background_id": "im_bg_2"}
+    av = Avatar(cfg, dry=True)
+    av.dws = FakeDws({"sid200": "200"})
+    av.inbox.dws = av.dws
+    av.exec_relay = FakeExec()
+    av.on_event(ev("统计门店日销", n="40"))
+    assert av.dws.text_emotions and not av.dws.reacts
+    te = av.dws.text_emotions[0]
+    assert te["text"] == "正在疯狂处理中..."
+    assert te["emotion_id"] == "23490385"
+
+
+def test_ack_text_emotion_fallback(cfg):
+    """文字表情失败 → 回落 ack_emoji。"""
+    cfg._p.setdefault("ingress", {})["ack_text_emotion"] = {
+        "emotion_id": "1", "emotion_name": "处理中",
+        "text": "正在疯狂处理中...", "background_id": "im_bg_2"}
+    av = Avatar(cfg, dry=True)
+    av.dws = FakeDws({"sid200": "200"})
+    av.dws.te_fail = True
+    av.inbox.dws = av.dws
+    av.exec_relay = FakeExec()
+    av.on_event(ev("统计门店日销", n="41"))
+    assert av.dws.reacts == ["奋斗"]
+
+
+def make_card_avatar(cfg):
+    cfg._p.setdefault("ingress", {})["use_card"] = True
+    av = Avatar(cfg, dry=True)
+    av.dws = FakeDws({"sid200": "200"})
+    av.inbox.dws = av.dws
+    av.exec_relay = FakeExec()
+    return av
+
+
+def test_card_flow_submit_to_done(cfg):
+    av = make_card_avatar(cfg)
+    av.on_event(ev("统计门店日销", n="50"))
+    av.on_event(ev("提交", n="51"))
+    s = av.sess.sessions["o:sid200"]
+    assert s.get("card_biz") == "BIZ1"
+    frames = av.dws.card_frames
+    assert frames[0][2] == 1 and "正在疯狂处理中" in frames[0][1]
+    # running → 节流进度帧（拨回 card_upd 触发）
+    av.exec_relay.tasks[1]["status"] = "running"
+    s["card_upd"] = 0
+    av._poll_sessions()
+    assert any("执行中" in c for _, c, _ in av.dws.card_frames[1:])
+    # done → 卡片定格结果，不再重复发文本
+    av.exec_relay.tasks[1] = {"id": 1, "status": "done", "result": "汇总完成"}
+    av.dws.sent.clear()
+    av._poll_sessions()
+    last = av.dws.card_frames[-1]
+    assert last[2] == 3 and "汇总完成" in last[1]
+    assert "card_biz" not in s
+    assert not av.dws.sent
+
+
+def test_card_long_result_sends_file(cfg):
+    av = make_card_avatar(cfg)
+    av.on_event(ev("长文任务", n="55"))
+    av._flush(av.sess.sessions["o:sid200"], uid="200")
+    s = av.sess.sessions["o:sid200"]
+    tid = s["task_id"]
+    av.exec_relay.tasks[tid] = {"id": tid, "status": "done",
+                                "result": "长" * 5000}
+    av._poll_sessions()
+    last = av.dws.card_frames[-1]
+    assert last[2] == 3 and "全文见附件" in last[1]
+    assert any("[file]" in t for _, t in av.dws.sent)
+
+
+def test_card_gate_keeps_card(cfg):
+    av = make_card_avatar(cfg)
+    av.on_event(ev("删库", n="52"))
+    av._flush(av.sess.sessions["o:sid200"], uid="200")
+    s = av.sess.sessions["o:sid200"]
+    tid = s["task_id"]
+    av.exec_relay.tasks[tid] = {"id": tid, "status": "pending_approval",
+                                "blocked_cmd": "rm -rf /"}
+    av._poll_sessions()
+    assert s.get("card_biz") == "BIZ1"   # 门禁不销卡，放行后继续刷新
+    assert any(f[2] == 4 and "待审批" in f[1] for f in av.dws.card_frames)
+
+
+def test_card_fail_fallback_text(cfg):
+    av = make_card_avatar(cfg)
+    av.dws.te_fail = True   # card_create/update 均失败
+    av.on_event(ev("统计", n="53"))
+    av.on_event(ev("提交", n="54"))
+    s = av.sess.sessions["o:sid200"]
+    assert not s.get("card_biz")
+    tid = s["task_id"]
+    av.exec_relay.tasks[tid] = {"id": tid, "status": "done", "result": "结果X"}
+    av._poll_sessions()
+    assert any("结果X" in t for t in texts(av))

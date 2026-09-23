@@ -86,10 +86,23 @@ class Avatar:
         self._notify({"user_id": str(uid)}, text)
 
     def _react(self, s: dict, cfg_key: str):
-        emoji = self.cfg.get("ingress", cfg_key)
         mid = s.get("last_msg_id") or ""
         cid = s.get("last_conv_id") or ""
-        if not emoji or not mid or not cid:
+        if not mid or not cid:
+            return
+        if cfg_key == "ack_emoji":
+            te = self.cfg.section("ingress").get("ack_text_emotion") or {}
+            if te.get("emotion_id") and te.get("text"):
+                try:
+                    r = self.dws.react_text_emotion(cid, mid, te)
+                    if not (r.get("error") or r.get("errorMsg")):
+                        return
+                    log("text-emotion ack failed, fallback emoji:",
+                        str(r)[:120])
+                except Exception as e:
+                    log("text-emotion ack failed, fallback emoji:", e)
+        emoji = self.cfg.get("ingress", cfg_key)
+        if not emoji:
             return
         try:
             self.dws.react(cid, mid, str(emoji))
@@ -452,7 +465,61 @@ class Avatar:
             "ingress": "dingtalk", "backend": "relay",
             "tier": self.policy.get_level(uid)})
         self._react(s, "submit_emoji")
+        self._card_open(s, tid, desc)
         log(f"task #{tid} submitted (resume={resume})")
+
+    # ── 流式卡片（提交即开卡，状态跳变更新，完成定格） ──
+    def _card_open(self, s: dict, tid, desc: str):
+        if not self.cfg.get("ingress", "use_card", True):
+            return
+        try:
+            biz = self.dws.card_create(s["reply"])
+        except Exception as e:
+            log("card create failed:", e)
+            return
+        if not biz:
+            return
+        s["card_biz"] = biz
+        s["card_hint"] = (desc.splitlines() or [""])[0][:40]
+        s["card_start"] = time.time()
+        s["card_upd"] = time.time()
+        try:
+            self.dws.card_update(
+                biz, self._card_progress(s, tid, "已提交，正在排队执行…"), 1)
+        except Exception as e:
+            log("card first frame failed:", e)
+
+    def _card_progress(self, s: dict, tid, note: str) -> str:
+        return (f"🍂 **{self.cfg.avatar_name}正在疯狂处理中…**\n\n"
+                f"> 📥 {s.get('card_hint') or ''}\n> ⏳ 任务 #{tid}：{note}")
+
+    def _card_beat(self, s: dict, tid, status: str):
+        """运行中进度刷新（节流 card_progress_sec，防钉钉客户端合并帧）。"""
+        biz = s.get("card_biz")
+        if not biz:
+            return
+        gap = int(self.cfg.get("ingress", "card_progress_sec", 30))
+        now = time.time()
+        if now - s.get("card_upd", 0) < gap:
+            return
+        s["card_upd"] = now
+        used = int(now - s.get("card_start", now))
+        word = "排队中" if status == "queued" else "执行中"
+        try:
+            self.dws.card_update(
+                biz, self._card_progress(s, tid, f"{word}…（已用 {used}s）"), 1)
+        except Exception:
+            pass
+
+    def _card_final(self, s: dict, content: str, status: int = 3) -> bool:
+        biz = s.pop("card_biz", None)
+        if not biz:
+            return False
+        try:
+            return bool(self.dws.card_update(biz, content[:2500], status))
+        except Exception as e:
+            log("card final failed:", e)
+            return False
 
     # ── relay 任务轮询 ──
     def _poll_sessions(self):
@@ -471,11 +538,22 @@ class Avatar:
             if status in ("queued", "running"):
                 if s["state"] != "RUNNING":
                     s["state"] = "RUNNING"
+                self._card_beat(s, tid, status)
                 continue
             if status == "pending_approval" and s["state"] != "WAIT_APPROVAL":
                 s["state"] = "WAIT_APPROVAL"
                 s["gate_cmd"] = row.get("blocked_cmd") or ""
                 self._notify_session(s, self._approval_text(tid, s))
+                if s.get("card_biz"):
+                    cmd = (s.get("gate_cmd") or "").splitlines()
+                    cmd = (cmd[0] if cmd else "")[:60]
+                    try:
+                        # 不销卡：放行后任务继续，卡片随后续状态刷新
+                        self.dws.card_update(s["card_biz"], self._card_progress(
+                            s, tid,
+                            f"待审批：`{cmd}…` 回复「确认」放行，「拒绝」终止"), 4)
+                    except Exception:
+                        pass
                 self.st.archive_round(tid, "pending_approval",
                                       row.get("blocked_cmd"))
                 continue
@@ -499,20 +577,30 @@ class Avatar:
         result = (row.get("result") or "").strip()
         head = prefix or f"任务 #{tid} 完成。"
         limit = int(self.cfg.get("ingress", "result_max_chars", 3000))
-        if len(result) > limit:
-            fp = self.st.rounds / f"{tid}_result.md"
-            try:
-                fp.write_text(result, encoding="utf-8")
-                self.dws.send_text(s["reply"], md_hardbreak(
-                    self.selfmark.append(
-                        head + "\n\n" + result[:1500] + "\n\n…（全文见附件）",
-                        self.sign)))
-                self.dws.send_file(s["reply"], str(fp))
-            except Exception as e:
-                log("send result failed:", e)
+        long = len(result) > limit
+        if s.get("card_biz"):
+            body = head + "\n\n" + (
+                result[:1500] + "\n\n…（全文见附件）" if long
+                else (result or "（无文本结果）"))
+            if self._card_final(s, body, 3):
+                if long:
+                    self._send_full_file(s, tid, result)
+                return
+        if long:
+            self._notify_session(
+                s, head + "\n\n" + result[:1500] + "\n\n…（全文见附件）")
+            self._send_full_file(s, tid, result)
         else:
             self._notify_session(
                 s, head + ("\n\n" + result if result else "（无文本结果）"))
+
+    def _send_full_file(self, s: dict, tid, result: str):
+        fp = self.st.rounds / f"{tid}_result.md"
+        try:
+            fp.write_text(result, encoding="utf-8")
+            self.dws.send_file(s["reply"], str(fp))
+        except Exception as e:
+            log("send result file failed:", e)
 
     def _finish(self, s: dict, row: dict):
         tid = row.get("id")
@@ -528,10 +616,13 @@ class Avatar:
                                              "冲突，请人工复核。")
             s["last_task_id"] = tid
         elif status == "failed":
-            self._notify_session(s, f"任务 #{tid} 执行失败："
-                                    f"{(row.get('error') or '未知错误')[:300]}")
+            msg = (f"任务 #{tid} 执行失败："
+                   f"{(row.get('error') or '未知错误')[:300]}")
+            if not self._card_final(s, "❌ " + msg, 5):
+                self._notify_session(s, msg)
         elif status == "cancelled":
-            self._notify_session(s, f"任务 #{tid} 已取消。")
+            if not self._card_final(s, f"🚫 任务 #{tid} 已取消。", 3):
+                self._notify_session(s, f"任务 #{tid} 已取消。")
         s["task_id"] = None
         if s.get("followups"):
             self.sess.start_followup_window(s)

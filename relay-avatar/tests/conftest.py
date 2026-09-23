@@ -48,6 +48,7 @@ alert_to = "18434"
 [ingress]
 debounce_sec = 20
 noise_ignore = ["你好", "收到"]
+use_card = false
 """
 
 

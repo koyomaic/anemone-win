@@ -22,12 +22,24 @@ followup_debounce_sec = 30     # 任务结束后追问聚合窗口
 session_ttl_sec = 1800         # 会话上下文（resume_from）有效期
 poll_sec = 3                   # relay 任务状态轮询间隔
 result_max_chars = 3000        # 结果超长截断，全文走附件
-ack_emoji = "收到"
+ack_emoji = "奋斗"              # 收到回执兜底表情（文字表情未配置/失败时用）
 submit_emoji = "赞"
+use_card = true                # 流式卡片：提交即开卡「正在处理」，状态跳变更新，完成定格结果
+card_progress_sec = 30         # 运行中卡片进度刷新节流（秒）
 noise_ignore = ["你好", "您好", "在吗", "在么", "hi", "hello", "嗯", "嗯嗯",
                 "好的", "好", "收到", "ok", "OK", "谢谢", "多谢", "辛苦了", "测试"]
-self_poll = false              # P2：轮询本人单聊（账号自发消息不进事件流的补充通道）
+self_poll = false              # P2：轮询本人单聊（账号自发消息不进事件流）
 self_poll_interval_sec = 5
+
+[ingress.ack_text_emotion]
+# 收到回执首选：钉钉文字表情（贴原消息的小图标，显示自定义文字）。
+# emotion_id/background_id 由 `dws chat message create-text-emotion --emotion-name 处理中
+# --text "正在疯狂处理中..."` 创建后回填（账号维度，一次创建长期有效）；留空则回落 ack_emoji。
+# 注意：TOML 子表必须放在 [ingress] 全部简单键之后，否则后续键会被卷进子表。
+emotion_id = ""
+emotion_name = "处理中"
+text = "正在疯狂处理中..."
+background_id = ""
 
 [keywords]
 submit = ["提交", "开始执行"]

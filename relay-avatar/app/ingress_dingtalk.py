@@ -119,11 +119,59 @@ class Dws:
                          "--message-id", msg_id,
                          "--emoji", emoji, "-y", "-f", "json"], timeout=15)
 
+    def react_text_emotion(self, conv_id: str, msg_id: str, te: dict) -> dict:
+        """文字表情回应：贴原消息的小图标，显示自定义文字（如「正在疯狂处理中...」）。"""
+        return self.run(["chat", "message", "add-text-emotion",
+                         "--conversation-id", conv_id,
+                         "--message-id", msg_id,
+                         "--emotion-id", str(te.get("emotion_id", "")),
+                         "--emotion-name", str(te.get("emotion_name", "")),
+                         "--text", str(te.get("text", "")),
+                         "--background-id", str(te.get("background_id", "")),
+                         "-y", "-f", "json"], timeout=15)
+
     def mark_read(self, conv_id: str, msg_id: str) -> dict:
         return self.run(["chat", "+conversation-mark-read",
                          "--conversation-id", conv_id,
                          "--message-id", msg_id, "--yes", "-f", "json"],
                         timeout=15)
+
+    # ── 流式卡片（提交即开卡，状态跳变更新，完成 flow-status=3 定格） ──
+    def card_create(self, target: dict) -> str:
+        """创建流式卡片返回 bizId（失败空串）。群 --group / 单聊优先
+        --receiver-open-dingtalk-id 直传（--receiver 走通讯录解析，慢且可能歧义）。"""
+        if target.get("is_group"):
+            args = ["chat", "+messages-send-card", "--group",
+                    target.get("conversation_id", "")]
+        elif target.get("open_dingtalk_id"):
+            args = ["chat", "+messages-send-card",
+                    "--receiver-open-dingtalk-id",
+                    target["open_dingtalk_id"]]
+        elif target.get("user_id"):
+            args = ["chat", "+messages-send-card", "--receiver",
+                    str(target["user_id"])]
+        else:
+            return ""
+        r = self.run(args + ["--yes", "--format", "json"], timeout=30)
+        try:
+            return str(((r.get("cardRef") or {}).get("bizId")
+                        or ((r.get("created") or {}).get("result")
+                            or {}).get("bizId")
+                        or (r.get("result") or {}).get("bizId")
+                        or r.get("bizId") or ""))
+        except Exception:
+            return ""
+
+    def card_update(self, biz_id: str, content: str, flow_status: int) -> bool:
+        """更新卡片。flow_status: 1处理中/2输入中/3完成/4执行中/5错误。"""
+        if not biz_id:
+            return False
+        r = self.run(["chat", "+messages-update-card", "--biz-id", biz_id,
+                      "--content", md_hardbreak(content or ""),
+                      "--flow-status", str(flow_status),
+                      "--yes", "--format", "json"], timeout=30)
+        return not (r.get("error") or r.get("errorMsg") or r.get("_error")
+                    or r.get("_timeout"))
 
     def download_media(self, media_id: str, message_id: str, conv_id: str,
                        outdir: Path) -> dict:
