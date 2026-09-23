@@ -223,33 +223,40 @@ class Dws:
 
     def resolve_userid(self, open_id: str, sender_name: str,
                        cache_file: Path) -> str:
-        """openDingTalkId → userId：contacts 缓存 → dws 按姓名反查落盘。"""
+        """openDingTalkId → userId：contacts 缓存 → dws 按姓名反查落盘。
+        未命中写负缓存（miss:<ts>，6h），防 bot/陌生号每条消息都打通讯录。"""
         if not open_id:
             return ""
         try:
             contacts = json.loads(cache_file.read_text(encoding="utf-8"))
         except Exception:
             contacts = {}
-        uid = contacts.get(open_id, "")
-        if uid:
-            return uid
+        v = contacts.get(open_id)
+        if isinstance(v, str) and v:
+            if not v.startswith("miss:"):
+                return v
+            try:
+                if time.time() - float(v.split(":", 1)[1]) < 21600:
+                    return ""
+            except Exception:
+                pass
         if not sender_name or sender_name == "未知":
             return ""
         res = self.run(["contact", "+search-user", "--query", sender_name,
                         "--format", "json"], timeout=15)
         users = (res.get("data") or {}).get("users") or res.get("users") or []
+        uid = ""
         for u in users:
             if u.get("openDingTalkId", "") == open_id:
                 uid = str(u.get("userId") or u.get("userid") or "")
-                if uid:
-                    contacts[open_id] = uid
-                    try:
-                        atomic_write_text(cache_file, json.dumps(
-                            contacts, ensure_ascii=False, indent=1))
-                    except Exception:
-                        pass
-                return uid
-        return ""
+                break
+        contacts[open_id] = uid or f"miss:{time.time()}"
+        try:
+            atomic_write_text(cache_file, json.dumps(
+                contacts, ensure_ascii=False, indent=1))
+        except Exception:
+            pass
+        return uid
 
 
 class InboundHealth:

@@ -140,6 +140,7 @@ def test_dedup(avatar):
 
 
 def test_guest_intro_and_request(avatar):
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
     avatar.on_event(ev("在吗", sid="sid555", sender="访客", n="4"))
     assert any("申请授权" in t for t in texts(avatar))
     avatar.dws.sent.clear()
@@ -152,6 +153,7 @@ def test_guest_intro_and_request(avatar):
 
 
 def test_approval_flow(avatar):
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
     avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="6"))
     avatar.dws.sent.clear()
     avatar.on_event(ev("同意 555", sid="sid18434", sender="王洪彬", n="7"))
@@ -412,3 +414,40 @@ def test_failed_swaps_to_error_emotion(cfg):
     assert any(te["emotion_id"] == "E3" for te in posted)
     assert any("没办成" in t for _, t in av.dws.sent) or \
         any("没办成" in c for _, c, _ in getattr(av.dws, "card_frames", []))
+
+
+def test_guest_silent_by_default(avatar):
+    """名单外默认静默：不回话、不建会话、只留审计（防 bot 互刷）。"""
+    avatar.on_event(ev("在吗", sid="sid555", sender="访客", n="70"))
+    avatar.on_event(ev("[图片消息](mediaId=xx)", sid="sid556", sender="马某", n="71"))
+    assert avatar.sess.sessions == {}
+    assert not avatar.dws.sent and not avatar.dws.reacts
+    audit = (avatar.cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "guest_ignored" in audit
+
+
+def test_guest_silent_audit_throttled(avatar):
+    avatar.on_event(ev("在吗", sid="sid555", sender="访客", n="72"))
+    avatar.on_event(ev("在吗在吗", sid="sid555", sender="访客", n="73"))
+    audit = (avatar.cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert audit.count("guest_ignored") == 1   # 同人 1h 一条
+
+
+def test_guide_intro_throttled(avatar):
+    """guide 模式：引导话术同人 1h 一次；申请指令不受节流。"""
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
+    avatar.on_event(ev("在吗", sid="sid555", sender="访客", n="74"))
+    n1 = len(avatar.dws.sent)
+    assert n1 == 1
+    avatar.on_event(ev("在吗啊", sid="sid555", sender="访客", n="75"))
+    assert len(avatar.dws.sent) == n1          # 第二条不再引导
+    avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="76"))
+    assert len(avatar.dws.sent) > n1           # 申请指令照常受理
+    assert avatar.policy.find_pending_all("555")
+
+
+def test_bot_never_answered(avatar):
+    """拉黑 bot：静默丢弃且不解析身份（互刷死循环根因封堵）。"""
+    avatar.on_event(ev("我是自动回复 bot", sid="BOTOPENID", sender="某bot", n="77"))
+    assert avatar.sess.sessions == {}
+    assert not avatar.dws.sent

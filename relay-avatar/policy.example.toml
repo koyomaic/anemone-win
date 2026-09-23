@@ -68,7 +68,9 @@ conflict = ["冲突"]
 enabled = false                # 群@监听默认关；开启需显式改本文件（决策留痕）
 
 [permissions]
-default_mode = "whitelist"     # whitelist=名单外一律 guest（引导申请授权）；blacklist 需显式配置
+default_mode = "whitelist"     # whitelist=名单外一律 guest（空名单即除 super 外全拒）；blacklist 需显式配置
+guest_mode = "silent"          # 名单外处置：silent=彻底静默忽略（不回话不建会话，默认，防与自动回复 bot 互刷死循环）；
+                               # guide=自我介绍+引导「申请授权/申请传文件」审批流（同人 1h 只引导一次）
 superadmin = ["18434"]         # super：全权 + 审批动态白名单
 admins = []                    # L1：管理员
 whitelist = []                 # L2：静态白名单
@@ -98,7 +100,9 @@ profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制�
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 100   # 每用户日任务数上限
 reprompt_cooldown_sec = 60     # 门禁无关消息重提示冷却
-bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt"]  # 「AI助理」类账号永久静默丢弃
+bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt",   # 「AI助理」（曾与分身互刷死循环）
+                 "D8YACgStfKBdniisB5xLrLu2EyEI8kX7NU",   # 「原油AI研究院」bot（2026-09-23 互刷事故）
+                 "D8YACgStfKBfFEEsPWgvYYtiSa1ViiXKETw"]  # 「预警提醒」系统号（只进不出）
 media_max_size_mb = 20
 media_allowed_ext = [".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml",
                      ".docx", ".doc", ".pdf", ".xlsx", ".xls", ".pptx", ".ppt",

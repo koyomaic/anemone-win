@@ -69,6 +69,17 @@ class Avatar:
         self.contacts = self.st.run / "contacts.json"
         self.sign = str(cfg.get("identity", "sign", "") or "")
         self._guide_seen: dict = {}
+        self._guest_seen: dict = {}
+
+    def _guest_silent(self, sid: str, sender: str, content):
+        """名单外静默忽略：只留节流审计（同人每小时一条），绝不回话。"""
+        k = sid or sender
+        now = time.time()
+        if now - self._guest_seen.get(k, 0) < 3600:
+            return
+        self._guest_seen[k] = now
+        self.audit.log("guest_ignored", str(k)[:24],
+                       f"{sender}: {str(content)[:60]}")
 
     # ── 发送 ──
     def _notify(self, target: dict, text: str):
@@ -177,7 +188,16 @@ class Avatar:
             else:
                 uid = self.dws.resolve_userid(sid, sender, self.contacts)
         ev["_uid"] = uid
-        self.gwatch.collect(ev)   # enabled=false 时 no-op
+        lvl = self.policy.level_of(uid, sid, sender)
+        if lvl == "BLOCKED":
+            return
+        # 名单外默认静默忽略：不回话、不建会话（防与自动回复 bot 互刷死循环，
+        # 2026-09-23「原油AI研究院」事故）；引导话术需 guest_mode="guide" 显式开启
+        if lvl == "NONE" and str(self.cfg.get("permissions", "guest_mode",
+                                              "silent")) == "silent":
+            self._guest_silent(sid, sender, content)
+            return
+        self.gwatch.collect(ev)   # enabled=false 时 no-op；只收登记群
         key = (f"g:{ev.get('conversation_id')}:{sid}" if is_group
                else f"o:{sid}")
         s = self.sess.get_or_create(key, sender, sid, ev, is_group)
@@ -189,9 +209,6 @@ class Avatar:
             if ap:
                 self._dm(uid, self._do_approval(ap, uid))
                 return
-        lvl = self.policy.level_of(uid, sid, sender)
-        if lvl == "BLOCKED":
-            return
         # L3：文件投递/问答（不进通用会话流）
         if lvl == "L3" and not is_group:
             self._mark_read(s)
@@ -380,6 +397,13 @@ class Avatar:
                         "能答疑、查知识、整理材料、协办事务。")
             return "⚠️ 没能识别你的身份（工号解析失败），请稍后再试或联系管理员。"
         expired = self.policy.dyn_expired(uid) if uid else {}
+        # 引导话术同人 1 小时只发一次（申请指令不受限）——防 guide 模式下
+        # 与自动回复 bot 互刷死循环
+        gkey = f"dm:{uid or ev.get('sender_open_dingtalk_id') or sender}"
+        now = time.time()
+        if now - self._guide_seen.get(gkey, 0) < 3600:
+            return ""
+        self._guide_seen[gkey] = now
         if expired:
             was_l3 = expired.get("tier") == "L3"
             kind = "文件投递" if was_l3 else "使用"
