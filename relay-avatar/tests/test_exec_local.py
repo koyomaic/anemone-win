@@ -11,7 +11,7 @@ def make(cfg, storage, audit, policy):
 def test_disabled_by_default(cfg, storage, audit, policy):
     ex = make(cfg, storage, audit, policy)
     assert not ex.available()
-    assert "未启用" in ex.run_l3("300", "问题")
+    assert "未启用" in ex.run_l3("300", "问题")["text"]
 
 
 def test_sender_data_dirs(cfg, storage, shared, audit, policy):
@@ -59,3 +59,60 @@ def test_session_ttl(cfg, storage, audit, policy):
     d["k1"]["ts"] = time.time() - 99999
     storage.save_json(ex.sessions_file, d)
     assert ex.get_session("k1") == ""
+
+
+def test_parse_line_stream(cfg, storage, audit, policy):
+    import json as _j
+    ex = make(cfg, storage, audit, policy)
+    steps = []
+    fired = []
+    # tool_use 事件 → 步骤回调
+    line = _j.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Read"}]}})
+    assert ex._parse_line(line, steps, lambda s, a: fired.append(s)) is None
+    assert steps == ["📖 读取文件"] and fired == ["📖 读取文件"]
+    # 首段文本 → 组织回复步骤（只触发一次）
+    line = _j.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "开始作答"}]}})
+    ex._parse_line(line, steps, lambda s, a: fired.append(s))
+    ex._parse_line(line, steps, lambda s, a: fired.append(s))
+    assert steps.count("✍️ 正在组织回复…") == 1
+    # result 事件 → 返回 dict
+    line = _j.dumps({"type": "result", "result": "最终答复",
+                     "session_id": "sid-9", "is_error": False})
+    d = ex._parse_line(line, steps, None)
+    assert d["result"] == "最终答复" and d["session_id"] == "sid-9"
+    # 非 JSON / 非对象行忽略
+    assert ex._parse_line("noise", steps, None) is None
+
+
+def test_is_deny():
+    from app.exec_local import ExecLocal
+    assert ExecLocal._is_deny("The tool use was rejected (permission denied)")
+    assert ExecLocal._is_deny("此操作需要批准，已被拒绝")
+    assert not ExecLocal._is_deny("正常完成的答复")
+
+
+def test_claude_env_merges_settings(cfg, storage, audit, policy,
+                                    tmp_path, monkeypatch):
+    """认证 env 从 ~/.claude/settings.json 注入；CLAUDE_CONFIG_DIR 隔离。"""
+    import json as _j
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text(_j.dumps(
+        {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8790",
+                 "ANTHROPIC_AUTH_TOKEN": "tok"}}), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    ex = make(cfg, storage, audit, policy)
+    env = ex._claude_env()
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8790"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "tok"
+    assert env["CLAUDE_CONFIG_DIR"] == str(ex.cchome)
+    assert "127.0.0.1" in env["NO_PROXY"]
+
+
+def test_run_self_escalates_when_unavailable(cfg, storage, audit, policy):
+    """local 未启用时 self 任务返回 escalate=True（升级不降级 → relay 门禁）。"""
+    ex = make(cfg, storage, audit, policy)
+    r = ex.run_self("18434", "干活")
+    assert r["escalate"] is True

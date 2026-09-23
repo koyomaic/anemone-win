@@ -130,12 +130,16 @@ class Storage:
         e["STORE_ROOT"] = str(self.store_root)
         return e
 
-    def _store(self, args: list, timeout: int = 60) -> tuple[int, str]:
+    def _store(self, args: list, timeout: int = 60,
+               extra_env: dict | None = None) -> tuple[int, str]:
         cli = str(self.cfg.get("store", "cli", "store"))
+        env = self._store_env()
+        if extra_env:
+            env.update({k: str(v) for k, v in extra_env.items()})
         try:
             p = subprocess.run([cli, "--root", str(self.store_root)] + args,
                                capture_output=True, text=True, timeout=timeout,
-                               env=self._store_env())
+                               env=env)
             return p.returncode, (p.stdout or p.stderr or "")[:400]
         except FileNotFoundError:
             return 127, "store CLI 不存在"

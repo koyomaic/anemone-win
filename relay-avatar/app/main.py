@@ -31,9 +31,10 @@ from app.exec_relay import ExecRelay
 from app.file_inbox import FileInbox, extract_file_from_event, find_media_ids
 from app.group_watch import GroupWatch, parse_watch_cmd
 from app.ingress_dingtalk import (Dws, EventIngress, InboundHealth, SelfMark,
-                                  SelfPoller, card_biz_id, md_hardbreak)
+                                  SelfPoller, SentEcho, card_biz_id,
+                                  md_hardbreak)
 from app.ingress_relay import RelayClient
-from app.knowledge import Knowledge
+from app.knowledge import Knowledge, parse_learn_cmd
 from app.monitor import Monitor
 from app.policy import Policy, sanitize_field, sanitize_injected
 from app.session import SessionManager
@@ -63,6 +64,7 @@ class Avatar:
         self.know = Knowledge(cfg, self.st)
         self.health = InboundHealth(self.st)
         self.selfmark = SelfMark(self.st)
+        self.echo = SentEcho(self.st)
         self.monitor = Monitor(cfg, self.st, self.dws, self.audit)
         self.dashboard = Dashboard(cfg, self.st, self.audit)
         self.q: queue.Queue = queue.Queue()
@@ -71,6 +73,7 @@ class Avatar:
         self.sign = str(cfg.get("identity", "sign", "") or "")
         self._guide_seen: dict = {}
         self._guest_seen: dict = {}
+        self._note_guard: dict = {}
 
     def _guest_silent(self, sid: str, sender: str, content):
         """名单外静默忽略：只留节流审计（同人每小时一条），绝不回话。"""
@@ -85,6 +88,7 @@ class Avatar:
     # ── 发送 ──
     def _notify(self, target: dict, text: str, task_id=None):
         try:
+            self.echo.record(text)   # 出站指纹（防轮询回音自循环，主防线）
             r = self.dws.send_text(target, md_hardbreak(
                 self.selfmark.append(text, self.sign)))
             recall.record(self.st, "text",
@@ -195,6 +199,14 @@ class Avatar:
             else:
                 uid = self.dws.resolve_userid(sid, sender, self.contacts)
         ev["_uid"] = uid
+        # self 模式（轮询本人单聊）：审批指令 / 「学 N」升格 / 「/」前缀任务 / 无前缀速记
+        if ev.get("_self_poll"):
+            key = f"o:{sid}"
+            s = self.sess.get_or_create(key, sender, sid, ev, False)
+            self.sess.touch(s, ev)
+            self._handle_self(s, str(content), uid)
+            self.sess.save()
+            return
         lvl = self.policy.level_of(uid, sid, sender)
         if lvl == "BLOCKED":
             return
@@ -225,10 +237,8 @@ class Avatar:
                 return
             text = str(content).strip()
             if text and not self._is_noise(text):
-                self._react(s, "ack_emoji")
-                self._dm(uid or sid, self.inbox.l3_qa(
-                    uid, text,
-                    self.exec_local if self.exec_local.available() else None))
+                self._ack_receive(s)
+                self._l3_qa(s, uid, text)
             return
         # guest：引导申请授权（审批流）
         if lvl == "NONE":
@@ -425,6 +435,103 @@ class Avatar:
     def _notify_superadmins(self, text: str):
         for su in sorted(self.policy.superadmin):
             self._dm(su, text)
+
+    # ── self 模式（本人单聊轮询，P2） ──
+    def _handle_self(self, s: dict, text: str, uid: str):
+        t = (text or "").strip()
+        if not t:
+            return
+        # 审批指令：superadmin 经自聊审批（分身用本人账号，审批入口即自聊）
+        ap = self.policy.parse_approval(t)
+        if ap and self.policy.is_superadmin(uid):
+            self._dm(uid, self._do_approval(ap, uid))
+            return
+        # 会话进行中 → 交会话流（提交/取消/门禁关键词与聚合）
+        if s["state"] != "IDLE":
+            self._on_message("", s, t, uid)
+            return
+        # 「学 N [域] [主题]」：暂存笔记审核升格（knowledge + wiki 双写 + store）
+        lc = parse_learn_cmd(t)
+        if lc:
+            n, domain, topic = lc
+            r = self.know.promote_by_index(n, domain, topic)
+            if r.get("error"):
+                self._notify_session(s, f"⚠️ {r['error']}")
+                return
+            wiki = ("已双写 jingboWiki（受理即成功，解析后台进行）"
+                    if r.get("wiki") == "pushed"
+                    else f"wiki 双写未执行（{r.get('wiki')}）")
+            store = "✓" if r.get("store_ok") else \
+                "✗ " + str(r.get("store_out", ""))[:80]
+            self._notify_session(
+                s, f"✅ 已升格入库：{r['path']}\n\nstore 登记：{store}\n{wiki}")
+            self.audit.log("knowledge_promote", uid, str(r.get("path")))
+            return
+        # 「/」前缀 → 任务（走会话流：debounce/门禁/卡片全套，relay 后端）
+        if t.startswith(("/", "／")):
+            real = t.lstrip("/／").strip()
+            if real:
+                self._on_message("", s, real, uid)
+            return
+        # 门禁类关键词在 IDLE 不落笔记（与会话流语义一致）
+        if any(self._kw(t, k) for k in
+               ("submit", "cancel", "confirm", "deny", "conflict")):
+            return
+        # 防循环闸二：同文本 2 分钟内不重复落笔记（回音闸万一漏网的双保险）
+        nkey = SentEcho.norm(t)
+        now = time.time()
+        if now - self._note_guard.get(nkey, 0) < 120:
+            return
+        self._note_guard[nkey] = now
+        # 无前缀 → 暂存速记（低摩擦，不进台账）
+        self.know.save_note(t)
+        n = len(self.know.list_notes())
+        self._notify_session(
+            s, f"📝 已记到暂存笔记（第 {n} 条）。发「学 {n}」审核入库，"
+               f"或「学 {n} 口径方法论」指定域。")
+
+    # ── L3 文件问答（exec_local 硬隔离 + 流式卡片） ──
+    def _l3_qa(self, s: dict, uid: str, text: str):
+        target = {"user_id": uid} if uid else s["reply"]
+        if not self.exec_local.available():
+            self._notify(target, "📮 文件问答尚未在本机启用"
+                                 "（policy execution.local_enabled=false），"
+                                 "文件已安全存档，如需加急请联系管理员。")
+            return
+        biz = ""
+        if self.cfg.get("ingress", "use_card", True):
+            try:
+                biz = card_biz_id(self.dws.card_create(s["reply"]))
+            except Exception:
+                biz = ""
+        throttle = {"upd": 0.0}
+
+        def on_step(step, steps):
+            if not biz:
+                return
+            now = time.time()
+            if now - throttle["upd"] < 5:
+                return
+            throttle["upd"] = now
+            try:
+                self.dws.card_update(
+                    biz, f"🍂 **{self.cfg.avatar_name}正在处理…**\n\n"
+                    + "\n".join(f"> {x}" for x in steps[-6:]), 1)
+            except Exception:
+                pass
+
+        kb = self.know.search(text)
+        r = self.exec_local.run_l3(uid, text, kb=kb, on_step=on_step)
+        out = str(r.get("text") or "（没读出内容，换个问法试试？）")
+        self.st.archive_round(f"l3-{uid}", "qa",
+                              {"q": text[:200], "a": out[:300]})
+        if biz:
+            try:
+                if self.dws.card_update(biz, out[:2500], 3):
+                    return
+            except Exception:
+                pass
+        self._notify(target, out)
 
     # ── 会话流（自 im-bridge 演进） ──
     def _kw(self, text: str, name: str) -> bool:
@@ -817,7 +924,7 @@ class Avatar:
         if self.cfg.get("ingress", "self_poll", False):
             threading.Thread(target=SelfPoller(
                 self.cfg, self.dws, self.selfmark, self.st, self.on_event,
-                self.stop).loop, daemon=True).start()
+                self.stop, echo=self.echo).loop, daemon=True).start()
         last_poll = 0.0
         poll_sec = float(self.cfg.get("ingress", "poll_sec", 3))
         while not self.stop.is_set():

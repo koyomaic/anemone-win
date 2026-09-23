@@ -172,7 +172,7 @@ def test_approval_deny_and_missing(avatar):
 
 def test_l3_file_uploader_text(avatar):
     avatar.on_event(ev("帮我查一下", sid="sid300", sender="李四", n="9"))
-    assert any("即将开放" in t for t in texts(avatar))
+    assert any("尚未在本机启用" in t for t in texts(avatar))
     s = avatar.sess.sessions["o:sid300"]
     assert s["state"] == "IDLE" and not s["buffer"]   # L3 不进通用会话流
 
@@ -451,3 +451,96 @@ def test_bot_never_answered(avatar):
     avatar.on_event(ev("我是自动回复 bot", sid="BOTOPENID", sender="某bot", n="77"))
     assert avatar.sess.sessions == {}
     assert not avatar.dws.sent
+
+
+def self_ev(text, n):
+    """self 轮询事件（本人单聊）。"""
+    return {"event_type": "user_im_message_receive_o2o_all",
+            "content": text, "sender": "王洪彬",
+            "sender_open_dingtalk_id": "SELFOPENID",
+            "message_id": f"sm{n}", "conversation_id": f"sc{n}",
+            "event_id": f"se{n}", "_self_poll": True}
+
+
+def test_self_note_and_learn(avatar, monkeypatch):
+    """self 无前缀 → 暂存速记；「学 N」→ 升格入库（store mock）。"""
+    avatar.on_event(self_ev("明早九点开营，带物料", "80"))
+    assert any("已记到暂存笔记" in t for t in texts(avatar))
+    notes = avatar.know.list_notes()
+    assert len(notes) == 1
+    calls = []
+    monkeypatch.setattr(avatar.st, "_store",
+                        lambda a, timeout=60: (calls.append(a) or (0, "")))
+    avatar.dws.sent.clear()
+    avatar.on_event(self_ev("学 1 工具运维 开营准备", "81"))
+    assert any("已升格入库" in t for t in texts(avatar))
+    assert [c for c in calls if c[0] == "add" and "--wiki-tag" in c]
+    assert avatar.know.list_notes() == []      # 升格后暂存清除
+    audit = (avatar.cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "knowledge_promote" in audit
+
+
+def test_self_learn_out_of_range(avatar):
+    avatar.on_event(self_ev("学 99", "82"))
+    assert any("超出范围" in t for t in texts(avatar))
+
+
+def test_self_slash_task(avatar):
+    """/前缀 → 走会话流提交 relay 任务。"""
+    avatar.on_event(self_ev("/查一下今天的日程", "83"))
+    s = avatar.sess.sessions["o:SELFOPENID"]
+    assert s["state"] == "BUFFERING"
+    avatar.on_event(self_ev("提交", "84"))
+    assert s["state"] == "RUNNING"
+    assert "查一下今天的日程" in avatar.exec_relay.submitted[0]["desc"]
+
+
+def test_self_approval_via_selfchat(avatar):
+    """分身用本人账号：审批入口即自聊（superadmin 经 self 轮询审批）。"""
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
+    avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="85"))
+    avatar.dws.sent.clear()
+    avatar.on_event(self_ev("同意 555", "86"))
+    assert avatar.policy.get_level("555") == "L2"
+    assert any("已开通" in t for t in texts(avatar))
+
+
+def test_l3_qa_with_local_backend(avatar, monkeypatch):
+    """L3 问答：local 后端可用时走硬隔离问答 + 卡片定格。"""
+    monkeypatch.setitem(avatar.cfg._p.setdefault("execution", {}),
+                        "local_enabled", True)
+    monkeypatch.setattr(avatar.exec_local, "bin", "/bin/true")
+    monkeypatch.setattr(avatar.exec_local, "run_l3",
+                        lambda uid, text, kb="", on_step=None:
+                        {"text": "答案：共 3 个文件", "escalate": False})
+    monkeypatch.setattr(avatar.know, "search", lambda t: "")
+    avatar.cfg._p.setdefault("ingress", {})["use_card"] = True
+    avatar.on_event(ev("我的文件里有什么", sid="sid300", sender="李四", n="87"))
+    frames = getattr(avatar.dws, "card_frames", [])
+    assert frames and frames[-1][2] == 3 and "答案" in frames[-1][1]
+
+
+def test_sent_echo_gate(cfg, storage):
+    """出站指纹闸：钉钉剥离 HTML 注释后仍能识别自己的回执（防自循环主防线）。"""
+    from app.ingress_dingtalk import SentEcho
+    echo = SentEcho(storage)
+    sent = "📝 已记到暂存笔记（第 1 条）。发「学 1」审核入库。"
+    echo.record(sent)
+    # 轮询回来的渲染版：SELF_MARK 被剥离 + 硬换行加了行尾空格
+    rendered = sent.replace("。", "。  ") + "  "
+    assert echo.is_echo(rendered)
+    assert echo.is_echo(sent + "\n<!--av-self:deadbeef-->")   # 带标记也命中
+    assert not echo.is_echo("用户发的新消息")
+    # 落盘重启不丢
+    echo2 = SentEcho(storage)
+    assert echo2.is_echo(sent)
+
+
+def test_self_note_no_echo_loop(avatar):
+    """回执被轮询回来（指纹闸漏网场景）也不重复落笔记：同文本 2 分钟闸。"""
+    avatar.on_event(self_ev("记一条事", "90"))
+    n1 = len(avatar.know.list_notes())
+    receipt = [t for _, t in avatar.dws.sent if "已记到暂存笔记" in t][0]
+    # 模拟回执被当新消息轮询回来（无 SELF_MARK、指纹闸失效的最坏情况）
+    avatar.on_event(self_ev(receipt, "91"))
+    assert len(avatar.know.list_notes()) == n1   # 未新增笔记

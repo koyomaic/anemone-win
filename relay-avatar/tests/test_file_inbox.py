@@ -100,8 +100,3 @@ def test_receive_rejects_oversize(cfg, storage, audit):
 def test_receive_not_file(cfg, storage, audit):
     inbox = FileInbox(cfg, FakeDws(), storage, audit)
     assert inbox.receive("20102", "张三", {"content": "普通消息"}) == ""
-
-
-def test_l3_qa_placeholder(cfg, storage, audit):
-    inbox = FileInbox(cfg, FakeDws(), storage, audit)
-    assert "即将开放" in inbox.l3_qa("300", "问题", None)

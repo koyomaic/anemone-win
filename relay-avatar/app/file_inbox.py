@@ -205,9 +205,4 @@ class FileInbox:
         return (f"✅ 已收到《{name}》，暂存待台账恢复后自动补登记"
                 "（文件已安全落盘，不影响使用）。")
 
-    # ── L3 隔离问答（P2：依赖 exec_local） ──
-    def l3_qa(self, uid: str, text: str, executor) -> str:
-        if executor is None or not executor.available():
-            return ("📮 文件问答能力即将开放（P2）。文件已安全存档，"
-                    "如需加急请联系管理员。")
-        return executor.run_l3(uid, text)
+    # ── L3 隔离问答在 main._l3_qa（exec_local 硬隔离 + 流式卡片） ──

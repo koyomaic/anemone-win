@@ -96,6 +96,7 @@ permission_mode_l3 = "manual"
 l3_permission_prompts = "none"
 l3_disallowed_tools = "Bash Write Edit MultiEdit WebFetch WebSearch"
 session_ttl_sec = 3600
+reply_timeout_sec = 600        # local 执行看门狗（超时 kill）
 
 [security]
 l2_lockdown = true             # L2 沙箱：cwd 限共享区 + 禁 Bash（fenshen 默认关→这里默认开）
@@ -121,7 +122,10 @@ staging_fallback = true        # DB 不可达：先落 run/staging 暂存并回�
 
 [knowledge]
 local_dir = "/mnt/vol-eltaah12/workspace/shared/knowledge"
-wiki_enabled = false           # P2：jingboWiki 权威源检索（凭据走 env JINGBOWIKI_*）
+wiki_enabled = false           # jingboWiki 权威源检索+升格双写（凭据走 shared/secrets/jingbowiki.env，
+                               # 宿主级文件，非 relay.env；启用前置 true）
+wiki_env = "/mnt/vol-eltaah12/workspace/shared/secrets/jingbowiki.env"
+wiki_kb_id = ""                # 留空=取 jingbowiki.env 的 JINGBOWIKI_KB_ID
 recall_max_files = 6
 recall_char_budget = 3000
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -292,7 +293,9 @@ class InboundHealth:
 
 
 class SelfMark:
-    """SELF_MARK 隐形标识：出站消息末尾附注，轮询时跳过（防自循环）。"""
+    """SELF_MARK 隐形标识：出站消息末尾附注。
+    ⚠️ 2026-09-23 实测：钉钉会剥离 HTML 注释，轮询回来的 text 不含本标记——
+    它只是尽力而为的第二道防线；防自循环主防线是 SentEcho 文本指纹闸。"""
 
     def __init__(self, storage):
         self.path = storage.run / ".self_mark"
@@ -321,6 +324,50 @@ class SelfMark:
         if sign and sign not in t:
             t += f"\n\n{sign}"
         return t + "\n" + self.mark
+
+
+class SentEcho:
+    """出站内容指纹闸（防自循环主防线）。
+
+    钉钉剥离 HTML 注释导致 SELF_MARK 在轮询文本里失效（2026-09-23 速记
+    自循环事故根因）：改为记录出站文本的规范化指纹（去全部空白+去标记后
+    sha256），轮询到的文本命中指纹即判定为自己发的回执，跳过。
+    落盘 run/sent_echo.json（TTL 1h，容量 500，重启不丢）。
+    """
+
+    def __init__(self, storage, ttl_sec: int = 3600, cap: int = 500):
+        self.st = storage
+        self.file = storage.run / "sent_echo.json"
+        self.ttl = ttl_sec
+        self.cap = cap
+        self._d: dict | None = None
+
+    @staticmethod
+    def norm(text: str) -> str:
+        import hashlib
+        t = re.sub(r"<!--\S*self:[0-9a-f]+-->", "", str(text or ""))
+        t = re.sub(r"\s+", "", t)
+        return hashlib.sha256(t.encode("utf-8")).hexdigest()[:24]
+
+    def _load(self) -> dict:
+        if self._d is None:
+            self._d = self.st.load_json(self.file, {})
+        return self._d
+
+    def record(self, text: str):
+        if not str(text or "").strip():
+            return
+        now = time.time()
+        d = {k: v for k, v in self._load().items() if now - v < self.ttl}
+        d[self.norm(text)] = now
+        if len(d) > self.cap:
+            for k in sorted(d, key=lambda x: d[x])[:len(d) - self.cap]:
+                d.pop(k, None)
+        self._d = d
+        self.st.save_json(self.file, d)
+
+    def is_echo(self, text: str) -> bool:
+        return self.norm(text) in self._load()
 
 
 class EventIngress:
@@ -442,16 +489,18 @@ class EventIngress:
 
 
 class SelfPoller:
-    """self 模式补充轮询（P2 启用）：本人单聊 + SELF_MARK 回音闸 + 游标持久化。"""
+    """self 模式补充轮询（P2 启用）：本人单聊 + 双重回音闸
+    （SentEcho 指纹为主，SELF_MARK 尽力而为）+ 游标持久化。"""
 
     def __init__(self, cfg, dws: Dws, selfmark: SelfMark, storage, on_message,
-                 stop: threading.Event):
+                 stop: threading.Event, echo: "SentEcho | None" = None):
         self.cfg = cfg
         self.dws = dws
         self.sm = selfmark
         self.st = storage
         self.on_message = on_message
         self.stop = stop
+        self.echo = echo
         self.cursor_file = storage.run / "poll_cursor.txt"
 
     def loop(self):
@@ -460,6 +509,14 @@ class SelfPoller:
                                            "self_poll_interval_sec", 5)))
         try:
             since = self.cursor_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            since = ""
+        # 游标过旧（停机较久/首次）→ 快进到 now-2min：宁可漏掉陈旧历史，
+        # 不批量重放（旧回执无出站指纹记录，重放会当新消息处理）
+        try:
+            if since and (datetime.datetime.now() - datetime.datetime.strptime(
+                    since, "%Y-%m-%d %H:%M:%S")).total_seconds() > 600:
+                since = ""
         except Exception:
             since = ""
         if not since:
@@ -482,8 +539,12 @@ class SelfPoller:
                             atomic_write_text(self.cursor_file, since)
                         except Exception:
                             pass
-                    if not text or self.sm.is_own(text):
+                    if not text:
                         continue
+                    if self.sm.is_own(text):
+                        continue
+                    if self.echo is not None and self.echo.is_echo(text):
+                        continue   # 出站指纹命中：自己发的回执，跳过（防自循环）
                     self.on_message({
                         "sender_open_dingtalk_id":
                             self.cfg.self_open_id or m.get("senderId", ""),
