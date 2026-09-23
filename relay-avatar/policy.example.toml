@@ -35,19 +35,21 @@ self_poll_interval_sec = 5
 
 [ingress.ack_text_emotion]
 # 收到回执首选：钉钉文字表情（贴原消息的小图标，显示自定义文字）。
-# emotion_id/background_id 由 `dws chat message create-text-emotion --emotion-name 处理中
-# --text "正在疯狂处理中..."` 创建后回填（账号维度，一次创建长期有效）；留空则回落 ack_emoji。
+# emotion_id/background_id 由 `dws chat message create-text-emotion --emotion-name 马上办
+# --text "收到啦，马上为你办～"` 创建后回填（账号维度，一次创建长期有效；背景色由
+# 服务端分配、请求值仅供参考，多摇几次可拿到互不相同的底色）；留空则回落 ack_emoji。
+# 三态三色约定：处理中/办妥/出错各用不同 background_id，一眼可辨。
 # 注意：TOML 子表必须放在 [ingress] 全部简单键之后，否则后续键会被卷进子表。
 emotion_id = ""
-emotion_name = "处理中"
-text = "正在疯狂处理中..."
+emotion_name = "马上办"
+text = "收到啦，马上为你办～"
 background_id = ""
 
 [ingress.done_text_emotion]
-# 完成态换图标：撤「处理中」贴「已办好」（不同模板=不同背景色，一眼区分终态）
+# 完成态换图标：撤「马上办」贴「办妥啦」（不同模板=不同背景色，一眼区分终态）
 emotion_id = ""
-emotion_name = "已办好"
-text = "✅ 已办好"
+emotion_name = "办妥啦"
+text = "办妥啦，请查收～"
 background_id = ""
 
 [ingress.fail_text_emotion]
