@@ -103,7 +103,7 @@ l2_lockdown = true             # L2 沙箱：cwd 限共享区 + 禁 Bash（fensh
 l2_sandbox_dir = "/mnt/vol-eltaah12/workspace/shared/work"
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
-rate_limit_daily_tasks = 100   # 每用户日任务数上限
+rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）
 reprompt_cooldown_sec = 60     # 门禁无关消息重提示冷却
 bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt",   # 「AI助理」（曾与分身互刷死循环）
                  "D8YACgStfKBdniisB5xLrLu2EyEI8kX7NU",   # 「原油AI研究院」bot（2026-09-23 互刷事故）
