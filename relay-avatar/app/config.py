@@ -53,6 +53,9 @@ DEFAULTS: dict[str, Any] = {
     "security": {"l2_lockdown": True,
                  "l2_sandbox_dir": f"{DEFAULT_WORKSPACE}/shared/work",
                  "l2_add_dirs": [],
+                 # local 通路可写目录（作用域写）。默认空＝维持纯只读，
+                 # 需逐机显式开启；非空时 exec_local 会发 Edit(//abs/**) 规则。
+                 "local_write_dirs": [],
                  "profile_enforce": "strict", "sanitize": "on",
                  "rate_limit_daily_tasks": 100, "reprompt_cooldown_sec": 60,
                  "bot_blocklist": [], "media_max_size_mb": 20,

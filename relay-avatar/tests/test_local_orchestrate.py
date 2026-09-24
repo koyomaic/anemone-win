@@ -8,6 +8,7 @@
 另覆盖：升级不降级（越权→relay 且不死循环）、LOCAL 态不被 _poll_sessions 误重置、
 LOCAL 态收到「取消」不得重置会话态（否则卡片永远停在处理中）。
 """
+import re
 import time
 
 import pytest
@@ -526,3 +527,122 @@ def test_reap_count_cleared_on_success(av, cfg, shared):
     assert s["state"] == "IDLE"
     assert s["local_reap_count"] == 0
     assert s["local_desc"] == "" and s["local_deadline"] == 0
+
+
+# ── E. 作用域写（local 出文本件）+ needs_bash_backend 路由前置判定 ──
+# 实测依据（2026-09-24，claude 本机验证）：
+#   · 文件写权限只认 Edit(//绝对路径/**)；裸 Write/Edit 放进 --allowedTools 不生效
+#   · --disallowedTools 压过作用域 allow（Write 会被整个禁用）
+#   · --permission-prompts none 时越界写自动拒绝（fail-closed）
+#   · Bash 在 disallowed 内即整体不可用（含子代理）
+
+from app.policy import needs_bash_backend            # noqa: E402
+
+
+def write_ready(cfg, shared, dirs=("report", "work")):
+    """开 local + 作用域写，返回可写目录绝对路径列表。"""
+    sb = local_ready(cfg, shared)
+    wd = []
+    for d in dirs:
+        p = shared / d
+        p.mkdir(parents=True, exist_ok=True)
+        wd.append(str(p))
+    setcfg(cfg, "security", local_write_dirs=wd)
+    return sb, wd
+
+
+def test_write_dirs_default_empty_keeps_readonly(cfg, storage, audit, policy,
+                                                 shared):
+    """回归：未配 local_write_dirs 时行为完全不变（仍禁 Write/Edit）。"""
+    local_ready(cfg, shared)
+    cons = policy.constraints("200")
+    assert cons["write_dirs"] == []
+    for t in ("Write", "Edit"):
+        assert t in cons["disallowed_tools"]
+
+
+def test_write_dirs_drops_write_edit_from_disallowed(cfg, storage, audit,
+                                                     policy, shared):
+    """开作用域写后必须把 Write/Edit 从 disallowed 摘掉，否则压掉作用域授权。"""
+    _, wd = write_ready(cfg, shared)
+    cons = policy.constraints("200")
+    assert cons["write_dirs"] == wd
+    for t in ("Write", "Edit", "MultiEdit"):
+        assert t not in cons["disallowed_tools"]
+    assert "Bash" in cons["disallowed_tools"]          # Bash 始终禁
+    assert "WebFetch" in cons["disallowed_tools"]
+    assert "Task" in cons["allowed_tools"]             # 仍能委派 subagent
+
+
+def test_super_write_dirs_also_scoped(cfg, storage, audit, policy, shared):
+    """super 走 local 同样只拿作用域写，且仍不得 bypassPermissions。"""
+    setcfg(cfg, "execution", super_backend="local")
+    _, wd = write_ready(cfg, shared)
+    cons = policy.constraints("18434")
+    assert cons["tier"] == "super" and cons["backend"] == "local"
+    assert cons["write_dirs"] == wd
+    assert cons["permission_mode"] != "bypassPermissions"
+
+
+def test_flags_emit_scoped_edit_rules(cfg, storage, audit, policy, shared):
+    """_flags 必须发 Edit(//abs/**) 双斜杠绝对路径形式（单斜杠实测无效）。"""
+    _, wd = write_ready(cfg, shared)
+    ex = make_ex(cfg, storage, audit, policy)
+    cons = policy.constraints("200")
+    f = ex._flags(cons, list(cons["add_dirs"]))
+    allowed = f[f.index("--allowedTools") + 1]
+    for d in wd:
+        want = "Edit(//" + d.lstrip("/") + "/**)"
+        assert want in allowed, f"缺 {want}，实得 {allowed}"
+    assert "Edit(//" in allowed
+    # 不得出现单斜杠绝对路径形式（实测无效，会静默不授权）
+    assert not re.search(r"Edit\(/[^/]", allowed), allowed
+    dis = f[f.index("--disallowedTools") + 1]
+    assert "Bash" in dis and "Write" not in dis.split(",")
+
+
+def test_try_local_skipped_when_needs_bash(av, cfg, shared):
+    """需 Bash 的任务不得进 local（否则空转数分钟才 escalate）。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = sess_of(av, text="生成净头寸三层决策方案，做成 PPT 报告")
+    av._flush(s, uid="200")
+    assert av.exec_local.calls == []                 # 没进 local
+    assert len(av.exec_relay.submitted) == 1         # 直接走 relay
+    assert s["state"] == "RUNNING"
+
+
+def test_html_task_still_uses_local(av, cfg, shared):
+    """HTML 文本件 local 能出，不该被误判去 relay。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = sess_of(av, text="生成一周市场研判报告，html形式")
+    av._flush(s, uid="200")
+    assert s["state"] == "LOCAL"
+    assert av.exec_relay.submitted == []
+
+
+@pytest.mark.parametrize("text,want", [
+    # 需 Bash → relay
+    ("请给我净头寸三层决策方案，生成PPT报告，我要开会讲解", True),
+    ("生成一份 docx 版周报", True),
+    ("导出 xlsx 台账", True),
+    ("把报告转成 pdf", True),
+    ("以 pptx 形式给我", True),
+    ("把结果发送到钉钉群里", True),
+    ("发邮件给王洪彬", True),
+    ("在服务器上安装 python-pptx", True),
+    ("部署新版本并重启服务", True),
+    ("跑一下 scripts/build.py 脚本", True),
+    ("把结果写入数据库台账", True),
+    # 纯读/文本件 → local
+    ("生成一周市场研判报告，html形式", False),
+    ("统计门店日销", False),
+    ("查一下今天的裂解价差", False),
+    ("帮我看看这个报告说了什么", False),
+    ("生成一份摘要给我看", False),
+    ("调用舒小瀚做本周市场研判，出 md 结论", False),
+    ("净头寸现在是什么水位", False),
+])
+def test_needs_bash_backend(text, want):
+    assert needs_bash_backend(text) is want
