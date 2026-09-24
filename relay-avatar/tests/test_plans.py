@@ -223,3 +223,62 @@ def test_marker_executed_once_per_task(avatar):
     avatar.exec_relay.tasks[tid] = {"id": tid, "status": "done", "result": result}
     avatar._poll_sessions()
     assert len(avatar.exec_relay.created) == 1   # 不重复创建
+
+
+# ── 主路径：定时/计划 前缀在进大脑前就地拦截，绝不提交任务 ──
+
+def test_direct_create_does_not_reach_brain(avatar):
+    avatar.on_event(ev("定时 每天8点 跑经营日报", n="1"))
+    # 建了计划
+    assert len(avatar.exec_relay.created) == 1
+    name, on_cal, action = avatar.exec_relay.created[0]
+    assert name == "跑经营日报" and on_cal == "*-*-* 08:00:00"
+    assert action["type"] == "task" and "经营日报" in action["description"]
+    # 关键：没有提交任何大脑任务（不会被"当场执行"）
+    assert avatar.exec_relay.submitted == []
+    # 会话仍 IDLE（计划命令不进缓冲流）
+    assert avatar.sess.sessions["o:sid200"]["state"] == "IDLE"
+    joined = "\n".join(texts(avatar))
+    assert "已创建定时计划「跑经营日报」" in joined and "下次" in joined
+
+
+def test_direct_list(avatar):
+    avatar.exec_relay.plans.append({"id": 1, "name": "日报", "on_calendar": "*-*-* 08:00:00",
+                                    "enabled": True, "next_run": time.time() + 3600})
+    avatar.on_event(ev("计划列表", n="2"))
+    assert avatar.exec_relay.submitted == []
+    joined = "\n".join(texts(avatar))
+    assert "定时计划" in joined and "日报" in joined
+
+
+def test_direct_delete(avatar):
+    avatar.exec_relay.plans.append({"id": 9, "name": "晨会提醒", "on_calendar": "Mon..Fri *-*-* 09:30:00",
+                                    "enabled": True, "next_run": time.time() + 3600})
+    avatar.on_event(ev("计划删除 晨会", n="3"))
+    assert avatar.exec_relay.deleted == [9]
+    assert avatar.exec_relay.submitted == []
+    assert "已删除计划「晨会提醒」" in "\n".join(texts(avatar))
+
+
+def test_direct_create_fail_guides(avatar):
+    avatar.on_event(ev("定时 每天 跑日报", n="4"))   # 缺时间 → create_fail
+    assert not avatar.exec_relay.created
+    assert avatar.exec_relay.submitted == []
+    assert "没太看懂" in "\n".join(texts(avatar))
+
+
+def test_normal_task_still_reaches_brain(avatar):
+    """非计划消息照常走会话流（解析器不误拦）。"""
+    avatar.on_event(ev("统计每天的销量", n="5"))
+    avatar._flush(avatar.sess.sessions["o:sid200"], uid="200")
+    assert len(avatar.exec_relay.submitted) == 1
+    assert not avatar.exec_relay.created
+
+
+def test_plan_permission_gate(avatar):
+    """_handle_plan 纵深防御：非 super/L1/L2 拒绝（正常路由里 L3/NONE 到不了 IDLE）。"""
+    s = {"reply": {}, "uid": "999"}
+    avatar._handle_plan({"cmd": "create", "name": "x", "on_calendar": "*-*-* 08:00:00",
+                         "description": "y"}, s, uid="999")
+    assert not avatar.exec_relay.created
+    assert "权限" in "\n".join(texts(avatar))

@@ -37,6 +37,7 @@ from app.ingress_relay import RelayClient
 from app.knowledge import Knowledge, parse_learn_cmd
 from app.monitor import Monitor
 from app.policy import Policy, sanitize_field, sanitize_injected
+from app import planning
 from app.session import SessionManager
 from app.storage import Storage
 
@@ -264,6 +265,7 @@ class Avatar:
         quick = self._quick_text(content)
         if (s["state"] == "IDLE" and quick.strip()
                 and not self._is_noise(quick)
+                and not planning.parse_plan_cmd(quick)
                 and not any(self._kw(quick, k) for k in
                             ("submit", "cancel", "confirm", "deny",
                              "conflict"))):
@@ -625,6 +627,11 @@ class Avatar:
         if any(self._kw(text, k) for k in
                ("submit", "cancel", "confirm", "deny", "conflict")):
             return
+        # 计划（定时任务）：以 定时/计划 前缀就地拦截，进大脑前处理（大脑不会去"当场执行"）
+        pc = planning.parse_plan_cmd(text)
+        if pc:
+            self._handle_plan(pc, s, uid)
+            return
         if s.get("ack_mid") != s.get("last_msg_id"):
             self._ack_receive(s)   # 即时回执已贴过则不重复
         self.sess.start_buffering(s, text)
@@ -915,6 +922,39 @@ class Avatar:
         if "_error" in rr:
             return f"⚠️ 操作失败：{rr.get('_error')}"
         return (f"{'▶️ 已启用' if enabled else '⏸ 已停用'}计划「{p['name']}」。")
+
+    # ── 计划命令（relay-avatar 侧确定性解析，进大脑前拦截）──
+    def _handle_plan(self, pc: dict, s: dict, uid: str):
+        lvl = self.policy.get_level(uid)
+        if lvl not in ("super", "L1", "L2"):
+            self._notify_session(s, "⚠️ 你当前权限不能创建/管理定时计划。")
+            return
+        cmd = pc["cmd"]
+        if cmd == "create":
+            spec = {"op": "create", "name": pc["name"],
+                    "on_calendar": pc["on_calendar"], "description": pc["description"],
+                    "priority": "normal", "read_only": False}
+            note = self._plan_create_note(spec, uid)
+        elif cmd == "create_fail":
+            note = self._plan_fail_note(pc)
+        elif cmd == "list":
+            note = self._plan_list_note(uid)
+        elif cmd in ("delete", "disable", "enable"):
+            note = self._plan_by_name_note(cmd, pc["name"], uid)
+        else:
+            note = None
+        if note:
+            self._notify_session(s, note)
+
+    def _plan_fail_note(self, pc: dict) -> str:
+        if pc.get("reason") == "too_frequent":
+            return "⏱ 频率太高了（最快支持每 5 分钟一次）。要更频繁请到 dashboard「计划」页。"
+        return ("🤔 没太看懂这个定时规则。试试这样说：\n"
+                "· 定时 每天8点 跑经营日报\n"
+                "· 定时 每周一9:30 提醒我开会\n"
+                "· 定时 每月1号9点 生成月报\n"
+                "· 定时 每隔30分钟 检查服务\n"
+                "（也可到 dashboard「计划」页手动创建）")
 
     def _send_full_file(self, s: dict, tid, result: str):
         fp = self.st.rounds / f"{tid}_result.md"
