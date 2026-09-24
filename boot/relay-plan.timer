@@ -1,0 +1,11 @@
+[Unit]
+Description=Relay plan tick timer (every minute)
+
+[Timer]
+OnCalendar=*:*:00
+Persistent=true
+RandomizedDelaySec=20
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

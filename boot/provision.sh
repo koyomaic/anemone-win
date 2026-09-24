@@ -348,6 +348,25 @@ elif heal; then
   systemctl is-active --quiet dws-refresh.timer && ok "已启用" || bad "无法激活"
 else bad "未启用"; fi
 
+# ---------- 19c relay-plan 计划触发器（脚本+单元+定时器，SOFT） ----------
+# 每分钟扫本机 relay 的 due 计划→原子触发提交任务；日志 /var/log/relay-plan.log。
+# 纯 HTTP 打 relay admin 接口，不碰 systemd 单元/不写 /etc（大脑侧硬边界不变）。
+step "relay-plan脚本"
+if [ -f "$BOOT_DIR/plan-tick.sh" ] && cmp -s "$RES_ROOT/boot/plan-tick.sh" "$BOOT_DIR/plan-tick.sh"; then ok
+elif heal; then
+  miss "从资源树同步"
+  cp "$RES_ROOT/boot/plan-tick.sh" "$BOOT_DIR/plan-tick.sh" && chmod 700 "$BOOT_DIR/plan-tick.sh" && ok "已同步" || bad "同步失败"
+else bad "缺失"; fi
+sync_unit "relay-plan.service" "$RES_ROOT/boot/relay-plan.service" relay-plan.service copy no
+sync_unit "relay-plan.timer"   "$RES_ROOT/boot/relay-plan.timer"   relay-plan.timer   copy no
+step "relay-plan定时器"
+if systemctl is-enabled --quiet relay-plan.timer 2>/dev/null && systemctl is-active --quiet relay-plan.timer; then ok
+elif heal; then
+  miss "启用"
+  systemctl enable --now relay-plan.timer 2>/dev/null
+  systemctl is-active --quiet relay-plan.timer && ok "已启用" || bad "无法激活"
+else bad "未启用"; fi
+
 # ---------- 20 opencode.jsonc（模型 provider+密钥，SOFT） ----------
 step "opencode.jsonc"
 if [ -f "$OC_CONFIG" ] && ! grep -q 'sk-REPLACE_ME' "$OC_CONFIG"; then ok

@@ -47,6 +47,20 @@ CREATE TABLE IF NOT EXISTS tasks(
   started_at REAL,
   finished_at REAL
 );
+CREATE TABLE IF NOT EXISTS plans(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  owner_name TEXT NOT NULL,
+  on_calendar TEXT NOT NULL,
+  action TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  next_run REAL,
+  last_run REAL,
+  last_task_id INTEGER,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plans_due ON plans(enabled, next_run);
 """
 
 # PostgreSQL 方言（RELAY_DB 为 postgresql:// URL 时使用）；"user" 是 PG 保留字必须加引号
@@ -93,6 +107,20 @@ PG_SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
     "CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)",
+    """CREATE TABLE IF NOT EXISTS plans(
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      owner_name TEXT NOT NULL,
+      on_calendar TEXT NOT NULL,
+      action TEXT NOT NULL DEFAULT '{}',
+      enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      next_run DOUBLE PRECISION,
+      last_run DOUBLE PRECISION,
+      last_task_id BIGINT,
+      created_at DOUBLE PRECISION NOT NULL,
+      updated_at DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_plans_due ON plans(enabled, next_run)",
 ]
 
 TASK_FIELDS = {
@@ -100,6 +128,12 @@ TASK_FIELDS = {
     "session_id", "engine", "workdir", "result", "error", "changed_files",
     "conflicts", "tokens", "cost", "resume_from", "blocked_cmd", "resume_hint", "read_only",
     "started_at", "finished_at",
+}
+
+# plans 可更新字段白名单（update_plan 用）；owner_name/created_at 不可改。
+PLAN_FIELDS = {
+    "name", "on_calendar", "action", "enabled",
+    "next_run", "last_run", "last_task_id",
 }
 
 
@@ -116,6 +150,16 @@ def _row_to_task(row) -> dict:
             t[k] = []
     t["read_only"] = bool(t.get("read_only"))
     return t
+
+
+def _row_to_plan(row) -> dict:
+    p = dict(row)
+    try:
+        p["action"] = json.loads(p["action"])
+    except (TypeError, ValueError):
+        p["action"] = {}
+    p["enabled"] = bool(p.get("enabled"))
+    return p
 
 
 class DB:
@@ -403,6 +447,67 @@ class DB:
             "UPDATE tasks SET status='done', error=?, finished_at=COALESCE(finished_at, ?)"
             " WHERE id=? AND status IN ('review','pending_approval')",
             (marker, now, task_id))
+        return rowcount > 0
+
+    # ---- plans（定时计划：声明存库，root 侧 relay-plan.timer 扫库触发） ----
+
+    def create_plan(self, *, name: str, owner_name: str, on_calendar: str,
+                    action: dict, enabled: bool = True,
+                    next_run: float | None = None) -> int:
+        now = time.time()
+        args = (name, owner_name, on_calendar,
+                json.dumps(action, ensure_ascii=False), enabled, next_run, now, now)
+        sql = ("INSERT INTO plans(name, owner_name, on_calendar, action, enabled,"
+               " next_run, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
+        if self._pg:
+            row = self._q(sql + " RETURNING id", args, one=True)
+            return row["id"]
+        self._q(sql, args)
+        rows, _ = self._run("SELECT last_insert_rowid() AS id")
+        return rows[0]["id"]
+
+    def plan(self, plan_id: int) -> dict | None:
+        row = self._q("SELECT * FROM plans WHERE id = ?", (plan_id,), one=True)
+        return _row_to_plan(row) if row else None
+
+    def plan_by_name(self, name: str) -> dict | None:
+        row = self._q("SELECT * FROM plans WHERE name = ?", (name,), one=True)
+        return _row_to_plan(row) if row else None
+
+    def list_plans(self, limit: int = 500) -> list[dict]:
+        rows = self._q("SELECT * FROM plans ORDER BY id DESC LIMIT ?", (limit,))
+        return [_row_to_plan(r) for r in rows]
+
+    def update_plan(self, plan_id: int, **fields) -> None:
+        fields = {k: v for k, v in fields.items() if k in PLAN_FIELDS}
+        if not fields:
+            return
+        if "action" in fields and not isinstance(fields["action"], str):
+            fields["action"] = json.dumps(fields["action"], ensure_ascii=False)
+        fields["updated_at"] = time.time()
+        sql = "UPDATE plans SET {} WHERE id = ?".format(
+            ", ".join(f"{k} = ?" for k in fields))
+        self._q(sql, (*fields.values(), plan_id))
+
+    def delete_plan(self, plan_id: int) -> bool:
+        _, rowcount = self._run("DELETE FROM plans WHERE id = ?", (plan_id,))
+        return rowcount > 0
+
+    def due_plans(self, now: float) -> list[dict]:
+        """到点（enabled 且 next_run<=now）的计划，供 tick 触发。"""
+        rows = self._q("SELECT * FROM plans WHERE enabled AND next_run IS NOT NULL"
+                       " AND next_run <= ? ORDER BY next_run", (now,))
+        return [_row_to_plan(r) for r in rows]
+
+    def claim_plan(self, plan_id: int, now: float, new_next_run: float) -> bool:
+        """原子认领：仅当计划仍到点时推进 next_run/last_run，防 tick 重入双发。
+
+        返回是否由本次调用认领成功（rowcount>0）。
+        """
+        _, rowcount = self._run(
+            "UPDATE plans SET last_run = ?, next_run = ?, updated_at = ?"
+            " WHERE id = ? AND enabled AND next_run IS NOT NULL AND next_run <= ?",
+            (now, new_next_run, now, plan_id, now))
         return rowcount > 0
 
     def report(self, days: int = 7) -> dict:

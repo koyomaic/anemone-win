@@ -1,0 +1,7 @@
+[Unit]
+Description=Relay plan tick (fire due plans → submit relay tasks)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/team/relay-boot/plan-tick.sh
+NoNewPrivileges=true

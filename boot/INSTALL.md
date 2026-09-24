@@ -11,6 +11,7 @@
 | git 同步部署 | `relay-boot.timer` → `boot.sh` | 每日 01:00 + 开机 2min：拉新→测试门禁→上线/回滚→**跑 provision 清单**→失败钉钉预警 |
 | 工作区备份 | `relay-backup.timer` → `scripts/backup.sh` | 每日 03:30：数据库快照（SQLite `.backup` 或 PG `pg_dump -Fc`）+ shared/ + relay.env + relay.log → `/mnt/vol-eltaah12/backup/` |
 | dws 登录态小时级刷新 | `dws-refresh.timer` → `dws-refresh.sh` | 每小时整点（±60s 抖动）：软链共享种子进临时 HOME 跑 `auth status`，token 刷新原地发生在种子上（与 boot 预警同一份登录态）；日志 `/var/log/dws-refresh.log`；登录态失效时清单 WARN，需人工设备码重授权 |
+| 计划触发器 | `relay-plan.timer` → `plan-tick.sh` | 每分钟（±20s 抖动，`Persistent=true` 漏跑补跑）：扫本机 relay 的 due 计划→`POST /plans/{id}/fire` 原子认领并提交任务；纯 HTTP 打 admin 接口，不碰 systemd 单元/不写 /etc；日志 `/var/log/relay-plan.log`。计划由大脑/成员经 `POST /plans` 或 dashboard「计划」页创建，存本机各自的库 |
 | Claude 代理 | `claude-proxy.service` | 可选：Anthropic→OpenAI 翻译代理 :8790 |
 | TLS 代理 | `relay-tls-proxy.service` | 可选：仅 HTTPS 主机（有 relay-tls 证书才装），socat 回环明文 :8787→TLS :8788（仅本机健康检查兼容） |
 | store 台账 | —（CLI，`/usr/local/bin/store`） | 业务存储统一索引：磁盘为文件真身、PostgreSQL（relay 同库 `public` schema、`store_` 前缀）为权威索引与血缘、`index/manifest.jsonl` 为降级快照。存储根＝relay 的 `shared_dir`（同址是刻意的，见 `boot.env.example` 的 `STORE_ROOT` 说明）；约定见 workspace `AGENTS.md`「共享区约定」 |

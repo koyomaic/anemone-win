@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .audit import AuditLog
 from . import shared_knowledge
+from . import plans as plan_util
 from .config import Settings
 from .db import DB
 from .events import TERMINAL, EventBus
@@ -90,7 +91,7 @@ td.desc{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 .num{text-align:right;font-variant-numeric:tabular-nums}
 </style></head><body><div class="wrap">
 <header><h1>团队中转服务 <sub id="upd"></sub></h1>
-<nav><a href="#" id="tab-metrics" class="on">调用情况</a><a href="#" id="tab-tokens">凭证管理</a><a href="#" id="tab-shared">共享知识</a></nav>
+<nav><a href="#" id="tab-metrics" class="on">调用情况</a><a href="#" id="tab-tokens">凭证管理</a><a href="#" id="tab-shared">共享知识</a><a href="#" id="tab-plans">计划</a></nav>
 <a href="/logout">退出</a></header>
 <div id="view-metrics">
 <div class="cards" id="cards"></div>
@@ -133,6 +134,21 @@ td.desc{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 <div id="sh-view" style="display:none"><h2 id="sh-view-title"></h2>
 <pre id="sh-view-body" style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:420px;overflow:auto"></pre>
 <a href="#" id="sh-view-close">关闭预览</a></div>
+</div>
+<div id="view-plans" style="display:none">
+<p style="font-size:13px;color:#94a3b8">计划＝定时触发的 relay 任务。root 侧 <code>relay-plan.timer</code> 每分钟扫库，到点自动提交任务（大脑/成员也可经 <code>POST /plans</code> 创建）。表达式用 systemd OnCalendar：<code>*-*-* 08:00:00</code>（每天8点）、<code>Mon *-*-* 09:30:00</code>（每周一9:30）、<code>*:0/30:00</code>（每半小时）。</p>
+<h2>新建计划</h2>
+<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+<input id="pl-name" placeholder="计划名，如 daily-brief" style="flex:1;min-width:160px">
+<input id="pl-cal" placeholder="OnCalendar，如 *-*-* 08:00:00" style="flex:2;min-width:220px">
+</div>
+<textarea id="pl-desc" rows="2" placeholder="到点要执行的任务描述（提交给 relay 跑）" style="width:100%;box-sizing:border-box;margin-bottom:8px"></textarea>
+<div style="display:flex;gap:14px;margin-bottom:14px;align-items:center">
+<label style="font-size:13px;color:#94a3b8"><input type="checkbox" id="pl-urgent"> 加急</label>
+<label style="font-size:13px;color:#94a3b8"><input type="checkbox" id="pl-ro"> 只读</label>
+<button id="btn-pl-new">创建</button>
+</div>
+<h2>现有计划</h2><div id="plans"></div>
 </div>
 </div>
 <script>
@@ -180,15 +196,19 @@ function showTab(v){
   document.getElementById("view-metrics").style.display=v==="m"?"":"none";
   document.getElementById("view-tokens").style.display=v==="t"?"":"none";
   document.getElementById("view-shared").style.display=v==="s"?"":"none";
+  document.getElementById("view-plans").style.display=v==="p"?"":"none";
   document.getElementById("tab-metrics").className=v==="m"?"on":"";
   document.getElementById("tab-tokens").className=v==="t"?"on":"";
   document.getElementById("tab-shared").className=v==="s"?"on":"";
+  document.getElementById("tab-plans").className=v==="p"?"on":"";
   if(v==="t")refreshTokens();
   if(v==="s")refreshShared();
+  if(v==="p")refreshPlans();
 }
 document.getElementById("tab-metrics").addEventListener("click",e=>{e.preventDefault();showTab("m")});
 document.getElementById("tab-tokens").addEventListener("click",e=>{e.preventDefault();showTab("t")});
 document.getElementById("tab-shared").addEventListener("click",e=>{e.preventDefault();showTab("s")});
+document.getElementById("tab-plans").addEventListener("click",e=>{e.preventDefault();showTab("p")});
 document.getElementById("tasks").addEventListener("click",async e=>{
  const a=e.target.closest("a.act");if(!a)return;e.preventDefault();
  const k=a.dataset.k,n=a.dataset.n;
@@ -354,7 +374,59 @@ document.getElementById("btn-new").addEventListener("click",async()=>{
  document.getElementById("newname").value="";
  showNewTok(d);refreshTokens();
 });
-refresh();setInterval(()=>{refresh();if(document.getElementById("view-tokens").style.display!=="none")refreshTokens()},10000);
+function fmtNext(t){if(!t)return"-";const d=new Date(t*1000);
+ return d.toLocaleString("zh",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false})}
+async function refreshPlans(){
+ try{
+  const r=await fetch("/dashboard/plans");if(!r.ok)throw 0;const d=await r.json();
+  const ps=d.plans||[];
+  document.getElementById("plans").innerHTML=ps.length
+   ?`<table><tr><th>名称</th><th>OnCalendar</th><th>下次</th><th>上次</th><th>状态</th><th>任务</th><th>操作</th></tr>`+ps.map(p=>{
+     const a=p.action||{};const desc=a.description||"";
+     return `<tr><td><code>${esc(p.name)}</code><div style="font-size:11px;color:#64748b">${esc(p.owner_name)}</div></td>
+      <td style="font-size:12px">${esc(p.on_calendar)}</td>
+      <td style="font-size:12px">${p.enabled?fmtNext(p.next_run):"-"}</td>
+      <td style="font-size:12px">${fmtNext(p.last_run)}</td>
+      <td>${p.enabled?'<span class="b done">启用</span>':'<span class="b cancelled">停用</span>'}</td>
+      <td class="desc" title="${esc(desc)}">${esc(desc.slice(0,40))}</td>
+      <td><a href="#" class="act" data-a="toggle" data-n="${p.id}">${p.enabled?"停用":"启用"}</a>
+      <a href="#" class="act" data-a="del" data-n="${p.id}" style="color:#f87171">删除</a></td></tr>`;
+    }).join("")+"</table>"
+   :'<p style="font-size:13px;color:#64748b">暂无计划</p>';
+ }catch(e){}
+}
+document.getElementById("plans").addEventListener("click",async e=>{
+ const a=e.target.closest("a.act");if(!a)return;e.preventDefault();
+ const id=a.dataset.n,act=a.dataset.a;
+ if(act==="toggle"){
+  const r=await fetch(`/dashboard/plans/${encodeURIComponent(id)}/toggle`,{method:"POST"});
+  if(!r.ok){alert("操作失败: "+r.status);return;}
+  refreshPlans();
+ }else if(act==="del"){
+  if(!confirm("删除该计划？"))return;
+  const r=await fetch(`/dashboard/plans/${encodeURIComponent(id)}`,{method:"DELETE"});
+  if(!r.ok){alert("删除失败: "+r.status);return;}
+  refreshPlans();
+ }
+});
+document.getElementById("btn-pl-new").addEventListener("click",async()=>{
+ const name=document.getElementById("pl-name").value.trim();
+ const cal=document.getElementById("pl-cal").value.trim();
+ const desc=document.getElementById("pl-desc").value.trim();
+ if(!name||!cal||!desc){alert("请填写计划名、OnCalendar 和任务描述");return;}
+ const action={type:"task",description:desc,
+  priority:document.getElementById("pl-urgent").checked?"urgent":"normal",
+  read_only:document.getElementById("pl-ro").checked};
+ const r=await fetch("/dashboard/plans",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({name,on_calendar:cal,action,enabled:true})});
+ if(r.status===409){alert("计划名已存在");return;}
+ if(!r.ok){let m=r.status;try{m=await r.text()}catch(e){}alert("创建失败: "+m);return;}
+ document.getElementById("pl-name").value="";document.getElementById("pl-cal").value="";
+ document.getElementById("pl-desc").value="";document.getElementById("pl-urgent").checked=false;
+ document.getElementById("pl-ro").checked=false;
+ refreshPlans();
+});
+refresh();setInterval(()=>{refresh();if(document.getElementById("view-tokens").style.display!=="none")refreshTokens();if(document.getElementById("view-plans").style.display!=="none")refreshPlans()},10000);
 </script></body></html>"""
 from .executor import Executor
 from .scheduler import Scheduler
@@ -427,6 +499,20 @@ class ConfirmBody(BaseModel):
 
 class ApproveBody(BaseModel):
     decision: str  # approve | deny
+
+
+class NewPlan(BaseModel):
+    name: str
+    on_calendar: str            # systemd OnCalendar 表达式，如 *-*-* 08:00:00
+    action: dict                # 白名单动作，目前仅 {"type":"task","description":...,...}
+    enabled: bool = True
+
+
+class PlanPatch(BaseModel):
+    name: str | None = None
+    on_calendar: str | None = None
+    action: dict | None = None
+    enabled: bool | None = None
 
 
 class UploadFileBody(BaseModel):
@@ -1055,6 +1141,145 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    # ---- 计划（定时任务）----
+    # 大脑/成员只写声明（POST /plans），root 侧 relay-plan.timer 每分钟扫库、
+    # 原子认领并 POST /tasks 触发。大脑全程不碰 systemctl / 不写 /etc，
+    # relay.service 的 ProtectSystem=strict 硬边界原样保留。
+
+    def _plan_owner_ok(principal: dict, plan: dict) -> bool:
+        return bool(principal.get("admin")) or principal.get("name") == plan["owner_name"]
+
+    @app.post("/plans", status_code=201)
+    async def create_plan(body: NewPlan, principal: dict = Depends(auth)):
+        name = (body.name or "").strip()
+        if not plan_util.NAME_RE.match(name):
+            raise HTTPException(status_code=422,
+                                detail="name 需为 1-64 个字母/数字/中文/._- 字符")
+        if db.plan_by_name(name):
+            raise HTTPException(status_code=409, detail="plan name exists")
+        err = plan_util.validate_action(body.action)
+        if err:
+            raise HTTPException(status_code=422, detail=err)
+        on_cal = (body.on_calendar or "").strip()
+        nxt, cal_err = plan_util.next_elapse(on_cal)
+        if nxt is None:
+            raise HTTPException(status_code=422, detail=f"on_calendar 无效: {cal_err}")
+        plan_id = db.create_plan(name=name, owner_name=principal["name"],
+                                 on_calendar=on_cal, action=body.action,
+                                 enabled=body.enabled,
+                                 next_run=nxt if body.enabled else None)
+        audit.line(0, principal["name"], "plan_create", f"{name} @ {on_cal}")
+        return db.plan(plan_id)
+
+    @app.get("/plans")
+    async def list_plans(_: dict = Depends(auth)):
+        return {"plans": db.list_plans()}
+
+    @app.get("/plans/due")
+    async def plans_due(_: None = Depends(require_admin)):
+        return {"plans": db.due_plans(time.time())}
+
+    @app.get("/plans/{plan_id}")
+    async def get_plan(plan_id: int, _: dict = Depends(auth)):
+        p = db.plan(plan_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="plan not found")
+        return p
+
+    @app.patch("/plans/{plan_id}")
+    async def patch_plan(plan_id: int, body: PlanPatch, principal: dict = Depends(auth)):
+        p = db.plan(plan_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="plan not found")
+        if not _plan_owner_ok(principal, p):
+            raise HTTPException(status_code=403, detail="only owner or admin")
+        fields: dict = {}
+        if body.name is not None:
+            nm = body.name.strip()
+            if not plan_util.NAME_RE.match(nm):
+                raise HTTPException(status_code=422, detail="bad name")
+            other = db.plan_by_name(nm)
+            if other and other["id"] != plan_id:
+                raise HTTPException(status_code=409, detail="plan name exists")
+            fields["name"] = nm
+        if body.action is not None:
+            err = plan_util.validate_action(body.action)
+            if err:
+                raise HTTPException(status_code=422, detail=err)
+            fields["action"] = body.action
+        if body.on_calendar is not None:
+            on_cal = body.on_calendar.strip()
+            nxt, cal_err = plan_util.next_elapse(on_cal)
+            if nxt is None:
+                raise HTTPException(status_code=422, detail=f"on_calendar 无效: {cal_err}")
+            fields["on_calendar"] = on_cal
+            fields["next_run"] = nxt
+        if body.enabled is not None:
+            fields["enabled"] = body.enabled
+            if body.enabled:
+                if "next_run" not in fields:  # 重新启用且未改日历 → 重算下次触发
+                    nxt, cal_err = plan_util.next_elapse(p["on_calendar"])
+                    if nxt is None:
+                        raise HTTPException(status_code=422,
+                                            detail=f"on_calendar 无效: {cal_err}")
+                    fields["next_run"] = nxt
+            else:
+                fields["next_run"] = None  # 停用即不再到点
+        if not fields:
+            return p
+        db.update_plan(plan_id, **fields)
+        audit.line(0, principal["name"], "plan_update",
+                   f"{p['name']} {sorted(fields.keys())}")
+        return db.plan(plan_id)
+
+    @app.delete("/plans/{plan_id}")
+    async def delete_plan(plan_id: int, principal: dict = Depends(auth)):
+        p = db.plan(plan_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="plan not found")
+        if not _plan_owner_ok(principal, p):
+            raise HTTPException(status_code=403, detail="only owner or admin")
+        db.delete_plan(plan_id)
+        audit.line(0, principal["name"], "plan_delete", p["name"])
+        return {"ok": True, "id": plan_id}
+
+    @app.post("/plans/{plan_id}/fire")
+    async def fire_plan(plan_id: int, _: None = Depends(require_admin)):
+        """tick 专用：原子认领（推进 next_run）后提交任务。先认领后提交 → 至多一次，
+        即使 tick 重入/并发也不会双发。"""
+        p = db.plan(plan_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="plan not found")
+        if not p["enabled"]:
+            raise HTTPException(status_code=409, detail="plan disabled")
+        now = time.time()
+        nxt, cal_err = plan_util.next_elapse(p["on_calendar"])
+        if nxt is None:
+            # 日历已坏：停用，避免每分钟空转刷日志
+            db.update_plan(plan_id, enabled=False, next_run=None)
+            audit.line(0, "__plan_tick__", "plan_disable_bad_calendar",
+                       f"{p['name']}: {cal_err}")
+            raise HTTPException(status_code=422, detail=f"on_calendar 无效: {cal_err}")
+        if not db.claim_plan(plan_id, now, nxt):
+            return {"skipped": True, "id": plan_id}  # 已被认领/未到点
+        action = p["action"] or {}
+        if action.get("type") != "task":
+            audit.line(0, "__plan_tick__", "plan_bad_action", p["name"])
+            return {"skipped": True, "id": plan_id, "reason": "bad action"}
+        task_id = db.create_task(
+            user=p["owner_name"],
+            description=action["description"],
+            project=action.get("project", ""),
+            targets=action.get("targets", []),
+            priority=action.get("priority", "normal"),
+            read_only=bool(action.get("read_only", False)),
+        )
+        db.update_plan(plan_id, last_task_id=task_id)
+        audit.line(task_id, p["owner_name"], "plan_fire", p["name"])
+        bus.publish(task_id, t="status", s="queued")
+        await sched.submit(task_id, action.get("priority", "normal"))
+        return {"task_id": task_id, "next_run": nxt}
+
     # ---- 文件上传/下载（共享区，单文件 ≤10MB） ----
 
     @app.post("/files", status_code=201)
@@ -1474,5 +1699,64 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         db.delete_user(name)
         audit.line(0, "__dashboard__", "token_delete", name)
         return {"ok": True, "name": name}
+
+    # ---- 计划管理（dashboard 口令会话内，代理 admin 的 plans 管理） ----
+
+    @app.get("/dashboard/plans")
+    async def dashboard_plans(request: Request):
+        _dash_auth(request)
+        return {"plans": db.list_plans()}
+
+    @app.post("/dashboard/plans", status_code=201)
+    async def dashboard_plan_create(request: Request, body: NewPlan):
+        _dash_auth(request)
+        name = (body.name or "").strip()
+        if not plan_util.NAME_RE.match(name):
+            raise HTTPException(status_code=422,
+                                detail="name 需为 1-64 个字母/数字/中文/._- 字符")
+        if db.plan_by_name(name):
+            raise HTTPException(status_code=409, detail="plan name exists")
+        err = plan_util.validate_action(body.action)
+        if err:
+            raise HTTPException(status_code=422, detail=err)
+        on_cal = (body.on_calendar or "").strip()
+        nxt, cal_err = plan_util.next_elapse(on_cal)
+        if nxt is None:
+            raise HTTPException(status_code=422, detail=f"on_calendar 无效: {cal_err}")
+        plan_id = db.create_plan(name=name, owner_name="__dashboard__",
+                                 on_calendar=on_cal, action=body.action,
+                                 enabled=body.enabled,
+                                 next_run=nxt if body.enabled else None)
+        audit.line(0, "__dashboard__", "plan_create", f"{name} @ {on_cal}")
+        return db.plan(plan_id)
+
+    @app.post("/dashboard/plans/{plan_id}/toggle")
+    async def dashboard_plan_toggle(plan_id: int, request: Request):
+        _dash_auth(request)
+        p = db.plan(plan_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="plan not found")
+        enabled = not p["enabled"]
+        fields: dict = {"enabled": enabled}
+        if enabled:
+            nxt, cal_err = plan_util.next_elapse(p["on_calendar"])
+            if nxt is None:
+                raise HTTPException(status_code=422, detail=f"on_calendar 无效: {cal_err}")
+            fields["next_run"] = nxt
+        else:
+            fields["next_run"] = None
+        db.update_plan(plan_id, **fields)
+        audit.line(0, "__dashboard__", "plan_toggle", f"{p['name']} -> {enabled}")
+        return db.plan(plan_id)
+
+    @app.delete("/dashboard/plans/{plan_id}")
+    async def dashboard_plan_delete(plan_id: int, request: Request):
+        _dash_auth(request)
+        p = db.plan(plan_id)
+        if not p:
+            raise HTTPException(status_code=404, detail="plan not found")
+        db.delete_plan(plan_id)
+        audit.line(0, "__dashboard__", "plan_delete", p["name"])
+        return {"ok": True, "id": plan_id}
 
     return app
