@@ -756,3 +756,154 @@ def test_poll_sessions_skips_local_shadow(av, cfg, shared):
     av._poll_sessions()
     assert polled == []                            # 没去轮询
     assert s["state"] == "LOCAL"                   # 态未被改
+
+
+# ── G. send_file 标记代投（local 无 Bash，投递由 avatar 代做）──
+# 缺口：放开作用域写后 local 能出 HTML，但**发不出去**——dws 要 Bash，而 Bash 仍禁
+# （avatar 服务无沙箱，开 Bash 等于无限制 root）。故给一个标记出口由 avatar 代投。
+# 标记内容来自模型输出、可被用户输入间接注入，故五道护栏逐条锁死。
+
+import json as _json                      # noqa: E402
+import os as _os                          # noqa: E402
+
+
+def _mk(path, content="x", size=None):
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content if size is None else "a" * size)
+    return path
+
+
+def _send_block(path, extra=None):
+    obj = {"path": path}
+    if extra:
+        obj.update(extra)
+    return "结论正文\n\n```send_file\n" + _json.dumps(obj, ensure_ascii=False) + "\n```"
+
+
+def test_send_marker_delivers_and_strips(av, cfg, shared):
+    """护栏内正常路径：文件发出、标记块从正文剔除、附注告知用户。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/x.html", "<html>报告</html>")
+    s = sess_of(av)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "sid200",
+                  "conversation_id": "c1", "sender": "张三"}
+    clean, notes = av._consume_send_markers(_send_block(p), s, 1, "200")
+    assert "send_file" not in clean and "结论正文" in clean   # 标记已剔除
+    assert len(notes) == 1 and "已发文件" in notes[0]
+    assert any("[file]" in c and p in c for _, c in av.dws.sent)
+
+
+def test_send_marker_refuses_out_of_scope(av, cfg, shared):
+    """护栏①：作用域外路径一律拒（哪怕文件真实存在）。"""
+    _, wd = write_ready(cfg, shared)
+    outside = _mk(str(shared / "knowledge" / "secret.md"), "内部知识")
+    s = sess_of(av)
+    clean, notes = av._consume_send_markers(_send_block(outside), s, 1, "200")
+    assert any("拒绝代投" in n for n in notes)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_send_marker_refuses_dotdot_escape(av, cfg, shared):
+    """护栏①：`../` 穿越必须被 realpath 归一后拦下。"""
+    _, wd = write_ready(cfg, shared)
+    _mk(str(shared / "knowledge" / "secret.md"), "内部知识")
+    esc = wd[0] + "/../knowledge/secret.md"
+    s = sess_of(av)
+    _, notes = av._consume_send_markers(_send_block(esc), s, 1, "200")
+    assert any("拒绝代投" in n for n in notes)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_send_marker_refuses_symlink_escape(av, cfg, shared):
+    """护栏①：符号链接指向作用域外同样拦下（realpath 解析后才比对）。"""
+    _, wd = write_ready(cfg, shared)
+    target = _mk(str(shared / "knowledge" / "secret.md"), "内部知识")
+    link = wd[0] + "/innocent.html"
+    try:
+        _os.symlink(target, link)
+    except OSError:
+        pytest.skip("无 symlink 权限")
+    s = sess_of(av)
+    _, notes = av._consume_send_markers(_send_block(link), s, 1, "200")
+    assert any("拒绝代投" in n for n in notes)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_send_marker_ignores_recipient_override(av, cfg, shared):
+    """护栏②：标记里写 to/收件人一律无效，只能发给发起会话。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/y.html", "x")
+    s = sess_of(av)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "sid200",
+                  "conversation_id": "c1", "sender": "张三"}
+    av._consume_send_markers(
+        _send_block(p, {"to": "马韵升", "open_dingtalk_id": "EVIL",
+                        "conversation_id": "EVIL"}), s, 1, "200")
+    tgt = [t for t, c in av.dws.sent if "[file]" in c]
+    assert tgt and tgt[0]["open_dingtalk_id"] == "sid200"    # 仍是发起会话
+
+
+def test_send_marker_missing_and_oversize(av, cfg, shared):
+    """护栏③：不存在的文件、超 media_max_size_mb 都要如实告知且不崩。"""
+    _, wd = write_ready(cfg, shared)
+    s = sess_of(av)
+    _, n1 = av._consume_send_markers(
+        _send_block(wd[0] + "/不存在.html"), s, 1, "200")
+    assert any("不是已存在的文件" in n for n in n1)
+    setcfg(cfg, "security", media_max_size_mb=0)      # 0MB → 任何件都超
+    big = _mk(wd[0] + "/big.html", size=10)
+    _, n2 = av._consume_send_markers(_send_block(big), s, 2, "200")
+    assert any("超过" in n for n in n2)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_send_marker_caps_file_count(av, cfg, shared):
+    """护栏④：单次最多 SEND_MAX_FILES 件，防刷。"""
+    from app.main import SEND_MAX_FILES
+    _, wd = write_ready(cfg, shared)
+    blocks = []
+    for i in range(SEND_MAX_FILES + 3):
+        blocks.append("```send_file\n" + _json.dumps(
+            {"path": _mk(f"{wd[0]}/f{i}.html")}) + "\n```")
+    s = sess_of(av)
+    _, notes = av._consume_send_markers("正文\n" + "\n".join(blocks), s, 1, "200")
+    files = [c for _, c in av.dws.sent if "[file]" in c]
+    assert len(files) == SEND_MAX_FILES
+    assert any("上限" in n for n in notes)
+
+
+def test_send_marker_dedupes_by_tid(av, cfg, shared):
+    """护栏⑤：同一 tid 二次回流不重复发。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/z.html", "x")
+    s = sess_of(av)
+    av._consume_send_markers(_send_block(p), s, 7, "200")
+    av._consume_send_markers(_send_block(p), s, 7, "200")
+    assert len([c for _, c in av.dws.sent if "[file]" in c]) == 1
+
+
+def test_send_marker_malformed_json_kept_in_text(av, cfg, shared):
+    """解析失败不得吞正文：原样保留，让用户看见模型到底写了什么。"""
+    _, wd = write_ready(cfg, shared)
+    s = sess_of(av)
+    bad = "正文\n\n```send_file\n{不是 JSON}\n```"
+    clean, notes = av._consume_send_markers(bad, s, 1, "200")
+    assert "{不是 JSON}" in clean and notes == []
+    assert av.dws.sent == []
+
+
+def test_drain_local_sends_file_end_to_end(av, cfg, shared):
+    """全链路：local 出件 → 标记 → avatar 代投 → 正文回话（标记已剔除）。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/报告.html", "<html>市场研判</html>")
+    av.exec_local = FakeExecLocal(
+        result={"text": _send_block(p), "escalate": False})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    assert any("[file]" in c and p in c for _, c in av.dws.sent)
+    txt = [c for _, c in av.dws.sent if "结论正文" in c or "已发文件" in c]
+    assert txt and "send_file" not in "".join(txt)
+    assert s["state"] == "IDLE"

@@ -47,6 +47,12 @@ EMOJI_RE = re.compile(r"^(\[[^\[\]]{1,12}\]\s*)+$")
 # 大脑在回复里放的结构化计划标记：```plan\n{json}\n```。relay-avatar 解析并执行
 # （理解交给 LLM，带凭据的创建/管理留在本进程）。解析失败则原样保留、不吞正文。
 PLAN_BLOCK_RE = re.compile(r"```plan[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
+# local 通路无 Bash，跑不了 dws，故出件后**发不出去**（2026-09-24 实测：agent 明确
+# 回报"本会话工具集里没有 Bash/Shell 入口，dws CLI 无从执行"）。给它一个标记出口：
+# 大脑把要发的文件写成 ```send_file``` 块，由 avatar（本就持有 dws）代投。
+# 这样既补上投递能力，又不必放开 Bash（avatar 服务无沙箱，放开等于无限制 root）。
+SEND_BLOCK_RE = re.compile(r"```send_file[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
+SEND_MAX_FILES = 5            # 单次结果最多代投几件，防刷
 
 
 def log(*a):
@@ -828,6 +834,12 @@ class Avatar:
                 self._flush(s, uid=uid, force_relay=True)
                 continue
             s["state"] = "IDLE"
+            # 代投文件（local 无 Bash 跑不了 dws，由 avatar 代投）。必须在清元数据
+            # 与回报之前做：去重键要取影子 task_id，且回报/回话都应是净化后的正文。
+            dedupe = s.get("task_id") or f"local-{s.get('local_started')}"
+            out, notes = self._consume_send_markers(out, s, dedupe, uid)
+            if notes:
+                out = (out + ("\n\n" if out else "") + "\n".join(notes)).strip()
             # 成功收尾即清恢复元数据：local_reap_count 若只增不减，累计 2 次后
             # （哪怕中间都成功）会永久禁用自动重投。
             s["local_desc"] = ""
@@ -1092,6 +1104,81 @@ class Avatar:
                 note = f"⚠️ 计划操作异常：{e!r}"
             if note:
                 notes.append(note)
+        return clean, notes
+
+    def _consume_send_markers(self, result: str, s: dict, tid, uid: str):
+        """解析 ```send_file``` 标记并由 avatar 代投文件，返回 (净化正文, 附注)。
+
+        为什么由 avatar 代投而不是给 local 开 Bash：relay-avatar.service **没有任何
+        沙箱**（无 ProtectSystem／InaccessiblePaths，与 relay.service 不同），local
+        子进程一旦拿到 Bash 就是无限制 root——能读 relay.env 取 admin token、
+        rm -rf shared/、systemctl stop relay。而 `Bash(python3 *)` 这类作用域规则是
+        假边界（`python3 -c "import shutil…"` 一句话绕过）。故投递能力放在持有 dws
+        的 avatar 这一层，local 只负责把件写到作用域目录里。
+
+        五道护栏（缺一不可，标记内容来自模型输出、可被用户输入间接注入）：
+        ① 路径必须 realpath 落在 security.local_write_dirs 内——即"只能发它本来
+           就有权写的东西"，堵住 `../../relay.env` 与符号链接逃逸；
+        ② 收件人**恒为发起会话** s["reply"]，标记里写什么都不能改投递目标，
+           杜绝把内部件外发给第三方；
+        ③ 必须是已存在的普通文件，且不超过 media_max_size_mb；
+        ④ 单次结果最多 SEND_MAX_FILES 件，防刷；
+        ⑤ 按 tid 去重，review→done 二次回流不重复发。
+        """
+        specs: list = []
+
+        def _grab(m):
+            try:
+                obj = json.loads(m.group(1))
+            except Exception:
+                return m.group(0)          # 解析失败：原样保留，不吞正文
+            if isinstance(obj, dict):
+                specs.append(obj)
+                return ""
+            return m.group(0)
+
+        clean = SEND_BLOCK_RE.sub(_grab, result).strip()
+        if not specs or s.get("send_applied") == tid:
+            return clean, []
+        s["send_applied"] = tid
+        roots = [os.path.realpath(str(x)) for x in
+                 (self.cfg.section("security").get("local_write_dirs") or [])]
+        maxb = int(self.cfg.get("security", "media_max_size_mb", 20)) * 1024 * 1024
+        notes: list = []
+        sent = 0
+        for spec in specs:
+            raw = str(spec.get("path") or "").strip()
+            if not raw:
+                continue
+            if sent >= SEND_MAX_FILES:
+                notes.append(f"⚠️ 超过单次代投上限 {SEND_MAX_FILES} 件，"
+                             f"其余未发（{os.path.basename(raw)}）")
+                continue
+            p = os.path.realpath(os.path.abspath(raw))
+            if not any(p == r or p.startswith(r + os.sep) for r in roots):
+                self.audit.log("send_refused", uid, f"越界路径 {p[:120]}",
+                               backend="local", task_id=tid)
+                notes.append(f"⚠️ 拒绝代投：`{os.path.basename(raw)}` 不在可写作用域内")
+                continue
+            if not os.path.isfile(p):
+                notes.append(f"⚠️ 代投失败：`{os.path.basename(raw)}` 不是已存在的文件")
+                continue
+            if os.path.getsize(p) > maxb:
+                notes.append(f"⚠️ 代投失败：`{os.path.basename(raw)}` 超过 "
+                             f"{maxb // 1048576}MB 上限")
+                continue
+            try:
+                r = self.dws.send_file(s["reply"], p)
+            except Exception as e:
+                r = {"_exc": repr(e)[:120]}
+            ok = bool(r) and "_exc" not in r and r.get("success") is not False
+            self.audit.log("send_file" if ok else "send_failed", uid,
+                           f"{p[:120]} ({os.path.getsize(p)}B)",
+                           backend="local", task_id=tid)
+            sent += 1 if ok else 0
+            notes.append(f"📎 已发文件：`{os.path.basename(p)}`" if ok
+                         else f"⚠️ 文件发送失败：`{os.path.basename(p)}` "
+                              f"{str(r.get('_exc') or r.get('errorMsg') or '')[:80]}")
         return clean, notes
 
     def _exec_plan_op(self, spec: dict, uid: str) -> str | None:
