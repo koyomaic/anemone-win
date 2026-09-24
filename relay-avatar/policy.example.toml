@@ -126,12 +126,82 @@ l2_add_dirs = []               # local 后端额外只读目录：subagent 要�
 # memory 会自动并入每个任务的 CLAUDE.md（改它＝向所有后续任务注入提示词）、
 # data 是经营数据入站真源（可写＝能伪造后续报告引用的"真实数据"）、
 # Agents/*-Skills 是机队行为定义。这些一律只读，要改走 relay 门禁。
+#
+# ⚠ 本项与下面的 local_sandbox_rw 是**两层不同的作用域**，别混：
+#   local_write_dirs = claude 的 Edit/Write 工具作用域 **且** ```send_file``` 代投
+#                      作用域（main.py 的 _consume_send_markers 直接读这一项）。
+#   local_sandbox_rw = 内核可写白名单（Bash 放开后由它管辖）。
+# 两者耦合决定了 local_write_dirs **不能随意放宽**：放宽到 shared/data 会让
+# send_file 能取任意 sender 目录的件外发，破坏 L3 发件人隔离。要放宽内核可写范围
+# 请改 local_sandbox_rw，不要改这一项。
+# 实际可写范围 = 两者交集：Bash 禁用时（阶段一）等于 local_write_dirs；
+# Bash 放开后（阶段二）等于 local_sandbox_rw。
 local_write_dirs = []
 # local 通路**可删**目录（```delete_file``` 标记的作用域）。刻意比 local_write_dirs
 # 更窄：只给草稿区 shared/work。shared/report 是正式交付区、local 又不做 baseline
 # 快照，删了不可追溯，故不开放——要删交付件走 relay 门禁（那边有 baseline +
 # 冲突检测 + 审批）。留空＝local 完全无删除能力（agent 请求删件会被拒并留审计）。
 local_delete_dirs = []
+# ── local 内核沙箱 ─────────────────────────────────────────────────────
+# **机队默认应开启**。为什么必须有：relay-avatar.service 无任何沙箱指令且以 root
+# 运行（relay.service 则有 ProtectSystem=strict + InaccessiblePaths），local 侧一旦
+# 没有内核边界就只剩 claude 的**词法**权限规则，而它实测可被绕过：
+#   · Bash 命令黑名单 `Bash(rm:*)`：7 种删除手法放过 4 种（python3 -c os.remove /
+#     find -delete / 写脚本再 bash 执行 / 重定向截断）
+#   · 路径 deny 规则：cat/base64/awk/符号链接/../ 穿越能拦，但 perl -e、node -e、
+#     dd if= 全部绕过，且能**写入**"受保护"目录（PWNED.txt 落盘成功）
+# 黑名单要成立必须有「所有访问必经」的检查点。relay 侧是 _shared_path() 做 realpath
+# 比对（代码解析路径，故绕不过）；local 开了 Bash 就没有任何中介，只有内核 mount
+# namespace 能充当（syscall 必经）。同一份路径名单实测：应用层 6 拦 5 绕，内核层 7/7 全拦。
+#
+# 机制：exec_local 用 systemd-run --pipe --collect 起瞬态 unit。三个实测坑：
+#   · 必须瞬态 **service** 不能用 --scope（scope 施加沙箱属性报 Unknown assignment）
+#   · 路径列表要写在**同一条** -p 赋值内、空格分隔、每条带 `-` 前缀；拆成多条 -p
+#     只保留最后一条，隐藏会静默失效
+#   · HOME 必须显式传且指向 .cchome——/root/.claude.json 被遮成*空文件*（非 ENOENT）
+#     会让 claude 报 "JSON Parse error: Unexpected EOF" 拒绝启动
+#   · 超时看门狗必须 systemctl kill --kill-who=all；只 proc.kill() 杀的是 systemd-run
+#     客户端，unit 内进程变孤儿且会持有输出管道把调用方阻塞到超时
+# fail-closed：本项为 true 而 systemd-run/systemctl 缺失、或下面两个列表任一为空 →
+# ExecLocal.available() 返回 False，路由整体改投 relay 门禁，**绝不降级成无沙箱 local**。
+local_sandbox = true
+# 内核可写白名单（ProtectSystem=strict 下，未列出的一切**只读**）。
+# 下面是机队标准布局；.cchome 必须在内（claude 的 HOME 与 CLAUDE_CONFIG_DIR）。
+# **刻意不给**：avatar/（policy.toml 与 state.json——agent 不能改自己的策略）、
+# index/（台账与 store-task.env，只读即可连库）、tools/ venv*/（可执行代码与环境，
+# 可写＝持久化任意代码执行）、_sync/ tmp/ secrets/。
+local_sandbox_rw = [
+  "/tmp",
+  "/var/tmp",
+  "/mnt/vol-eltaah12/workspace/avatar/.cchome",
+  "/mnt/vol-eltaah12/workspace/shared/work",
+  "/mnt/vol-eltaah12/workspace/shared/report",
+  "/mnt/vol-eltaah12/workspace/shared/skills",
+  "/mnt/vol-eltaah12/workspace/shared/skills-proposed",
+  "/mnt/vol-eltaah12/workspace/shared/G-Skills",
+  "/mnt/vol-eltaah12/workspace/shared/Z-Skills",
+  "/mnt/vol-eltaah12/workspace/shared/Agents",
+  "/mnt/vol-eltaah12/workspace/shared/knowledge",
+  "/mnt/vol-eltaah12/workspace/shared/templates",
+  "/mnt/vol-eltaah12/workspace/shared/models",
+  "/mnt/vol-eltaah12/workspace/shared/mcp",
+  "/mnt/vol-eltaah12/workspace/shared/memory",
+  "/mnt/vol-eltaah12/workspace/shared/data",
+]
+# 内核层隐藏黑名单：遮成空文件/空目录，**任何命令形式都读不到**（不是词法拦截，是
+# 路径在该 mount namespace 内根本不可解析）。与 relay.service 的 InaccessiblePaths
+# 同一套，另加 shared/secrets（relay 侧靠 ProtectSystem 只读兜住，local 侧必须显式
+# 隐藏，因为 secrets 在 workspace 下、而 workspace 需要部分可写）。
+local_sandbox_hide = [
+  "/mnt/vol-eltaah12/workspace/relay.env",
+  "/mnt/vol-eltaah12/workspace/shared/secrets",
+  "/root/.ssh",
+  "/root/.git-credentials",
+  "/root/.config/gh",
+  "/root/.claude",
+  "/root/.claude.json",
+  "/root/.claude-proxy",
+]
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）

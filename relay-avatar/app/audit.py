@@ -16,7 +16,8 @@ class Audit:
         self.file = self.dir / "audit.log"
 
     def log(self, action: str, actor: str = "", detail: str = "",
-            backend: str = "", ingress: str = "", task_id: object = None):
+            backend: str = "", ingress: str = "", task_id: object = None,
+            sandbox: str = ""):
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -28,6 +29,10 @@ class Audit:
                 rec["ingress"] = ingress
             if task_id is not None:
                 rec["task_id"] = task_id
+            if sandbox:
+                # local 内核沙箱：unit=avatar-local-<pid>-<seq> 或 off。
+                # 留痕「本次执行是否真在沙箱内」，否则配置回退成裸奔也无从发现。
+                rec["sandbox"] = str(sandbox)[:64]
             with open(self.file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:

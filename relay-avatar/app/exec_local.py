@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
@@ -53,10 +54,35 @@ class ExecLocal:
         self.ttl = int(cfg.get("claude", "session_ttl_sec", 3600))
         self.timeout = int(cfg.get("claude", "reply_timeout_sec", 600))
         self.bin = shutil.which("claude") or ""
+        # 内核沙箱靠 systemd-run 起瞬态 unit（--scope 不支持沙箱属性）。
+        self.sbx_bin = shutil.which("systemd-run") or ""
+        self.ctl_bin = shutil.which("systemctl") or ""
+        self._unit_seq = itertools.count(1)
 
     def available(self) -> bool:
-        return (bool(self.cfg.get("execution", "local_enabled", False))
-                and bool(self.bin))
+        """local 后端可用性。**fail-closed**：配置要求沙箱而 systemd-run/systemctl
+        缺失、或沙箱规格不完整（rw/hide 为空）时返回 False，让路由改投 relay 门禁
+        ——绝不降级成「无沙箱 local」。
+
+        理由：relay-avatar.service 无任何沙箱指令且以 root 运行，local 侧一旦没有
+        内核边界，就只剩 claude 的词法权限规则，而它实测可被解释器绕过
+        （python3/perl/node/dd 均能读写"受保护"路径，PWNED.txt 曾落盘成功）。
+
+        门禁放在这里而不是 _run 里：available() 是路由决策点，此处返回 False 会让
+        任务从一开始就走 relay；若等到 _run 才失败，各场景入口对失败语义的映射不同
+        （run_l3 把 denied 映射成"涉及数据区以外"的拒答文案），会误导用户。
+        """
+        if not (bool(self.cfg.get("execution", "local_enabled", False))
+                and bool(self.bin)):
+            return False
+        if bool(self.cfg.get("security", "local_sandbox", False)):
+            if not (self.sbx_bin and self.ctl_bin):
+                return False
+            try:
+                return bool(self.policy.sandbox_spec().get("enabled"))
+            except Exception:
+                return False
+        return True
 
     # ── 会话记忆 ──
     def _sessions(self) -> dict:
@@ -108,9 +134,35 @@ class ExecLocal:
                 out.append(str(day))
         return out
 
-    def _claude_env(self) -> dict:
+    # 沙箱内转发的 env 键白名单。systemd-run 起的是瞬态 **service**，环境被清空，
+    # 必须 --setenv 显式传。刻意不全量转发 os.environ：那会把 avatar 进程环境整个
+    # 写进 unit 属性（systemctl show 可见），无谓扩大暴露面。
+    _SBX_ENV_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+                     "NO_PROXY", "no_proxy", "CLAUDE_CONFIG_DIR",
+                     "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                     "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                     "ANTHROPIC_CUSTOM_MODEL_OPTION",
+                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+
+    # 沙箱内用的占位 token。本机代理 127.0.0.1:8790 **不校验**入站 token（实测假
+    # token 得 HTTP 200），它只用自己 config 里的 UPSTREAM_API_KEY 打上游
+    # （proxy.mjs:389-390、:448），入站 token 从不参与。故真钥匙无需进任务环境，
+    # --setenv / unit 属性 / `echo $ANTHROPIC_AUTH_TOKEN` 的泄露面归零；上游真钥匙
+    # 在 /root/.claude-proxy/config.json，已被 local_sandbox_hide 内核层隐藏。
+    _SBX_TOKEN_PLACEHOLDER = "local-sandbox-no-upstream-credential"
+
+    def _claude_env(self, sandboxed: bool = False) -> dict:
         """认证 env 从 ~/.claude/settings.json 注入（进程内传递，不落盘不复制）；
-        CLAUDE_CONFIG_DIR 隔离记忆；NO_PROXY 保内网直连。"""
+        CLAUDE_CONFIG_DIR 隔离记忆；NO_PROXY 保内网直连。
+
+        sandboxed=True 时两处不同：
+        ① **HOME 指向 .cchome**——/root/.claude.json 被 InaccessiblePaths 遮成
+           *空文件*（不是 ENOENT），claude 读它会报 "JSON Parse error: Unexpected
+           EOF" 而拒绝启动。改 HOME 后 claude 读写 $HOME/.claude.json（在可写白名单
+           内、初始不存在由它自建），/root 下全部保持隐藏。relay 侧 executor.py:206
+           用 per-task HOME 解决的是同一个问题。
+        ② ANTHROPIC_AUTH_TOKEN 换占位符（见 _SBX_TOKEN_PLACEHOLDER）。
+        """
         env = os.environ.copy()
         try:
             s = json.load(open(os.path.expanduser("~/.claude/settings.json"),
@@ -125,7 +177,62 @@ class ExecLocal:
               ".aliyuncs.com,aliyuncs.com,.alidocs.com")
         env["NO_PROXY"] = np
         env["no_proxy"] = np
+        if sandboxed:
+            env["HOME"] = str(self.cchome)
+            env["ANTHROPIC_AUTH_TOKEN"] = self._SBX_TOKEN_PLACEHOLDER
         return env
+
+    def _sandbox_wrap(self, cmd: list, cwd: str, env: dict, sbx: dict) -> tuple:
+        """把 cmd 包进 systemd-run 瞬态 unit，返回 (argv, unit名)。
+
+        sbx 未启用时返回 (cmd, "")，由调用方决定 fail-closed 回落 relay。
+
+        两个实测坑：
+        · 必须用瞬态 **service**（--pipe 保 stdio 流式），不能用 --scope——
+          scope 共享调用方上下文，施加沙箱属性会报 "Unknown assignment:
+          ProtectSystem=strict"。
+        · ReadWritePaths / InaccessiblePaths 的多条路径必须写在**同一条 -p 赋值内**
+          以空格分隔、且每条带 `-` 前缀（缺失不报错）。拆成多条 -p 实测只保留最后
+          一条，隐藏会静默失效。
+        """
+        if not (sbx and sbx.get("enabled")):
+            return list(cmd), ""
+        unit = f"avatar-local-{os.getpid()}-{next(self._unit_seq)}"
+        rw = " ".join("-" + str(p) for p in (sbx.get("rw") or []))
+        hide = " ".join("-" + str(p) for p in (sbx.get("hide") or []))
+        argv = [self.sbx_bin, "--pipe", "--quiet", "--collect", f"--unit={unit}",
+                "-p", "ProtectSystem=strict",
+                "-p", f"ReadWritePaths={rw}",
+                "-p", f"InaccessiblePaths={hide}",
+                "-p", "NoNewPrivileges=true",
+                "-p", "CapabilityBoundingSet=",
+                "-p", "ProtectKernelTunables=true",
+                "-p", "ProtectControlGroups=true",
+                "-p", "RestrictSUIDSGID=true"]
+        if cwd:
+            argv += ["-p", f"WorkingDirectory={cwd}"]
+        for k in self._SBX_ENV_KEYS:
+            v = env.get(k)
+            if v is not None and str(v) != "":
+                argv += [f"--setenv={k}={v}"]
+        argv += ["--"] + list(cmd)
+        return argv, unit
+
+    def _kill_unit(self, unit: str):
+        """杀整个瞬态 unit（含其中所有进程）。
+
+        为什么不能只 proc.kill()：proc 是 systemd-run **客户端**，杀它之后 unit 仍
+        active、unit 内进程变孤儿（实测 MainPID 存活）。孤儿还会持有继承来的输出
+        管道，把调用方阻塞到超时。必须 systemctl kill --kill-who=all。
+        """
+        if not (unit and self.ctl_bin):
+            return
+        try:
+            subprocess.run([self.ctl_bin, "kill", "--kill-who=all",
+                            "--signal=SIGKILL", f"{unit}.service"],
+                           capture_output=True, timeout=20)
+        except Exception:
+            pass
 
     # ── 场景入口 ──
     def run_l3(self, uid: str, text: str, kb: str = "", on_step=None) -> dict:
@@ -149,7 +256,13 @@ class ExecLocal:
             + (("\n\n" + kb) if kb else "") +
             "\n\n<user_message>\n" + sanitize_injected(text) + "\n</user_message>")
         r = self._run(prompt, conv_key=f"l3file:{uid}", cwd=dirs[-1],
-                      flags=self._flags(cons, dirs), uid=uid, on_step=on_step)
+                      flags=self._flags(cons, dirs), uid=uid, on_step=on_step,
+                      sbx=cons.get("sbx"))
+        if r.get("sbx_unavailable"):
+            # L3 硬隔离铁律：越权只拒不升级。沙箱不可用时同样不升级 relay，
+            # 因为 relay 侧没有 L3 的 sender 数据区隔离语义。
+            return {"text": "⚠️ 本地隔离执行环境未就绪，暂时无法作答，请稍后再试。",
+                    "escalate": False}
         if r.get("denied"):
             return {"text": ("⚠️ 这个问题涉及你数据区以外的内容，我不能回答。"
                              "只能就你上传的文件提问～"), "escalate": False}
@@ -172,8 +285,8 @@ class ExecLocal:
             "\n\n<user_message>\n" + sanitize_injected(text) + "\n</user_message>")
         r = self._run(prompt, conv_key=f"self:{uid}",
                       cwd=str(self.st.run), flags=self._flags(cons, []),
-                      uid=uid, on_step=on_step)
-        if r.get("denied"):
+                      uid=uid, on_step=on_step, sbx=cons.get("sbx"))
+        if r.get("denied") or r.get("sbx_unavailable"):
             return {"text": "", "escalate": True}   # 升级不降级：转 relay 门禁
         return {"text": r.get("text") or "", "escalate": False}
 
@@ -256,21 +369,35 @@ class ExecLocal:
             "\n\n<user_message>\n" + sanitize_injected(text) + "\n</user_message>")
         r = self._run(prompt, conv_key=f"task:{uid}", cwd=sandbox,
                       flags=self._flags(cons, list(cons.get("add_dirs") or [])),
-                      uid=uid, on_step=on_step)
-        if r.get("denied"):
+                      uid=uid, on_step=on_step, sbx=cons.get("sbx"))
+        if r.get("denied") or r.get("sbx_unavailable"):
             return {"text": "", "escalate": True}   # 升级不降级：转 relay 门禁
         return {"text": r.get("text") or "", "escalate": False}
 
     # ── 流式执行（移植 fenshen Engine.run：stream-json + 看门狗 + on_step） ──
     def _run(self, prompt: str, conv_key: str, cwd: str, flags: list,
-             uid: str = "", on_step=None) -> dict:
+             uid: str = "", on_step=None, sbx: dict | None = None) -> dict:
         sid = self.get_session(conv_key)
         cmd = [self.bin, "-p", "--output-format", "stream-json",
                "--verbose"] + flags
         if sid:
             cmd += ["--resume", sid]
-        self.audit.log("local_exec", uid, f"conv={conv_key}",
-                       backend=self.name)
+        # 内核沙箱。available() 已在路由决策点做过 fail-closed 门禁，这里是防御性
+        # 复查：配置要求沙箱而本次约束没带上可用规格 → 不执行，交调用方升级 relay。
+        want = bool(self.cfg.get("security", "local_sandbox", False))
+        sbx_on = bool(sbx and sbx.get("enabled"))
+        if want and not sbx_on:
+            self.audit.log("local_sandbox_unavailable", uid,
+                           f"conv={conv_key}", backend=self.name)
+            return {"text": "", "denied": False, "steps": [],
+                    "sbx_unavailable": True}
+        env = self._claude_env(sandboxed=sbx_on)
+        if sbx_on:
+            argv, unit = self._sandbox_wrap(cmd, cwd, env, sbx)
+        else:
+            argv, unit = cmd, ""
+        self.audit.log("local_exec", uid, f"conv={conv_key}", backend=self.name,
+                       sandbox=(f"unit={unit}" if unit else "off"))
         steps: list = []
         reply, new_sid, denied = "", "", False
         proc, watchdog = None, None
@@ -281,12 +408,15 @@ class ExecLocal:
                     proc.kill()
             except Exception:
                 pass
+            # 沙箱下 proc 只是 systemd-run 客户端，unit 内进程必须显式杀（见
+            # _kill_unit）。顺序：先杀客户端停止读管道，再杀 unit 内全部进程。
+            self._kill_unit(unit)
 
         try:
             proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                cwd=cwd, env=self._claude_env())
+                cwd=cwd, env=env)
             watchdog = threading.Timer(self.timeout, _kill)
             watchdog.daemon = True
             watchdog.start()

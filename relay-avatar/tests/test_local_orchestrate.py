@@ -135,8 +135,9 @@ def test_run_task_uses_sandbox_cwd_and_task_flag(cfg, storage, audit, policy,
     seen = {}
 
     def fake_run(prompt, conv_key=None, cwd=None, flags=None, uid="",
-                 on_step=None):
-        seen.update(prompt=prompt, conv_key=conv_key, cwd=cwd, flags=flags)
+                 on_step=None, sbx=None):
+        seen.update(prompt=prompt, conv_key=conv_key, cwd=cwd, flags=flags,
+                    sbx=sbx)
         return {"text": "本机结论", "denied": False}
 
     monkeypatch.setattr(ex, "_run", fake_run)

@@ -163,6 +163,32 @@ class Policy:
         return self.st.data_dir(uid)
 
     # ── tier → 约束表（两后端共读） ──
+    def _sandbox_spec(self, sec: dict) -> dict:
+        """local 内核沙箱规格（systemd-run 瞬态 unit 的属性来源）。
+
+        为什么 local 必须有内核层：relay-avatar.service 无任何沙箱指令且以 root
+        运行，而 claude 的 Bash/路径权限规则是对命令字符串做**词法**匹配——实测
+        路径 deny 规则可被 perl/node/dd/python3 绕过，且能写入"受保护"目录。
+        黑名单要成立必须有「所有访问必经」的检查点，无中介环境下只有内核 mount
+        namespace 能充当（syscall 必经）。同一份路径名单：应用层 6 拦 5 绕，
+        内核层 7/7 全拦。
+
+        enabled=False 或 rw/hide 为空时，exec_local 必须 **fail-closed 回落
+        relay**，绝不回落无沙箱 local。
+        """
+        rw = [str(x).strip() for x in (sec.get("local_sandbox_rw") or [])
+              if str(x).strip()]
+        hide = [str(x).strip() for x in (sec.get("local_sandbox_hide") or [])
+                if str(x).strip()]
+        on = bool(sec.get("local_sandbox", False)) and bool(rw) and bool(hide)
+        return {"enabled": on, "rw": rw, "hide": hide}
+
+    def sandbox_spec(self) -> dict:
+        """local 内核沙箱规格（公开入口，供 exec_local.available() 做 fail-closed
+        门禁：配置要求沙箱而规格不完整/工具缺失时，local 整体不可用 → 路由改投
+        relay，绝不降级成无沙箱 local）。"""
+        return self._sandbox_spec(self.cfg.section("security"))
+
     def _local_orchestrate(self, c: dict, sec: dict, tier: str) -> dict:
         """local 后端「只读编排」约束集：可委派 subagent（Task 在白名单内），
         但禁执行禁联网，cwd 锁 sandbox、add_dirs 给共享区只读目录。
@@ -208,6 +234,7 @@ class Policy:
                 "disallowed_tools": dis,
                 "write_dirs": write_dirs,
                 "delete_dirs": delete_dirs,
+                "sbx": self._sandbox_spec(sec),
                 "add_dirs": [str(x) for x in (sec.get("l2_add_dirs") or [])]}
 
     def constraints(self, uid: str) -> dict:
@@ -243,6 +270,7 @@ class Policy:
                     "permission_prompts": c.get("l3_permission_prompts"),
                     "sandbox": "", "allowed_tools": [],
                     "disallowed_tools": c.get("l3_disallowed_tools"),
+                    "sbx": self._sandbox_spec(sec),
                     "add_dirs": ["<sender_data_dirs>"]}
         return {"tier": "guest", "backend": "none", "permission_mode": "",
                 "sandbox": "", "allowed_tools": [], "disallowed_tools": "",
