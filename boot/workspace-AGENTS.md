@@ -110,3 +110,11 @@ store sync scan|push|verify|backfill          # jingboWiki 同步
 - `/tmp`、`/var/tmp` 下的清理（含 `rm -rf`）直接放行；systemctl、防火墙、cron、用户管理等均不拦。
 - 会被拦的核心项：`mkfs`、写裸盘（`of=/dev/磁盘`、`> /dev/磁盘`）、`shutdown/reboot/poweroff/halt`、`kill -9 1`、`chmod -R 777 /` 或 `~`、**非 /tmp 路径的递归 rm**。
 - 若任务确需执行会被拦的命令，如实说明并让用户在监控页审批，不要变着写法绕。
+
+## 软件安装（硬性：沙箱内系统包安装必然失败）
+
+- 任务沙箱由 systemd `ProtectSystem=strict` 托管，**`/usr`、`/etc`、`/boot` 对你只读**。`apt-get`／`apt`／`dnf`／`yum`／`rpm` 等系统包安装**一定失败**（典型报错：写 `/var/cache/apt/archives/partial/` 时 `Permission denied`）。**不要尝试、不要重试、不要 `sudo`**——宿主可写不代表沙箱可写。
+- **明确禁止安装 LibreOffice／`soffice`**：PPT→PDF 的视觉质检这条路走不通。需要质检时用**程序化质检**（如 python-pptx 逐形状边界／越界／文本溢出估算 ＋ 内容断言），并在交付件里如实写明"视觉质检不可用及其原因"。
+- Python 依赖只用 **`shared/venv`** 里已装好的（`python-pptx`、`pandas` 等）。缺库先查 `shared/venv/lib/python3.12/site-packages/` 确认，不要凭印象判定"未安装"。
+- **任何安装类命令（含 `pip install`）超过 1 分钟仍未完成，立即取消**，改走降级方案并如实记录，不要干等。
+- 为什么单列这一节：任务有超时上限（默认 1800 秒），安装类弯路会直接吃掉时限，导致**任务超时失败、已建成的交付件作废**。2026-09-24 任务 #203 即在 PPT 已构建并通过质检后，因反复尝试安装 LibreOffice 而在最后一步超时。
