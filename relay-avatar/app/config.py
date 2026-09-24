@@ -56,6 +56,11 @@ DEFAULTS: dict[str, Any] = {
                  # local 通路可写目录（作用域写）。默认空＝维持纯只读，
                  # 需逐机显式开启；非空时 exec_local 会发 Edit(//abs/**) 规则。
                  "local_write_dirs": [],
+                 # local 通路**可删**目录（代删标记 delete_file 的作用域）。
+                 # 默认空＝不开放代删。应配得比 local_write_dirs **更窄**：
+                 # 只给草稿区（shared/work），正式交付区（shared/report）无 baseline
+                 # 快照、删了不可追溯，一律不放进这里。
+                 "local_delete_dirs": [],
                  "profile_enforce": "strict", "sanitize": "on",
                  "rate_limit_daily_tasks": 100, "reprompt_cooldown_sec": 60,
                  "bot_blocklist": [], "media_max_size_mb": 20,

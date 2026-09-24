@@ -907,3 +907,136 @@ def test_drain_local_sends_file_end_to_end(av, cfg, shared):
     txt = [c for _, c in av.dws.sent if "结论正文" in c or "已发文件" in c]
     assert txt and "send_file" not in "".join(txt)
     assert s["state"] == "IDLE"
+
+
+# ── H. delete_file 标记代删（作用域比可写更窄：只给草稿区）──
+# 缺口：local 无 Bash、Write/Edit 也只能建/改不能删，所以"应用户请求清理草稿"
+# agent 自己根本做不到（2026-09-24 王洪彬「删除这个helloworld」被挡，
+# 表面是铁律禁止，实质是能力缺失）。
+
+def del_ready(cfg, shared, dirs=("work",)):
+    """开 local + 作用域写 + 指定可删目录，返回 (write_dirs, delete_dirs)。"""
+    _, wd = write_ready(cfg, shared)
+    dd = []
+    for d in dirs:
+        p = shared / d
+        p.mkdir(parents=True, exist_ok=True)
+        dd.append(str(p))
+    setcfg(cfg, "security", local_delete_dirs=dd)
+    return wd, dd
+
+
+def _del_block(path):
+    return "已处理\n\n```delete_file\n" + _json.dumps({"path": path}) + "\n```"
+
+
+def test_delete_marker_removes_file_in_scope(av, cfg, shared):
+    wd, dd = del_ready(cfg, shared)
+    p = _mk(dd[0] + "/draft.html", "草稿")
+    s = sess_of(av)
+    clean, notes = av._consume_delete_markers(_del_block(p), s, 1, "200")
+    assert not _os.path.exists(p)                    # 真删了
+    assert any("已删除" in n for n in notes)
+    assert "delete_file" not in clean and "已处理" in clean
+
+
+def test_delete_marker_refuses_report_dir(av, cfg, shared):
+    """核心边界：正式交付区不可删（无 baseline 快照，删了不可追溯）。"""
+    wd, dd = del_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/正式报告.html", "交付件")   # report/ 可写但不可删
+    s = sess_of(av)
+    _, notes = av._consume_delete_markers(_del_block(p), s, 1, "200")
+    assert _os.path.isfile(p)                        # 没被删
+    assert any("拒绝删除" in n for n in notes)
+
+
+def test_delete_marker_refuses_dotdot_and_symlink(av, cfg, shared):
+    wd, dd = del_ready(cfg, shared)
+    secret = _mk(str(shared / "knowledge" / "k.md"), "内部知识")
+    s = sess_of(av)
+    _, n1 = av._consume_delete_markers(
+        _del_block(dd[0] + "/../knowledge/k.md"), s, 1, "200")
+    assert _os.path.isfile(secret) and any("拒绝删除" in n for n in n1)
+    link = dd[0] + "/innocent.html"
+    try:
+        _os.symlink(secret, link)
+    except OSError:
+        pytest.skip("无 symlink 权限")
+    _, n2 = av._consume_delete_markers(_del_block(link), s, 2, "200")
+    assert _os.path.isfile(secret) and any("拒绝删除" in n for n in n2)
+
+
+def test_delete_marker_refuses_directory(av, cfg, shared):
+    """只删单个文件、不递归——避免一次误删整棵子树。"""
+    wd, dd = del_ready(cfg, shared)
+    sub = dd[0] + "/子目录"
+    _mk(sub + "/inner.html", "x")
+    s = sess_of(av)
+    _, notes = av._consume_delete_markers(_del_block(sub), s, 1, "200")
+    assert _os.path.isdir(sub) and _os.path.isfile(sub + "/inner.html")
+    assert any("是目录" in n for n in notes)
+
+
+def test_delete_marker_missing_file_and_cap(av, cfg, shared):
+    from app.main import DELETE_MAX_FILES
+    wd, dd = del_ready(cfg, shared)
+    s = sess_of(av)
+    _, n1 = av._consume_delete_markers(
+        _del_block(dd[0] + "/不存在.html"), s, 1, "200")
+    assert any("不存在" in n for n in n1)
+    blocks = []
+    for i in range(DELETE_MAX_FILES + 3):
+        blocks.append("```delete_file\n" + _json.dumps(
+            {"path": _mk(f"{dd[0]}/d{i}.html")}) + "\n```")
+    _, n2 = av._consume_delete_markers("正文\n" + "\n".join(blocks), s, 2, "200")
+    left = [i for i in range(DELETE_MAX_FILES + 3)
+            if _os.path.exists(f"{dd[0]}/d{i}.html")]
+    assert len(left) == 3                            # 只删了上限内的
+    assert any("上限" in n for n in n2)
+
+
+def test_delete_marker_dedupe_and_disabled(av, cfg, shared):
+    wd, dd = del_ready(cfg, shared)
+    p = _mk(dd[0] + "/dup.html", "x")
+    s = sess_of(av)
+    av._consume_delete_markers(_del_block(p), s, 9, "200")
+    p2 = _mk(dd[0] + "/dup2.html", "x")
+    _, notes = av._consume_delete_markers(_del_block(p2), s, 9, "200")
+    assert _os.path.isfile(p2) and notes == []       # 同 tid 不重复处理
+    # 未配 local_delete_dirs → 不开放代删
+    setcfg(cfg, "security", local_delete_dirs=[])
+    s2 = sess_of(av, sid="sid300", n="9")
+    p3 = _mk(dd[0] + "/dup3.html", "x")
+    _, n3 = av._consume_delete_markers(_del_block(p3), s2, 10, "300")
+    assert _os.path.isfile(p3) and any("未开放代删" in n for n in n3)
+
+
+def test_delete_marker_malformed_json_kept(av, cfg, shared):
+    wd, dd = del_ready(cfg, shared)
+    s = sess_of(av)
+    clean, notes = av._consume_delete_markers(
+        "正文\n\n```delete_file\n{坏 JSON}\n```", s, 1, "200")
+    assert "{坏 JSON}" in clean and notes == []
+
+
+def test_drain_local_deletes_end_to_end(av, cfg, shared):
+    wd, dd = del_ready(cfg, shared)
+    p = _mk(dd[0] + "/要删的.html", "x")
+    av.exec_local = FakeExecLocal(
+        result={"text": _del_block(p), "escalate": False})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    assert not _os.path.exists(p)
+    assert any("已删除" in c for _, c in av.dws.sent)
+    assert s["state"] == "IDLE"
+
+
+def test_delete_dirs_narrower_than_write_dirs(cfg, storage, audit, policy,
+                                              shared):
+    """配置约束：可删作用域必须是可写作用域的子集（否则语义混乱）。"""
+    wd, dd = del_ready(cfg, shared, dirs=("work",))
+    cons = policy.constraints("200")
+    assert set(cons["delete_dirs"]) <= set(cons["write_dirs"])
+    assert cons["delete_dirs"] == dd

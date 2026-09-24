@@ -53,6 +53,12 @@ PLAN_BLOCK_RE = re.compile(r"```plan[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 # 这样既补上投递能力，又不必放开 Bash（avatar 服务无沙箱，放开等于无限制 root）。
 SEND_BLOCK_RE = re.compile(r"```send_file[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 SEND_MAX_FILES = 5            # 单次结果最多代投几件，防刷
+# 代删标记。local 无 Bash、Write/Edit 也删不了文件，故"应用户请求清理草稿"同样
+# 只能由 avatar 代做。**可删根目录单独配（security.local_delete_dirs），比可写更窄**：
+# 只给 shared/work/（草稿区，按定义就是临时的），shared/report/ 是正式交付区、
+# 无 baseline 快照、删了不可追溯，一律严禁。
+DELETE_BLOCK_RE = re.compile(r"```delete_file[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
+DELETE_MAX_FILES = 10
 
 
 def log(*a):
@@ -838,6 +844,8 @@ class Avatar:
             # 与回报之前做：去重键要取影子 task_id，且回报/回话都应是净化后的正文。
             dedupe = s.get("task_id") or f"local-{s.get('local_started')}"
             out, notes = self._consume_send_markers(out, s, dedupe, uid)
+            out, dnotes = self._consume_delete_markers(out, s, dedupe, uid)
+            notes = notes + dnotes
             if notes:
                 out = (out + ("\n\n" if out else "") + "\n".join(notes)).strip()
             # 成功收尾即清恢复元数据：local_reap_count 若只增不减，累计 2 次后
@@ -1106,6 +1114,42 @@ class Avatar:
                 notes.append(note)
         return clean, notes
 
+    @staticmethod
+    def _grab_marker_specs(result: str, rx) -> tuple:
+        """抽出围栏标记里的 JSON 规格，返回 (净化正文, specs)。
+
+        解析失败的块**原样保留在正文里**，不吞——让用户看见模型到底写了什么，
+        而不是静默丢掉一段话（沿用 _consume_plan_markers 的处置）。
+        """
+        specs: list = []
+
+        def _grab(m):
+            try:
+                obj = json.loads(m.group(1))
+            except Exception:
+                return m.group(0)
+            if isinstance(obj, dict):
+                specs.append(obj)
+                return ""
+            return m.group(0)
+
+        return rx.sub(_grab, result).strip(), specs
+
+    @staticmethod
+    def _scoped_path(raw: str, roots: list) -> tuple:
+        """把标记里的路径归一化并校验是否落在 roots 内，返回 (realpath, 越界?)。
+
+        必须先 abspath 再 realpath：前者收掉 `../` 穿越，后者解析符号链接——
+        否则在可写目录里放一个指向 /mnt/.../relay.env 的软链就能把任意文件带出去。
+        """
+        p = os.path.realpath(os.path.abspath(str(raw or "").strip()))
+        ok = any(p == r or p.startswith(r + os.sep) for r in roots)
+        return p, (not ok)
+
+    def _roots(self, key: str) -> list:
+        return [os.path.realpath(str(x)) for x in
+                (self.cfg.section("security").get(key) or [])]
+
     def _consume_send_markers(self, result: str, s: dict, tid, uid: str):
         """解析 ```send_file``` 标记并由 avatar 代投文件，返回 (净化正文, 附注)。
 
@@ -1125,24 +1169,11 @@ class Avatar:
         ④ 单次结果最多 SEND_MAX_FILES 件，防刷；
         ⑤ 按 tid 去重，review→done 二次回流不重复发。
         """
-        specs: list = []
-
-        def _grab(m):
-            try:
-                obj = json.loads(m.group(1))
-            except Exception:
-                return m.group(0)          # 解析失败：原样保留，不吞正文
-            if isinstance(obj, dict):
-                specs.append(obj)
-                return ""
-            return m.group(0)
-
-        clean = SEND_BLOCK_RE.sub(_grab, result).strip()
+        clean, specs = self._grab_marker_specs(result, SEND_BLOCK_RE)
         if not specs or s.get("send_applied") == tid:
             return clean, []
         s["send_applied"] = tid
-        roots = [os.path.realpath(str(x)) for x in
-                 (self.cfg.section("security").get("local_write_dirs") or [])]
+        roots = self._roots("local_write_dirs")
         maxb = int(self.cfg.get("security", "media_max_size_mb", 20)) * 1024 * 1024
         notes: list = []
         sent = 0
@@ -1154,8 +1185,8 @@ class Avatar:
                 notes.append(f"⚠️ 超过单次代投上限 {SEND_MAX_FILES} 件，"
                              f"其余未发（{os.path.basename(raw)}）")
                 continue
-            p = os.path.realpath(os.path.abspath(raw))
-            if not any(p == r or p.startswith(r + os.sep) for r in roots):
+            p, out = self._scoped_path(raw, roots)
+            if out:
                 self.audit.log("send_refused", uid, f"越界路径 {p[:120]}",
                                backend="local", task_id=tid)
                 notes.append(f"⚠️ 拒绝代投：`{os.path.basename(raw)}` 不在可写作用域内")
@@ -1179,6 +1210,71 @@ class Avatar:
             notes.append(f"📎 已发文件：`{os.path.basename(p)}`" if ok
                          else f"⚠️ 文件发送失败：`{os.path.basename(p)}` "
                               f"{str(r.get('_exc') or r.get('errorMsg') or '')[:80]}")
+        return clean, notes
+
+    def _consume_delete_markers(self, result: str, s: dict, tid, uid: str):
+        """解析 ```delete_file``` 标记并由 avatar 代删，返回 (净化正文, 附注)。
+
+        为什么需要它：local 无 Bash，Write/Edit 也只能建/改不能删，所以"应用户请求
+        清理草稿"这件事 agent 自己**根本做不到**（2026-09-24 王洪彬「删除这个
+        helloworld」被铁律挡下，其实是能力缺失不只是策略禁止）。
+
+        与代投同源但**作用域更窄**：可删根目录取 security.local_delete_dirs，
+        只应配 shared/work/（草稿区）。shared/report/ 是正式交付区、local 又不做
+        baseline 快照，删了不可追溯，故不在可删范围内——要删走 relay 门禁。
+
+        护栏与 _consume_send_markers 同源：路径 realpath 必须在可删根内（堵 `../`
+        与符号链接逃逸）、只删普通文件（**不递归删目录**，避免一次误删整棵子树）、
+        单次上限、按 tid 去重、逐条审计（delete_file / delete_refused / delete_failed）。
+        """
+        clean, specs = self._grab_marker_specs(result, DELETE_BLOCK_RE)
+        if not specs or s.get("delete_applied") == tid:
+            return clean, []
+        s["delete_applied"] = tid
+        roots = self._roots("local_delete_dirs")
+        notes: list = []
+        if not roots:
+            for spec in specs:
+                notes.append("⚠️ 本机未开放代删（security.local_delete_dirs 为空）")
+                break
+            return clean, notes
+        done = 0
+        for spec in specs:
+            raw = str(spec.get("path") or "").strip()
+            if not raw:
+                continue
+            if done >= DELETE_MAX_FILES:
+                notes.append(f"⚠️ 超过单次代删上限 {DELETE_MAX_FILES} 件，"
+                             f"其余未删（{os.path.basename(raw)}）")
+                continue
+            p, out = self._scoped_path(raw, roots)
+            if out:
+                self.audit.log("delete_refused", uid, f"越界路径 {p[:120]}",
+                               backend="local", task_id=tid)
+                notes.append(f"⚠️ 拒绝删除：`{os.path.basename(raw)}` 不在可删作用域内"
+                             f"（仅草稿区可删，正式交付区请走 relay 门禁）")
+                continue
+            if os.path.isdir(p):
+                self.audit.log("delete_refused", uid, f"目录不删 {p[:120]}",
+                               backend="local", task_id=tid)
+                notes.append(f"⚠️ 拒绝删除：`{os.path.basename(raw)}` 是目录"
+                             f"（只删单个文件，不递归）")
+                continue
+            if not os.path.isfile(p):
+                notes.append(f"⚠️ 无需删除：`{os.path.basename(raw)}` 不存在")
+                continue
+            try:
+                sz = os.path.getsize(p)
+                os.remove(p)
+                self.audit.log("delete_file", uid, f"{p[:120]} ({sz}B)",
+                               backend="local", task_id=tid)
+                done += 1
+                notes.append(f"🗑️ 已删除：`{os.path.basename(p)}`")
+            except Exception as e:
+                self.audit.log("delete_failed", uid,
+                               f"{p[:120]} {e!r}"[:160], backend="local",
+                               task_id=tid)
+                notes.append(f"⚠️ 删除失败：`{os.path.basename(p)}` {str(e)[:80]}")
         return clean, notes
 
     def _exec_plan_op(self, spec: dict, uid: str) -> str | None:

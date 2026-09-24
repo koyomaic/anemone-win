@@ -189,6 +189,10 @@ class Policy:
         sandbox = str(sec.get("l2_sandbox_dir", "") or "").strip()
         write_dirs = [str(x).strip() for x in (sec.get("local_write_dirs") or [])
                       if str(x).strip()]
+        # 可删作用域**独立配置且应更窄**：只给草稿区。正式交付区无 baseline 快照、
+        # 删了不可追溯，不放进这里（要删走 relay 门禁）。
+        delete_dirs = [str(x).strip() for x in (sec.get("local_delete_dirs") or [])
+                       if str(x).strip()]
         dis = str(c.get("local_orchestrate_disallowed",
                         "Bash Write Edit MultiEdit WebFetch WebSearch"))
         if write_dirs:
@@ -203,6 +207,7 @@ class Policy:
                 "allowed_tools": list(c.get("local_orchestrate_tools", [])),
                 "disallowed_tools": dis,
                 "write_dirs": write_dirs,
+                "delete_dirs": delete_dirs,
                 "add_dirs": [str(x) for x in (sec.get("l2_add_dirs") or [])]}
 
     def constraints(self, uid: str) -> dict:
