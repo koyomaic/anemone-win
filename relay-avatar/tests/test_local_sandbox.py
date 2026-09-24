@@ -180,6 +180,37 @@ def test_sandbox_wrap_unit_names_unique(cfg, storage, audit, policy, shared):
     assert len(us) == 20                       # 重名会撞 unit，kill 会误杀
 
 
+# ── ③b 网络收敛 ──
+
+def test_sandbox_spec_carries_net_allow(cfg, storage, audit, policy, shared):
+    sbx_ready(cfg, shared, local_sandbox_net_allow=["127.0.0.1", "10.189.21.235"])
+    spec = policy.sandbox_spec()
+    assert spec["net_allow"] == ["127.0.0.1", "10.189.21.235"]
+    assert spec["enabled"] is True             # net 非必需项，缺了不影响 enabled
+
+
+def test_sandbox_wrap_applies_ip_allowlist(cfg, storage, audit, policy, shared):
+    """沙箱只管「能读到什么」，不管「能不能发出去」——Bash 放开后二者叠加才成外泄
+    通道（实测 python3 urllib 的外发尝试完全不被权限层拦截）。"""
+    ex = make_ex(cfg, storage, audit, policy)
+    spec = dict(SPEC, net_allow=["127.0.0.1", "10.189.21.235"])
+    argv, _ = ex._sandbox_wrap(["c"], "/w", {}, spec)
+    assert "IPAddressDeny=any" in argv
+    allow = [a for a in argv if a.startswith("IPAddressAllow=")]
+    assert len(allow) == 1
+    assert allow[0].split("=", 1)[1].split() == ["127.0.0.1", "10.189.21.235"]
+
+
+def test_sandbox_wrap_no_ip_rules_when_allowlist_empty(cfg, storage, audit,
+                                                       policy, shared):
+    """白名单为空则不施加 IP 规则（不加 IPAddressDeny=any，否则会把 claude 代理
+    与 PG 一起封死，任务直接不可用）。"""
+    ex = make_ex(cfg, storage, audit, policy)
+    for spec in (SPEC, dict(SPEC, net_allow=[]), dict(SPEC, net_allow=["  "])):
+        argv, _ = ex._sandbox_wrap(["c"], "/w", {}, spec)
+        assert not any(a.startswith("IPAddress") for a in argv)
+
+
 # ── ④ _claude_env ──
 
 def test_claude_env_sandboxed_home_and_placeholder(cfg, storage, audit,
@@ -334,3 +365,44 @@ def test_guest_gets_no_sbx(cfg, storage, audit, policy, shared):
     sbx_ready(cfg, shared)
     cons = policy.constraints("555")
     assert cons["backend"] == "none" and "sbx" not in cons
+
+
+# ── ⑨ 阶段二：Bash 只给 L2/super，L3 不放开 ──
+
+def test_bash_opened_for_l2_but_never_for_l3(cfg, storage, audit, policy,
+                                             shared):
+    """L3 是文件投递用户的硬隔离层（任何能给我发文件的人都落这档），信任级别最低，
+    且铁律「越权只拒不升级」——relay 侧没有对应的 sender 隔离语义可兜。故 L3 不随
+    阶段二放开 Bash：它不走 _local_orchestrate，disallowed_tools 原样透传，也不受
+    write_dirs 的 Write/Edit 摘除逻辑影响。"""
+    sbx_ready(cfg, shared)
+    setcfg(cfg, "security", local_write_dirs=[str(shared / "work")])
+    setcfg(cfg, "claude",
+           l3_disallowed_tools="Bash Write Edit MultiEdit WebFetch WebSearch",
+           local_orchestrate_tools=["Read", "Glob", "Grep", "LS", "Task", "Bash"],
+           local_orchestrate_disallowed="WebFetch WebSearch")
+
+    l3 = policy.constraints("300")
+    assert l3["tier"] == "L3" and l3["backend"] == "local"
+    assert "Bash" in str(l3["disallowed_tools"])          # L3 仍禁执行
+    assert "Bash" not in (l3["allowed_tools"] or [])
+    assert l3["sbx"]["enabled"] is True                   # 但仍在内核沙箱内
+
+    l2 = policy.constraints("200")                        # 对照：L2 已放开
+    assert l2["tier"] == "L2" and l2["backend"] == "local"
+    assert "Bash" in (l2["allowed_tools"] or [])
+    assert "Bash" not in str(l2["disallowed_tools"])
+    assert l2["sbx"]["enabled"] is True
+
+
+def test_l2_bash_open_requires_sandbox_enabled(cfg, storage, audit, policy,
+                                               shared):
+    """放开 Bash 的前提是内核沙箱生效。沙箱规格不完整时 available() 必须为 False，
+    使 Bash 不可能在无沙箱状态下被使用（fail-closed 的实质意义）。"""
+    sbx_ready(cfg, shared, local_sandbox_hide=[])         # 隐藏名单空 → 规格不完整
+    setcfg(cfg, "claude",
+           local_orchestrate_tools=["Read", "Glob", "Grep", "LS", "Task", "Bash"],
+           local_orchestrate_disallowed="WebFetch WebSearch")
+    ex = make_ex(cfg, storage, audit, policy)
+    assert ex.available() is False
+    assert ex.run_task("200", "跑个 python 脚本")["escalate"] is True

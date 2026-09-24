@@ -37,36 +37,47 @@ def sanitize_field(s: str, limit: int = 40) -> str:
     return s.strip()[:limit]
 
 
-# local 通路禁 Bash，故凡需执行代码/装包/外发/动系统的任务都进不去，只能等大脑
-# 自己摸索完再升级 relay —— 2026-09-24 任务 #204 因此白烧 10 分 02 秒
-# （13:02:18 进 local → 13:12:20 才 escalate）。这里在路由前做一次前置判定，
-# 命中即直接走 relay。
+# 路由前置判定：命中即直接走 relay 门禁，不进 local。
 #
-# 分工线：**文本件（html/md/csv/json/txt）local 能出**（作用域 Edit 直接落盘）；
-# **二进制件（pptx/docx/xlsx/pdf）必须跑 python → 需要 Bash → 走 relay**。
+# **2026-09-25 语义反转（阶段二）**：local 已在内核沙箱内放开 Bash，故「需要跑
+# 代码」不再是升级理由——pptx/docx/xlsx 等二进制件 local 自己就能出（实测
+# shared/venv/bin/python 带 python-pptx + python-docx，沙箱内只读但可执行）。
+# 旧口径把这类任务全推给 relay，是 local 禁 Bash 时代的产物：#204 因此白烧
+# 10 分 02 秒（13:02:18 进 local → 13:12:20 才 escalate）。
+#
+# 现在只判「**relay 独有能力**」：门禁审批、dws 外发凭据、root DSN 任意 SQL、
+# 沙箱可写范围外的系统操作、联网检索。
 # 宁可误判成 relay（代价：慢一点、过门禁），不可误判成 local（代价：白烧数分钟）。
-_NEEDS_BASH = re.compile(
-    r"(?:生成|产出|出具|出件|制作|做成|写成|导出|落盘|新建|编写|转成|转为)"
-    r"[^。；;\n]{0,20}?"
-    r"(?:pptx?|docx?|xlsx?|xls|csv|pdf|word|excel|powerpoint|幻灯|演示文稿)"
-    r"|(?:pptx?|docx?|xlsx?|pdf)\s*(?:形式|格式|文件|单文件)"
-    r"|(?:发|发送|推送|群发|外发)[^。；;\n]{0,14}"
+_NEEDS_RELAY = re.compile(
+    # ① 外发：local 无 dws 凭据（shared/secrets 与整个 /root 均被内核隐藏），
+    #    发不出去。投递能力只在持有 dws 的 avatar 层（```send_file``` 标记）。
+    r"(?:发|发送|推送|群发|外发|转发)[^。；;\n]{0,14}"
     r"(?:钉钉|邮件|邮箱|群里|短信|webhook|机器人)"
-    r"|(?:安装|卸载|部署|上线|重启|停机|扩容|迁移)"
-    r"|(?:跑|执行|运行|调用)[^。；;\n]{0,30}"
-    r"(?:脚本|python|shell|sql|\.py\b|\.sh\b)"
-    r"|(?:写入|更新|删除)[^。；;\n]{0,10}(?:数据库|台账|表|记录)"
-    r"|(?:下单|付款|转账|开票|审批通过|盖章)",
+    # ② 系统运维：目标在沙箱可写范围外（/opt /etc /usr 与 avatar/ 均只读），
+    #    且属需门禁留痕的动作
+    r"|(?:安装|卸载|部署|上线|下线|重启|停机|扩容|缩容|迁移|systemctl|service\s+\S+\s+)"
+    # ③ 任意 SQL / 直接改库：store_task 只有 store_* 表的 SELECT/INSERT/UPDATE 与
+    #    tasks(id,status) 列级授权，其余需 relay 侧的 root DSN
+    r"|(?:跑|执行|运行|调用)[^。；;\n]{0,20}(?:sql|数据库|建表|改表|删表|drop|truncate)"
+    r"|(?:写入|更新|删除|清空|修改)[^。；;\n]{0,10}(?:数据库|数据表|表结构|字段)"
+    # ④ 业务动作：需门禁审批留痕
+    r"|(?:下单|付款|转账|开票|审批通过|盖章|签合同)"
+    # ⑤ 联网检索：local 仍禁 WebFetch/WebSearch，且沙箱网络白名单只放行 claude
+    #    代理与 PG，公网实测不可达（IPAddressDeny=any）
+    r"|(?:联网|上网|外网|搜一下|搜索一下|抓(?:取)?[^。；;\n]{0,8}网页|爬取|爬虫"
+    r"|(?:打开|访问|请求|拉取|抓取)\s*https?://"
+    r"|WebSearch|WebFetch)",
     re.I)
 
 
-def needs_bash_backend(text: str) -> bool:
-    """任务是否需要 Bash（→ 必须走 relay 门禁，不进 local 只读通路）。
+def needs_relay_backend(text: str) -> bool:
+    """任务是否需要 relay 独有能力（→ 走门禁，不进 local 沙箱通路）。
 
-    只判「需要执行代码/装包/外发/动系统」这一类；纯查询、研判、统计、编排、
-    以及出 HTML/MD/CSV 文本件都返回 False（local 能胜任）。
+    只判「relay 才有」的东西：门禁审批、dws 外发凭据、root DSN 任意 SQL、沙箱
+    可写范围外的系统操作、联网检索。纯查询、研判、统计、编排，以及出
+    HTML/MD/CSV/PPTX/DOCX/XLSX 等件都返回 False（local 沙箱内能胜任）。
     """
-    return bool(_NEEDS_BASH.search(str(text or "")))
+    return bool(_NEEDS_RELAY.search(str(text or "")))
 
 
 class Policy:
@@ -180,8 +191,15 @@ class Policy:
               if str(x).strip()]
         hide = [str(x).strip() for x in (sec.get("local_sandbox_hide") or [])
                 if str(x).strip()]
+        # 网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=列表。
+        # 为什么必须收：沙箱只管「能读到什么」，不管「能不能发出去」。Bash 放开后
+        # 二者叠加才成外泄通道——实测 python3 urllib 的外发尝试**完全不被权限层
+        # 拦截**（只因目标端口无监听才失败）。必须同时放行 claude 代理与 PG，
+        # 否则 claude 起不来、store 连不上库。
+        net = [str(x).strip() for x in (sec.get("local_sandbox_net_allow") or [])
+               if str(x).strip()]
         on = bool(sec.get("local_sandbox", False)) and bool(rw) and bool(hide)
-        return {"enabled": on, "rw": rw, "hide": hide}
+        return {"enabled": on, "rw": rw, "hide": hide, "net_allow": net}
 
     def sandbox_spec(self) -> dict:
         """local 内核沙箱规格（公开入口，供 exec_local.available() 做 fail-closed
@@ -201,16 +219,20 @@ class Policy:
            super 要落地写操作请走 relay 门禁（升级不降级）。
 
         作用域写（security.local_write_dirs 非空时开启）：
-        仅放开指定目录的文本件写入（HTML/MD/CSV 等），**Bash 始终禁用**。
-        实测依据（2026-09-24，claude 本机验证）：
+        放开指定目录的 Edit/Write 写入。实测依据（2026-09-24，claude 本机验证）：
         · 文件写权限只认 `Edit(//绝对路径/**)` 作用域规则；裸 `Write`/`Edit`
           放进 --allowedTools **不生效**（claude 明示：只有 Edit(path) 规则被
           文件权限检查匹配，且 Edit 规则覆盖所有文件编辑工具）；
         · `--disallowedTools` **压过**作用域 allow，故开写时必须把
           Write/Edit/MultiEdit 从 disallowed 里摘掉（MultiEdit 已非有效工具名）；
-        · 配 `--permission-prompts none` 时越界写**自动拒绝**（fail-closed）；
-        · Bash 一旦在 disallowed 内即整体不可用（含子代理），故 python/脚本类
-          出件（pptx/docx/xlsx）仍须升级 relay —— 这也是 needs_bash_backend 的分工线。
+        · 配 `--permission-prompts none` 时越界写**自动拒绝**（fail-closed）。
+
+        阶段二（2026-09-25）起 Bash 在 local 沙箱内可用，于是本项与
+        security.local_sandbox_rw 构成**两层作用域**：Edit/Write 受本项管辖，
+        Bash 落盘受内核 ReadWritePaths 管辖。本项刻意保持窄（report/+work/），
+        因为它**同时是 ```send_file``` 代投的作用域**（main.py 直接读这一项），
+        放宽到 shared/data 会让代投能取任意 sender 目录的件外发、破坏 L3 隔离。
+        要放宽内核可写范围请改 local_sandbox_rw，不要改这一项。
         """
         sandbox = str(sec.get("l2_sandbox_dir", "") or "").strip()
         write_dirs = [str(x).strip() for x in (sec.get("local_write_dirs") or [])

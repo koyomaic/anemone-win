@@ -36,7 +36,7 @@ from app.ingress_dingtalk import (Dws, EventIngress, InboundHealth, SelfMark,
 from app.ingress_relay import RelayClient
 from app.knowledge import Knowledge, parse_learn_cmd
 from app.monitor import Monitor
-from app.policy import (Policy, needs_bash_backend, sanitize_field,
+from app.policy import (Policy, needs_relay_backend, sanitize_field,
                         sanitize_injected)
 from app import planning
 from app.session import SessionManager
@@ -724,11 +724,14 @@ class Avatar:
         cons = self.policy.constraints(uid)
         if cons.get("backend") != "local" or not self.exec_local.available():
             return False
-        # 前置判定：需要 Bash（出 pptx/docx/xlsx、装包、外发、动系统）的任务
-        # local 结构性做不成，直接放行走 relay 门禁，不要让它进 local 空转数分钟
-        # 再 escalate（#204 实测白烧 10 分 02 秒）。
-        if needs_bash_backend(desc):
-            log(f"local skipped for {uid}: needs bash backend")
+        # 前置判定：需要 **relay 独有能力**（门禁审批、dws 外发凭据、root DSN 任意
+        # SQL、沙箱可写范围外的系统操作、联网检索）的任务，local 结构性做不成，
+        # 直接放行走 relay 门禁，不要让它进 local 空转数分钟再 escalate
+        # （#204 实测白烧 10 分 02 秒）。
+        # 注：阶段二起 local 沙箱内已有 Bash，「出 pptx/docx/xlsx、跑 python」**不再**
+        # 是升级理由（shared/venv 带 python-pptx/python-docx，沙箱内可执行）。
+        if needs_relay_backend(desc):
+            log(f"local skipped for {uid}: needs relay backend")
             return False
         if s.get("state") == "LOCAL":
             return False                       # 已有本机任务在跑，不并发

@@ -211,6 +211,15 @@ class ExecLocal:
                 "-p", "RestrictSUIDSGID=true"]
         if cwd:
             argv += ["-p", f"WorkingDirectory={cwd}"]
+        # 网络收敛：沙箱只管「能读到什么」，不管「能不能发出去」——Bash 放开后二者
+        # 叠加才成外泄通道（实测 python3 urllib 的外发尝试完全不被权限层拦截）。
+        # IPAddressDeny=any + 白名单经 cgroup eBPF 生效，**含 loopback**（实测
+        # 127.0.0.1:8790 代理与 127.0.0.1:8787 relay 仍可达，公网 1.1.1.1:443 被阻断）。
+        # 白名单必须含 claude 代理与 PG，否则 claude 起不来、store 连不上库。
+        net = [str(x).strip() for x in (sbx.get("net_allow") or []) if str(x).strip()]
+        if net:
+            argv += ["-p", "IPAddressDeny=any",
+                     "-p", "IPAddressAllow=" + " ".join(net)]
         for k in self._SBX_ENV_KEYS:
             v = env.get(k)
             if v is not None and str(v) != "":

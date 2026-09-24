@@ -545,14 +545,17 @@ def test_reap_count_cleared_on_success(av, cfg, shared):
     assert s["local_desc"] == "" and s["local_deadline"] == 0
 
 
-# ── E. 作用域写（local 出文本件）+ needs_bash_backend 路由前置判定 ──
+# ── E. 作用域写（local 出件）+ needs_relay_backend 路由前置判定 ──
 # 实测依据（2026-09-24，claude 本机验证）：
 #   · 文件写权限只认 Edit(//绝对路径/**)；裸 Write/Edit 放进 --allowedTools 不生效
 #   · --disallowedTools 压过作用域 allow（Write 会被整个禁用）
 #   · --permission-prompts none 时越界写自动拒绝（fail-closed）
 #   · Bash 在 disallowed 内即整体不可用（含子代理）
+# 2026-09-25 阶段二语义反转：local 沙箱内已放开 Bash，故「出 pptx/docx/xlsx、跑
+# python 脚本」**不再**是升级理由；只判 relay 独有能力（外发凭据/任意 SQL/系统运维/
+# 业务动作/联网检索）。
 
-from app.policy import needs_bash_backend            # noqa: E402
+from app.policy import needs_relay_backend            # noqa: E402
 
 
 def write_ready(cfg, shared, dirs=("report", "work")):
@@ -617,15 +620,28 @@ def test_flags_emit_scoped_edit_rules(cfg, storage, audit, policy, shared):
     assert "Bash" in dis and "Write" not in dis.split(",")
 
 
-def test_try_local_skipped_when_needs_bash(av, cfg, shared):
-    """需 Bash 的任务不得进 local（否则空转数分钟才 escalate）。"""
+def test_try_local_skipped_when_needs_relay(av, cfg, shared):
+    """需 relay 独有能力（此处：dws 外发凭据）的任务不得进 local，
+    否则空转数分钟才 escalate。"""
     local_ready(cfg, shared)
     av.exec_local = FakeExecLocal()
-    s = sess_of(av, text="生成净头寸三层决策方案，做成 PPT 报告")
+    s = sess_of(av, text="把净头寸三层决策方案发送到钉钉群里")
     av._flush(s, uid="200")
     assert av.exec_local.calls == []                 # 没进 local
     assert len(av.exec_relay.submitted) == 1         # 直接走 relay
     assert s["state"] == "RUNNING"
+
+
+def test_ppt_task_now_uses_local(av, cfg, shared):
+    """**阶段二语义反转**：出 PPT 不再是升级理由。local 沙箱内已有 Bash，且
+    shared/venv/bin/python 带 python-pptx（实测沙箱内只读但可执行）。旧口径把这类
+    任务全推给 relay，是 local 禁 Bash 时代的产物。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = sess_of(av, text="生成净头寸三层决策方案，做成 PPT 报告")
+    av._flush(s, uid="200")
+    assert s["state"] == "LOCAL"
+    assert av.exec_relay.submitted == []
 
 
 def test_html_task_still_uses_local(av, cfg, shared):
@@ -639,19 +655,33 @@ def test_html_task_still_uses_local(av, cfg, shared):
 
 
 @pytest.mark.parametrize("text,want", [
-    # 需 Bash → relay
-    ("请给我净头寸三层决策方案，生成PPT报告，我要开会讲解", True),
-    ("生成一份 docx 版周报", True),
-    ("导出 xlsx 台账", True),
-    ("把报告转成 pdf", True),
-    ("以 pptx 形式给我", True),
+    # ── 阶段二反转：出二进制件 / 跑脚本 → local 沙箱内能做了 ──
+    ("请给我净头寸三层决策方案，生成PPT报告，我要开会讲解", False),
+    ("生成一份 docx 版周报", False),
+    ("导出 xlsx 台账", False),
+    ("把报告转成 pdf", False),
+    ("以 pptx 形式给我", False),
+    ("跑一下 scripts/build.py 脚本", False),
+    ("执行这段 python 统计一下", False),
+    # ── 仍需 relay：① 外发（local 无 dws 凭据）──
     ("把结果发送到钉钉群里", True),
     ("发邮件给王洪彬", True),
+    ("推送到 webhook", True),
+    # ── ② 系统运维（沙箱可写范围外 + 需门禁留痕）──
     ("在服务器上安装 python-pptx", True),
     ("部署新版本并重启服务", True),
-    ("跑一下 scripts/build.py 脚本", True),
+    ("systemctl restart relay", True),
+    # ── ③ 任意 SQL / 直接改库（store_task 授权不够）──
+    ("跑一下这段 sql", True),
     ("把结果写入数据库台账", True),
-    # 纯读/文本件 → local
+    ("修改数据表字段", True),
+    # ── ④ 业务动作（需门禁审批）──
+    ("审批通过这单", True),
+    ("下单采购 500 吨", True),
+    # ── ⑤ 联网检索（WebFetch/WebSearch 仍禁 + 公网不可达）──
+    ("联网搜一下今天的国际油价", True),
+    ("抓取这个网页的内容 https://example.com", True),
+    # ── 纯读/研判/文本件 → local ──
     ("生成一周市场研判报告，html形式", False),
     ("统计门店日销", False),
     ("查一下今天的裂解价差", False),
@@ -660,8 +690,8 @@ def test_html_task_still_uses_local(av, cfg, shared):
     ("调用舒小瀚做本周市场研判，出 md 结论", False),
     ("净头寸现在是什么水位", False),
 ])
-def test_needs_bash_backend(text, want):
-    assert needs_bash_backend(text) is want
+def test_needs_relay_backend(text, want):
+    assert needs_relay_backend(text) is want
 
 
 # ── F. local 影子记录（任务列表可见性）──

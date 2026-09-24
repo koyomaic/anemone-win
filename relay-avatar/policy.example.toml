@@ -100,12 +100,25 @@ super_backend = "relay"        # super；走 local 时同样只读编排，**不
 permission_mode_super = "bypassPermissions"
 permission_mode_l2 = "default"
 l2_allowed_tools = ["Read", "Glob", "Grep", "LS"]
-# local 只读编排专用约束（*_backend=local 时改用这两项，与上面 relay 侧的互不干扰）：
-# 白名单必须含 Task 才能委派 subagent；禁写禁执行禁联网必须齐全。
-local_orchestrate_tools = ["Read", "Glob", "Grep", "LS", "Task"]
-local_orchestrate_disallowed = "Bash Write Edit MultiEdit WebFetch WebSearch"
+# local 编排专用约束（*_backend=local 时改用这两项，与上面 relay 侧的互不干扰）：
+# 白名单必须含 Task 才能委派 subagent。
+#
+# **Bash 在 local 沙箱内放开**（阶段二，2026-09-25）。前提是内核沙箱已生效
+# （security.local_sandbox=true 且 local_sandbox_rw/hide 齐备）——边界由 mount
+# namespace + cgroup eBPF 强制，不再依赖 claude 的**词法**权限规则（后者实测可被
+# python3 -c / perl -e / node -e / dd if= 绕过，且能写入"受保护"目录）。
+# available() 已 fail-closed：沙箱不可用则 local 整体停用、路由改投 relay，
+# 故 Bash 不可能在无沙箱状态下被放开。**若关掉 local_sandbox，必须同时把 Bash
+# 加回 local_orchestrate_disallowed。**
+# Write/Edit 由 Edit(//abs/**) 作用域规则管辖（见 security.local_write_dirs）。
+# WebFetch/WebSearch 保持禁用：沙箱网络白名单只放行代理与 PG、公网不可达。
+local_orchestrate_tools = ["Read", "Glob", "Grep", "LS", "Task", "Bash"]
+local_orchestrate_disallowed = "WebFetch WebSearch"
 permission_mode_l3 = "manual"
 l3_permission_prompts = "none"
+# ⚠ L3 **不放开 Bash**（与上面刻意不同）。L3 是文件投递用户的硬隔离层：任何能发文件
+# 的人都落这一档，信任级别最低；且 L3 铁律「越权只拒不升级」，relay 侧没有对应的
+# sender 数据区隔离语义可兜。故维持禁执行禁写禁联网，只留 Read/Glob/Grep/LS。
 l3_disallowed_tools = "Bash Write Edit MultiEdit WebFetch WebSearch"
 session_ttl_sec = 3600
 reply_timeout_sec = 600        # local 执行看门狗（超时 kill）
@@ -189,18 +202,36 @@ local_sandbox_rw = [
   "/mnt/vol-eltaah12/workspace/shared/data",
 ]
 # 内核层隐藏黑名单：遮成空文件/空目录，**任何命令形式都读不到**（不是词法拦截，是
-# 路径在该 mount namespace 内根本不可解析）。与 relay.service 的 InaccessiblePaths
-# 同一套，另加 shared/secrets（relay 侧靠 ProtectSystem 只读兜住，local 侧必须显式
-# 隐藏，因为 secrets 在 workspace 下、而 workspace 需要部分可写）。
+# 路径在该 mount namespace 内根本不可解析）。
+#
+# /root **整体隐藏**，不要逐条列举 .ssh/.git-credentials/.claude* 等。原因
+# （2026-09-25 暴露面扫描，阶段二开 Bash 前）：逐条黑名单只覆盖了预想到的几条，而
+# /root 下散落着历代系统的真实凭据，Bash 一开全部可读——实测命中含
+# up-test-removed-*/（Bearer apikey）、.config/opencode/opencode.jsonc（apiKey）、
+# .team-agent/config、fenshen-*/env/*.env、fenshen-*/.cchome/settings.json 与
+# sessions/*.key、.dws/audit/*.jsonl 与 logs/dws.log、.viminfo（Password）、
+# 多份 core/config.py（444，备份目录下甚至 777）。
+# 沙箱内 HOME 已指向 .cchome，claude 不需要 /root 里任何东西——实测整体隐藏后
+# claude 仍正常应答，而上述文件全部 FileNotFoundError。一条顶原来 6 条，且覆盖
+# 所有未预见的残留。**新增系统时不要把凭据放 /root 以外又忘了登记到这里。**
 local_sandbox_hide = [
   "/mnt/vol-eltaah12/workspace/relay.env",
   "/mnt/vol-eltaah12/workspace/shared/secrets",
-  "/root/.ssh",
-  "/root/.git-credentials",
-  "/root/.config/gh",
-  "/root/.claude",
-  "/root/.claude.json",
-  "/root/.claude-proxy",
+  "/root",
+]
+# 沙箱网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=本列表。
+# 为什么必须收：沙箱只管「能读到什么」，不管「能不能发出去」。Bash 放开后二者叠加
+# 才成外泄通道——实测 python3 urllib 的外发尝试**完全不被权限层拦截**（只因目标端口
+# 无监听才失败）。经 cgroup eBPF 生效，**含 loopback**。实测：代理 8790 可达、
+# PG 5432 可达（store ping ok=true）、relay 本机 8787 可达、公网 1.1.1.1:443 被阻断。
+#   127.0.0.1     claude-proxy（:8790，ANTHROPIC_BASE_URL）+ relay 本机（:8787）
+#   10.189.21.235 PG（:5432，store 台账走每机私有的最小权限角色）
+# 刻意**不给**公网：知识召回由 avatar 侧 knowledge.py 在沙箱外完成后注入 prompt，
+# agent 无需直连；给公网等于把隐藏名单的残余风险变成可外泄。留空＝不施加 IP 规则
+# （**不要**留空，那等于放开全部外发）。
+local_sandbox_net_allow = [
+  "127.0.0.1",
+  "10.189.21.235",
 ]
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
