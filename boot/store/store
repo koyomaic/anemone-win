@@ -394,12 +394,45 @@ GRANTS = [
 ]
 
 
+def _task_dsn_works(env_p: str) -> bool:
+    """实测 index/store-task.env 里的凭据能否真的连上库。
+
+    为什么必须实测：ensure_task_role 原本只看「角色在 + 文件在」就沿用旧密码，
+    一旦库侧密码与文件不一致（角色被重建、密码在别处改过、恢复过备份），
+    store init 会**静默沿用失效凭据**，重跑多少次都修不好。
+    2026-09-24 事故：#152/#204/#215 连续三次报
+    `password authentication failed for user "store_task"`，当天全部交付件
+    （两份 PPT + 市场研判 HTML）都进不了台账，agent 只能如实上报等人工。
+    """
+    dsn = ""
+    try:
+        for line in open(env_p, encoding="utf-8"):
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if line.startswith("STORE_DB="):
+                dsn = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    except OSError:
+        return False
+    if not dsn:
+        return False
+    try:
+        c = psycopg2.connect(dsn, connect_timeout=10)
+        c.close()
+        return True
+    except Exception:
+        return False
+
+
 def ensure_task_role(cur, root: str, rotate: bool = False) -> dict:
     """建/更新任务侧最小权限角色，连接串写进 index/store-task.env（任务可读）。
 
     任务环境拿不到 RELAY_DB（executor 滤掉 RELAY_* 前缀）也读不到 relay.env
     （relay.service 的 InaccessiblePaths 物理屏蔽），所以必须有一条独立的、
     权限受限的连库路径，否则 store 在任务内完全不可用。
+
+    自愈：沿用现有凭据前先**实测能否连上**，连不上就强制轮换（见 _task_dsn_works）。
     """
     import secrets as _sec
     from urllib.parse import urlparse, quote
@@ -408,8 +441,13 @@ def ensure_task_role(cur, root: str, rotate: bool = False) -> dict:
     cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (TASK_ROLE,))
     existed = bool(cur.fetchone())
     env_p = os.path.join(root, "index", "store-task.env")
-    # 已有角色且凭据文件在 → 不轮换密码，避免打断在途任务；--rotate-task-role 强制轮换
-    if existed and os.path.isfile(env_p) and not rotate:
+    # 已有角色且凭据文件在 → 原则上不轮换密码，避免打断在途任务；
+    # --rotate-task-role 强制轮换；凭据实测失效则自动轮换（自愈）。
+    healed = False
+    reuse = existed and os.path.isfile(env_p) and not rotate
+    if reuse and not _task_dsn_works(env_p):
+        reuse, healed = False, True
+    if reuse:
         pw = None
     else:
         pw = _sec.token_urlsafe(24)
@@ -427,14 +465,21 @@ def ensure_task_role(cur, root: str, rotate: bool = False) -> dict:
                     f"STORE_DB=postgresql://{netloc}{u.path}\n")
         os.chmod(env_p, 0o644)  # 任务需可读
     return {"role": TASK_ROLE, "created": not existed, "password_rotated": bool(pw),
+            "healed_stale_credentials": healed,
             "env": env_p if pw else "(沿用现有)"}
 
 
 def cmd_ping(a) -> None:
-    """探活：DB 可连 + 5 张表在 + 台账行数。供 provision 检查项用，绝不建表。
+    """探活：DB 可连 + 5 张表在 + 台账行数 + **任务侧凭据实测可用**。供 provision 用。
 
     退出码：0=正常；1=连上了但缺表（首次需 store init）；2=DB 不可达（relay 本身也已瘫，
-    属需要钉钉预警的故障）。provision 据此区分 WARN 与 FAIL。
+    属需要钉钉预警的故障）；3=宿主侧正常但**任务侧凭据失效**（store init 可自愈）。
+    provision 据此区分 WARN 与 FAIL。
+
+    为什么必须实测任务侧凭据：此前只查 `pg_roles` 里角色**存在**，不验密码**可用**。
+    角色在、密码失效时 ping 照样返回 ok，provision [36] 一路 PASS，而任务里
+    store add 全部失败——2026-09-24 当天三份交付件因此都没进台账，故障在检查清单
+    上完全隐形。
     """
     try:
         conn = connect()
@@ -450,17 +495,32 @@ def cmd_ping(a) -> None:
         if not cur.fetchone():
             missing.append(t)
     n = role_ok = None
+    task_dsn_ok = None
     if not missing:
         cur.execute("SELECT count(*) n FROM store_files")
         n = cur.fetchone()["n"]
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (TASK_ROLE,))
         role_ok = bool(cur.fetchone())
     conn.close()
-    out({"ok": not missing, "missing_tables": missing, "store_files_rows": n,
-         "task_role": TASK_ROLE if role_ok else None, "root": a.root,
-         "hint": "" if not missing else "首次需人工执行: store init（会建表，属有副作用操作）"})
+    env_p = os.path.join(a.root, "index", "store-task.env")
+    if not missing and role_ok:
+        # 只在文件存在时实测；文件缺失属"未 init"，由下面的 hint 覆盖
+        if os.path.isfile(env_p):
+            task_dsn_ok = _task_dsn_works(env_p)
+    hint = ""
+    if missing:
+        hint = "首次需人工执行: store init（会建表，属有副作用操作）"
+    elif task_dsn_ok is False:
+        hint = (f"任务侧凭据失效（{TASK_ROLE} 密码认证不过）——"
+                f"执行 store init 即可自愈轮换（幂等，不动表数据）")
+    out({"ok": not missing and task_dsn_ok is not False,
+         "missing_tables": missing, "store_files_rows": n,
+         "task_role": TASK_ROLE if role_ok else None,
+         "task_dsn_ok": task_dsn_ok, "root": a.root, "hint": hint})
     if missing:
         sys.exit(1)
+    if task_dsn_ok is False:
+        sys.exit(3)
 
 
 def cmd_init(a) -> None:
