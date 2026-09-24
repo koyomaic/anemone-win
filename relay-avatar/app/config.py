@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 import tomllib
 from pathlib import Path
@@ -37,16 +38,21 @@ DEFAULTS: dict[str, Any] = {
                     "admins": [], "whitelist": [], "blacklist": [],
                     "file_uploaders": [], "grant_valid_days": 90},
     "execution": {"default_backend": "relay", "local_enabled": False,
-                  "local_allowed_for": ["self", "l3"]},
+                  "local_allowed_for": ["self", "l3"],
+                  "l2_backend": "relay", "super_backend": "relay"},
     "claude": {"permission_mode_super": "bypassPermissions",
                "permission_mode_l2": "default",
                "l2_allowed_tools": ["Read", "Glob", "Grep", "LS"],
+               "local_orchestrate_tools": ["Read", "Glob", "Grep", "LS", "Task"],
+               "local_orchestrate_disallowed":
+                   "Bash Write Edit MultiEdit WebFetch WebSearch",
                "permission_mode_l3": "manual",
                "l3_permission_prompts": "none",
                "l3_disallowed_tools": "Bash Write Edit MultiEdit WebFetch WebSearch",
                "session_ttl_sec": 3600, "reply_timeout_sec": 600},
     "security": {"l2_lockdown": True,
                  "l2_sandbox_dir": f"{DEFAULT_WORKSPACE}/shared/work",
+                 "l2_add_dirs": [],
                  "profile_enforce": "strict", "sanitize": "on",
                  "rate_limit_daily_tasks": 100, "reprompt_cooldown_sec": 60,
                  "bot_blocklist": [], "media_max_size_mb": 20,
@@ -154,12 +160,20 @@ class Config:
 
 
 def _deep_merge(base: dict, over: dict) -> dict:
-    out = dict(base)
+    """深合并，且**必须深拷贝**。
+
+    原实现 `out = dict(base)` 是浅拷贝：未被 over 覆盖的嵌套 dict 会直接别名
+    base（即模块级 DEFAULTS）。policy.toml 里缺哪个节，哪个节的默认 dict 就被
+    共享——之后任何对 cfg._p 的就地修改都会改写全进程默认值，导致同进程内二次
+    加载的配置互相串味、测试变成顺序相关（实测：POLICY_TMPL 无 [execution]，
+    一个测试设 l2_backend=local 后，后续所有测试的默认后端都变成了 local）。
+    """
+    out = copy.deepcopy(base)
     for k, v in over.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
-            out[k] = v
+            out[k] = copy.deepcopy(v)
     return out
 
 

@@ -84,14 +84,26 @@ grant_valid_days = 90          # 动态授权强制过期天数（修 fenshen P1
 
 [execution]
 default_backend = "relay"      # 主执行走 relay 门禁体系
-local_enabled = false          # P2：local claude 后端（仅 self/L3，约束同表，升级不降级）
-local_allowed_for = ["self", "l3"]
+local_enabled = false          # local claude 后端总开关（关掉则下面两个 *_backend 一律无效）
+local_allowed_for = ["self", "l3"]   # 预留；self 通路尚未接线（run_self 目前无调用方）
+# tier → 后端。relay=走 /tasks 门禁体系（审批/追问/冲突检测齐全）；
+# local=本机 claude「只读编排」，可用 Task 委派 subagent（如十一智能体），但禁写
+# 禁执行禁联网、cwd 锁 security.l2_sandbox_dir，需落地时自动升级 relay（升级不降级）。
+# 改 local 的前置：local_enabled=true 且 l2_sandbox_dir 非空并真实存在
+#（sandbox 为空时 policy 强制回落 relay，绝不让 local 后端裸奔）。
+# 代价：local 通路无 relay 的 task_id，故不支持门禁审批/冲突检测/中途取消。
+l2_backend = "relay"           # L1/L2（含动态白名单）
+super_backend = "relay"        # super；走 local 时同样只读编排，**不用** bypassPermissions
 
 [claude]
 # tier → claude 权限映射（修 fenshen P0：L2 不再 bypassPermissions）
 permission_mode_super = "bypassPermissions"
 permission_mode_l2 = "default"
 l2_allowed_tools = ["Read", "Glob", "Grep", "LS"]
+# local 只读编排专用约束（*_backend=local 时改用这两项，与上面 relay 侧的互不干扰）：
+# 白名单必须含 Task 才能委派 subagent；禁写禁执行禁联网必须齐全。
+local_orchestrate_tools = ["Read", "Glob", "Grep", "LS", "Task"]
+local_orchestrate_disallowed = "Bash Write Edit MultiEdit WebFetch WebSearch"
 permission_mode_l3 = "manual"
 l3_permission_prompts = "none"
 l3_disallowed_tools = "Bash Write Edit MultiEdit WebFetch WebSearch"
@@ -99,8 +111,11 @@ session_ttl_sec = 3600
 reply_timeout_sec = 600        # local 执行看门狗（超时 kill）
 
 [security]
-l2_lockdown = true             # L2 沙箱：cwd 限共享区 + 禁 Bash（fenshen 默认关→这里默认开）
+l2_lockdown = true             # L2 沙箱：禁 Bash（relay 后端）；cwd 限制见 l2_sandbox_dir
 l2_sandbox_dir = "/mnt/vol-eltaah12/workspace/shared/work"
+l2_add_dirs = []               # local 后端额外只读目录：subagent 要读 Agents/G-Skills/
+                               # Z-Skills/knowledge 时必须在此给出，否则规格与知识读不到
+                               #（sandbox 只是 cwd，兄弟目录不会自动可达）
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）

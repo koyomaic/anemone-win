@@ -131,17 +131,47 @@ class Policy:
         return self.st.data_dir(uid)
 
     # ── tier → 约束表（两后端共读） ──
+    def _local_orchestrate(self, c: dict, sec: dict, tier: str) -> dict:
+        """local 后端「只读编排」约束集：可委派 subagent（Task 在白名单内），
+        但禁写禁执行禁联网，cwd 锁 sandbox、add_dirs 给共享区只读目录。
+
+        两条安全底线：
+        ① sandbox 为空则 backend 强制回落 relay —— cons["sandbox"] 此前是死配置
+           （全仓无消费点），local 后端一旦没有 cwd 约束就等于放开整个文件系统；
+        ② permission_mode 一律用 permission_mode_l2（default），**不用** super 的
+           bypassPermissions —— 后者叠加 local 后端即无限制文件系统访问。
+           super 要落地写操作请走 relay 门禁（升级不降级）。
+        """
+        sandbox = str(sec.get("l2_sandbox_dir", "") or "").strip()
+        return {"tier": tier,
+                "backend": "local" if sandbox else "relay",
+                "permission_mode": c.get("permission_mode_l2"),
+                "sandbox": sandbox,
+                "allowed_tools": list(c.get("local_orchestrate_tools", [])),
+                "disallowed_tools": str(c.get(
+                    "local_orchestrate_disallowed",
+                    "Bash Write Edit MultiEdit WebFetch WebSearch")),
+                "add_dirs": [str(x) for x in (sec.get("l2_add_dirs") or [])]}
+
     def constraints(self, uid: str) -> dict:
-        """返回执行约束（exec_relay / exec_local 各自映射，语义等价）。"""
+        """返回执行约束（exec_relay / exec_local 各自映射，语义等价）。
+
+        backend 取值：relay=走 /tasks 门禁体系（默认）；local=本机 claude 只读
+        编排（可委派 subagent，需 execution.local_enabled=true 且 sandbox 非空）。
+        """
         c = self.cfg.section("claude")
         sec = self.cfg.section("security")
         lvl = self.get_level(uid)
         if lvl == "super":
-            return {"tier": "super", "backend": "any",
+            if str(self.cfg.get("execution", "super_backend", "relay")) == "local":
+                return self._local_orchestrate(c, sec, "super")
+            return {"tier": "super", "backend": "relay",
                     "permission_mode": c.get("permission_mode_super"),
                     "sandbox": "", "allowed_tools": [],
                     "disallowed_tools": "", "add_dirs": []}
         if lvl in ("L1", "L2"):
+            if str(self.cfg.get("execution", "l2_backend", "relay")) == "local":
+                return self._local_orchestrate(c, sec, "L2")
             lockdown = bool(sec.get("l2_lockdown", True))
             return {"tier": "L2",
                     "backend": "relay",   # L2 主执行走 relay 门禁；local 需显式开

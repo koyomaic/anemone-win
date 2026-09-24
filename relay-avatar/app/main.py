@@ -602,8 +602,16 @@ class Avatar:
             s["deadline"] = time.time() + int(
                 self.cfg.get("ingress", "debounce_sec", 20))
             return
-        if st in ("RUNNING", "WAIT_APPROVAL", "WAIT_REVIEW", "FOLLOWUP"):
+        if st in ("RUNNING", "WAIT_APPROVAL", "WAIT_REVIEW", "FOLLOWUP",
+                  "LOCAL"):
             if self._kw(text, "cancel"):
+                if st == "LOCAL":
+                    # local 通路无 task_id、claude 子进程不可中途撤回；若在此重置
+                    # 会话态，_drain_local 会跳过收尾，卡片将永远停在「处理中」
+                    self._notify_session(
+                        s, "🚫 本机只读通路的任务不支持中途取消，稍候即可；"
+                           "补充内容我会一并处理。")
+                    return
                 tid = s.get("task_id")
                 if tid:
                     r = self.exec_relay.cancel(tid, uid)
@@ -636,7 +644,8 @@ class Avatar:
             self._ack_receive(s)   # 即时回执已贴过则不重复
         self.sess.start_buffering(s, text)
 
-    def _flush(self, s: dict, followup: bool = False, uid: str = ""):
+    def _flush(self, s: dict, followup: bool = False, uid: str = "",
+               force_relay: bool = False):
         items = s["followups"] if followup else s["buffer"]
         if not items:
             s["state"] = "IDLE"
@@ -650,6 +659,11 @@ class Avatar:
             s["state"] = "IDLE"
             return
         desc = sanitize_injected("\n\n".join(items))
+        # backend=local（只读编排，可委派 subagent）优先；未启用/越权/被拒则升级
+        # relay 门禁（升级不降级）。force_relay 供 escalate 回落用，防再次进 local
+        # 造成死循环。
+        if not force_relay and self._try_local_task(s, uid, desc, followup):
+            return
         resume = self.sess.resume_candidate(s)
         r = self.exec_relay.submit(desc, resume_from=resume, uid=uid)
         if "_error" in r:
@@ -674,6 +688,119 @@ class Avatar:
         self._react(s, "submit_emoji")
         self._card_open(s, tid, desc)
         log(f"task #{tid} submitted (resume={resume})")
+
+    # ── local 后端团队任务（只读编排，可委派 subagent） ──
+    def _try_local_task(self, s: dict, uid: str, desc: str,
+                        followup: bool = False) -> bool:
+        """backend=local 的团队任务通路：后台线程执行 + 流式卡片。
+
+        返回 True=已由本通路接管（调用方直接 return）；False=未启用/越权/已在跑，
+        调用方升级 relay 门禁（升级不降级）。
+
+        为什么必须后台线程：主循环单线程串行（handle_line → _tick →
+        _poll_sessions），同步跑 claude 最长会阻塞 reply_timeout_sec（默认 600s），
+        期间所有入站消息与**在途 relay 任务的轮询**一起冻结。
+        为什么收尾回主循环：会话态 s 与主循环共享，worker 只写 s["local_result"]，
+        由 _drain_local 在主循环内收尾，避免并发改会话态。
+        为什么用独立 LOCAL 态：_poll_sessions 见到 RUNNING 且无 task_id 会立刻
+        重置 IDLE，而 local 通路没有 relay 的 task_id；LOCAL 也不在 due() 的
+        BUFFERING/FOLLOWUP 之列，不会被误 flush。
+        代价：local 通路不支持门禁审批/冲突检测/中途取消，需要这些请保持
+        backend=relay。
+        """
+        cons = self.policy.constraints(uid)
+        if cons.get("backend") != "local" or not self.exec_local.available():
+            return False
+        if s.get("state") == "LOCAL":
+            return False                       # 已有本机任务在跑，不并发
+        biz = ""
+        if self.cfg.get("ingress", "use_card", True):
+            try:
+                biz = card_biz_id(self.dws.card_create(s["reply"]))
+            except Exception:
+                biz = ""
+        if followup:
+            s["followups"] = []
+        else:
+            s["buffer"] = []
+        s["uid"] = uid
+        s["task_id"] = None
+        s["state"] = "LOCAL"
+        s["local_result"] = None
+        s["notified_followup"] = False
+        self._swap_ack(s, "")
+        self.st.archive_round(f"local-{uid}", "submit", {
+            "desc": desc[:500], "backend": "local",
+            "tier": self.policy.get_level(uid),
+            "sandbox": cons.get("sandbox", ""),
+            "add_dirs": list(cons.get("add_dirs") or [])})
+        threading.Thread(target=self._local_worker,
+                         args=(s, uid, desc, biz), daemon=True).start()
+        log(f"local task started for {uid} (tier={cons['tier']})")
+        return True
+
+    def _local_worker(self, s: dict, uid: str, desc: str, biz: str):
+        """后台执行 local 任务；只写 s["local_result"]，不碰其他会话态。"""
+        throttle = {"upd": 0.0}
+        gap = float(self.cfg.get("ingress", "card_progress_sec", 30))
+
+        def on_step(step, steps):
+            if not biz:
+                return
+            now = time.time()
+            if now - throttle["upd"] < gap:
+                return
+            throttle["upd"] = now
+            try:
+                self.dws.card_update(
+                    biz, f"🍂 **{self.cfg.avatar_name}正在处理…**\n\n"
+                    + "\n".join(f"> {x}" for x in steps[-6:]), 1)
+            except Exception:
+                pass
+
+        try:
+            kb = self.know.search(desc)
+            r = self.exec_local.run_task(uid, desc, kb=kb, on_step=on_step)
+        except Exception as e:
+            log("local task error:", e)
+            r = {"text": "", "escalate": True, "error": str(e)[:200]}
+        s["local_result"] = {"r": r, "biz": biz, "uid": uid, "desc": desc}
+
+    def _drain_local(self):
+        """主循环侧收尾 LOCAL 态：出结果→定格卡片/回话；被拒→升级 relay 门禁。"""
+        for key, s in list(self.sess.sessions.items()):
+            if s.get("state") != "LOCAL":
+                continue
+            res = s.get("local_result")
+            if not res:
+                continue                       # 仍在跑
+            s["local_result"] = None
+            r, biz, uid = res["r"], res["biz"], res["uid"]
+            desc, out = res["desc"], str(r.get("text") or "").strip()
+            if r.get("escalate") or not out:
+                s["state"] = "IDLE"
+                s["buffer"] = [desc]
+                why = str(r.get("error") or "")[:60]
+                log(f"local task escalate→relay for {uid}"
+                    + (f" ({why})" if why else ""))
+                self._flush(s, uid=uid, force_relay=True)
+                continue
+            s["state"] = "IDLE"
+            self.st.archive_round(f"local-{uid}", "done",
+                                  {"backend": "local", "chars": len(out),
+                                   "out": out[:500]})
+            done = False
+            if biz:
+                try:
+                    done = bool(self.dws.card_update(biz, out[:2500], 3))
+                except Exception:
+                    done = False
+            if not done:
+                self._notify_session(s, out)
+            log(f"local task done for {uid} ({len(out)} chars)")
+            if s.get("followups"):
+                s["state"] = "FOLLOWUP"        # 交 _tick 的 due() 正常 flush
+                s["deadline"] = time.time() + 1
 
     # ── 流式卡片（fenshen 样式：叶子+粗体名+引用行；提交即开卡，跳变更新，完成定格） ──
     def _card_open(self, s: dict, tid, desc: str):
@@ -1014,6 +1141,7 @@ class Avatar:
 
     # ── 定时 ──
     def _tick(self):
+        self._drain_local()      # 先收尾本机任务，escalate 的可在本轮直接转 relay
         for key, s, kind in self.sess.due():
             s["deadline"] = 0
             self._flush(s, followup=(kind == "followup"))

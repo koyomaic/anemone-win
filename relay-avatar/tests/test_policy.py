@@ -90,7 +90,9 @@ def test_rate_limit(policy):
 
 def test_constraints_table(policy):
     c = policy.constraints("18434")
-    assert c["tier"] == "super" and c["backend"] == "any"
+    # super 的 backend 原为 "any"——一个全仓无消费点的死值，路由无从判定；
+    # 现明确为 relay（默认）或 local（execution.super_backend=local 时）
+    assert c["tier"] == "super" and c["backend"] == "relay"
     c = policy.constraints("200")
     assert c["tier"] == "L2" and c["backend"] == "relay"
     assert c["disallowed_tools"] == "Bash"      # l2_lockdown 默认开
