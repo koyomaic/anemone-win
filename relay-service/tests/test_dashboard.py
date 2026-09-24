@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+import types
 
 import httpx
 import pytest
@@ -175,3 +177,57 @@ def test_create_app_rejects_default_admin_token(tmp_path):
                        users_root=str(tmp_path / "users"), admin_token=bad)
         with pytest.raises(RuntimeError):
             create_app(cfg)
+
+
+# ---- 系统定时器只读列表（dashboard「计划」tab 下方） ----
+
+def test_list_system_timers_parses_and_sorts(monkeypatch):
+    raw = json.dumps([
+        {"unit": "stopped.timer", "activates": "stopped.service",
+         "next": None, "left": None, "last": 0, "passed": 0},
+        {"unit": "later.timer", "activates": "later.service",
+         "next": 2_000_000_000_000, "left": 0, "last": 1_000_000_000_000, "passed": 0},
+        {"unit": "soon.timer", "activates": "soon.service",
+         "next": 1_500_000_000_000, "left": 0, "last": 0, "passed": 0},
+    ])
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(stdout=raw))
+    out = m._list_system_timers()
+    # 运行中按 next 升序在前，未排程（next=null）沉底
+    assert [t["unit"] for t in out] == ["soon.timer", "later.timer", "stopped.timer"]
+    assert out[0]["next"] == 1_500_000.0 and out[0]["running"] is True
+    assert out[0]["last"] is None          # last=0 → 从未运行 → None
+    assert out[1]["last"] == 1_000_000.0   # 微秒 → 秒
+    assert out[2]["next"] is None and out[2]["running"] is False
+
+
+def test_list_system_timers_degrades_to_empty(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("no systemctl")
+    monkeypatch.setattr(m.subprocess, "run", boom)
+    assert m._list_system_timers() == []
+
+
+def test_dashboard_timers_endpoint_auth_and_shape(relay_dash, monkeypatch):
+    fixed = [{"unit": "x.timer", "activates": "x.service",
+              "next": 1.0, "last": None, "running": True}]
+    monkeypatch.setattr(m, "_list_system_timers", lambda: fixed)
+    c = httpx.Client(base_url=relay_dash["base"], timeout=10)
+    try:
+        assert c.get("/dashboard/timers").status_code == 401  # 未登录
+        c.post("/login", data={"password": "dash-test-pw"}, follow_redirects=False)
+        r = c.get("/dashboard/timers")
+        assert r.status_code == 200
+        assert r.json() == {"timers": fixed}
+    finally:
+        c.close()
+
+
+def test_dashboard_page_has_timers_section(relay_dash):
+    c = httpx.Client(base_url=relay_dash["base"], timeout=10)
+    try:
+        c.post("/login", data={"password": "dash-test-pw"}, follow_redirects=False)
+        html = c.get("/").text
+        assert 'id="timers"' in html and "系统定时器" in html
+    finally:
+        c.close()

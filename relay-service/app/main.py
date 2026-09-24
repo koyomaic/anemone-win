@@ -150,6 +150,9 @@ td.desc{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 <button id="btn-pl-new">创建</button>
 </div>
 <h2>现有计划</h2><div id="plans"></div>
+<h2 style="margin-top:22px">系统定时器（只读）</h2>
+<p style="font-size:12px;color:#94a3b8">本机 systemd 定时器一览，仅供查看，不在此启停。</p>
+<div id="timers"></div>
 </div>
 </div>
 <script>
@@ -204,7 +207,7 @@ function showTab(v){
   document.getElementById("tab-plans").className=v==="p"?"on":"";
   if(v==="t")refreshTokens();
   if(v==="s")refreshShared();
-  if(v==="p")refreshPlans();
+  if(v==="p"){refreshPlans();refreshTimers();}
 }
 document.getElementById("tab-metrics").addEventListener("click",e=>{e.preventDefault();showTab("m")});
 document.getElementById("tab-tokens").addEventListener("click",e=>{e.preventDefault();showTab("t")});
@@ -394,9 +397,24 @@ async function refreshPlans(){
       <a href="#" class="act" data-a="del" data-n="${p.id}" style="color:#f87171">删除</a></td></tr>`;
     }).join("")+"</table>"
    :'<p style="font-size:13px;color:#64748b">暂无计划</p>';
- }catch(e){}
-}
-document.getElementById("plans").addEventListener("click",async e=>{
+  }catch(e){}
+ }
+ async function refreshTimers(){
+  try{
+   const r=await fetch("/dashboard/timers");if(!r.ok)throw 0;const d=await r.json();
+   const ts=d.timers||[];
+   document.getElementById("timers").innerHTML=ts.length
+    ?`<table><tr><th>定时器</th><th>激活单元</th><th>下次</th><th>上次</th><th>状态</th></tr>`+ts.map(t=>{
+      return `<tr><td><code>${esc(t.unit)}</code></td>
+       <td style="font-size:12px">${esc(t.activates||"")}</td>
+       <td style="font-size:12px">${t.next?fmtNext(t.next):"-"}</td>
+       <td style="font-size:12px">${t.last?fmtNext(t.last):"-"}</td>
+       <td>${t.running?'<span class="b done">运行中</span>':'<span class="b cancelled">已停止</span>'}</td></tr>`;
+     }).join("")+"</table>"
+    :'<p style="font-size:13px;color:#64748b">无定时器</p>';
+  }catch(e){}
+ }
+ document.getElementById("plans").addEventListener("click",async e=>{
  const a=e.target.closest("a.act");if(!a)return;e.preventDefault();
  const id=a.dataset.n,act=a.dataset.a;
  if(act==="toggle"){
@@ -427,7 +445,7 @@ document.getElementById("btn-pl-new").addEventListener("click",async()=>{
  document.getElementById("pl-ro").checked=false;
  refreshPlans();
 });
-refresh();setInterval(()=>{refresh();if(document.getElementById("view-tokens").style.display!=="none")refreshTokens();if(document.getElementById("view-plans").style.display!=="none")refreshPlans()},10000);
+refresh();setInterval(()=>{refresh();if(document.getElementById("view-tokens").style.display!=="none")refreshTokens();if(document.getElementById("view-plans").style.display!=="none"){refreshPlans();refreshTimers()}},10000);
 </script></body></html>"""
 from .executor import Executor
 from .scheduler import Scheduler
@@ -607,6 +625,35 @@ def _launch_boot(boot: str) -> tuple[bool, str]:
         return True, "detached"
     except OSError as e:
         return False, f"launch failed: {e!r}"
+
+
+def _list_system_timers() -> list[dict]:
+    """本机 systemd 定时器只读一览（供 dashboard 展示，不做启停）。
+
+    解析 `systemctl list-timers --all --output=json`；时间戳为微秒，
+    next 为空表示未排程（timer 未运行）。任何异常退化为空列表，
+    绝不影响 dashboard 其余部分。
+    """
+    try:
+        p = subprocess.run(
+            ["systemctl", "list-timers", "--all", "--output=json"],
+            capture_output=True, text=True, timeout=5)
+        raw = json.loads(p.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    out = []
+    for t in raw:
+        nxt = t.get("next") or None
+        last = t.get("last") or None
+        out.append({
+            "unit": t.get("unit"),
+            "activates": t.get("activates"),
+            "next": nxt / 1_000_000 if nxt else None,
+            "last": last / 1_000_000 if last else None,
+            "running": bool(nxt),
+        })
+    out.sort(key=lambda r: (not r["running"], r["next"] if r["next"] is not None else 0))
+    return out
 
 
 def sweep_stale(db, bus, audit, cfg, ws) -> list[int]:
@@ -1787,6 +1834,11 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     async def dashboard_plans(request: Request):
         _dash_auth(request)
         return {"plans": db.list_plans()}
+
+    @app.get("/dashboard/timers")
+    async def dashboard_timers(request: Request):
+        _dash_auth(request)
+        return {"timers": await asyncio.to_thread(_list_system_timers)}
 
     @app.post("/dashboard/plans", status_code=201)
     async def dashboard_plan_create(request: Request, body: NewPlan):
