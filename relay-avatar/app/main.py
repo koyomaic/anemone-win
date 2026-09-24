@@ -42,6 +42,10 @@ from app.storage import Storage
 
 EMOJI_RE = re.compile(r"^(\[[^\[\]]{1,12}\]\s*)+$")
 
+# 大脑在回复里放的结构化计划标记：```plan\n{json}\n```。relay-avatar 解析并执行
+# （理解交给 LLM，带凭据的创建/管理留在本进程）。解析失败则原样保留、不吞正文。
+PLAN_BLOCK_RE = re.compile(r"```plan[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
+
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
@@ -779,6 +783,10 @@ class Avatar:
     def _send_result(self, s: dict, row: dict, prefix: str = ""):
         tid = row.get("id")
         result = (row.get("result") or "").strip()
+        result, notes = self._consume_plan_markers(result, s, tid)
+        if notes:
+            result = (result + ("\n\n" if result else "")
+                      + "\n\n".join(notes)).strip()
         head = prefix or f"🍂 **{self.cfg.avatar_name}办好了 ✅**"
         limit = int(self.cfg.get("ingress", "result_max_chars", 3000))
         long = len(result) > limit
@@ -797,6 +805,113 @@ class Avatar:
         else:
             self._notify_session(
                 s, head + ("\n\n" + result if result else "（无文本结果）"))
+
+    # ── 计划标记消费：大脑产出 ```plan JSON，本进程带凭据执行 ──
+    def _consume_plan_markers(self, result: str, s: dict, tid):
+        specs: list = []
+
+        def _grab(m):
+            try:
+                obj = json.loads(m.group(1))
+            except Exception:
+                return m.group(0)          # 解析失败：原样保留，不吞正文
+            if isinstance(obj, dict):
+                specs.append(obj)
+                return ""                  # 命中：从正文剔除
+            return m.group(0)
+
+        clean = PLAN_BLOCK_RE.sub(_grab, result).strip()
+        if not specs or s.get("plan_applied") == tid:
+            return clean, []               # 已执行过（review→done 二次回流）不再重复
+        s["plan_applied"] = tid
+        uid = s.get("uid") or ""
+        notes = []
+        for spec in specs:
+            try:
+                note = self._exec_plan_op(spec, uid)
+            except Exception as e:
+                note = f"⚠️ 计划操作异常：{e!r}"
+            if note:
+                notes.append(note)
+        return clean, notes
+
+    def _exec_plan_op(self, spec: dict, uid: str) -> str | None:
+        op = str(spec.get("op") or "create").lower()
+        if op == "list":
+            return self._plan_list_note(uid)
+        if op == "create":
+            return self._plan_create_note(spec, uid)
+        if op in ("delete", "disable", "enable"):
+            return self._plan_by_name_note(op, str(spec.get("name") or ""), uid)
+        return None
+
+    def _plan_create_note(self, spec: dict, uid: str) -> str:
+        on_cal = str(spec.get("on_calendar") or "").strip()
+        desc = str(spec.get("description") or "").strip()
+        if not on_cal or not desc:
+            return "⚠️ 计划信息不完整（缺 on_calendar 或 description），未创建。"
+        name = re.sub(r"[^A-Za-z0-9_.一-鿿-]", "",
+                      str(spec.get("name") or "").strip() or desc[:16])[:40] or "plan"
+        existing = {p.get("name") for p in
+                    (self.exec_relay.list_plans(uid).get("plans") or [])}
+        base, i = name, 2
+        while name in existing:
+            name = f"{base}-{i}"
+            i += 1
+        action = {"type": "task", "description": desc,
+                  "priority": spec.get("priority", "normal"),
+                  "read_only": bool(spec.get("read_only", False))}
+        r = self.exec_relay.create_plan(name, on_cal, action, uid=uid)
+        if "_error" in r:
+            return (f"⚠️ 创建计划失败："
+                    f"{str(r.get('_detail') or r.get('_error'))[:160]}")
+        nr = r.get("next_run")
+        nrs = time.strftime("%m-%d %H:%M", time.localtime(nr)) if nr else "?"
+        return (f"✅ 已创建定时计划「{name}」\n"
+                f"· 规则：{on_cal}\n· 下次：{nrs}\n· 内容：{desc[:60]}\n"
+                f"到点自动执行。想看就说「我的计划」，想取消说「删掉计划 {name}」。")
+
+    def _plan_list_note(self, uid: str) -> str:
+        r = self.exec_relay.list_plans(uid)
+        if "_error" in r:
+            return f"⚠️ 读取计划失败：{r.get('_error')}"
+        plans = r.get("plans") or []
+        if not plans:
+            return "📋 当前没有定时计划。"
+        lines = ["📋 定时计划："]
+        for p in plans:
+            nr = p.get("next_run")
+            nrs = (time.strftime("%m-%d %H:%M", time.localtime(nr))
+                   if nr else "已停用")
+            st = "启用" if p.get("enabled") else "停用"
+            lines.append(f"· {p['name']}｜{p['on_calendar']}｜{st}｜下次 {nrs}")
+        return "\n".join(lines)
+
+    def _plan_by_name_note(self, op: str, name: str, uid: str) -> str:
+        name = (name or "").strip()
+        if not name:
+            return "⚠️ 请说明要操作哪个计划（用计划名）。"
+        r = self.exec_relay.list_plans(uid)
+        if "_error" in r:
+            return f"⚠️ 读取计划失败：{r.get('_error')}"
+        plans = r.get("plans") or []
+        cands = [p for p in plans if p["name"] == name] or \
+            [p for p in plans if name in p["name"]]
+        if not cands:
+            return f"没找到计划「{name}」。说「我的计划」可查看全部。"
+        if len(cands) > 1:
+            opts = "、".join(p["name"] for p in cands[:8])
+            return f"「{name}」匹配到多个：{opts}。请用完整计划名。"
+        p = cands[0]
+        if op == "delete":
+            rr = self.exec_relay.delete_plan(p["id"], uid=uid)
+            return ("🗑 已删除计划「" + p["name"] + "」。" if "_error" not in rr
+                    else f"⚠️ 删除失败：{rr.get('_error')}")
+        enabled = (op == "enable")
+        rr = self.exec_relay.patch_plan(p["id"], {"enabled": enabled}, uid=uid)
+        if "_error" in rr:
+            return f"⚠️ 操作失败：{rr.get('_error')}"
+        return (f"{'▶️ 已启用' if enabled else '⏸ 已停用'}计划「{p['name']}」。")
 
     def _send_full_file(self, s: dict, tid, result: str):
         fp = self.st.rounds / f"{tid}_result.md"

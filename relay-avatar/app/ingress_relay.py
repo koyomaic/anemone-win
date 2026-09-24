@@ -66,3 +66,19 @@ class RelayClient:
 
     def cancel(self, tid) -> dict:
         return self.req("POST", f"/tasks/{tid}/cancel")
+
+    # ---- 计划（定时任务）----
+
+    def create_plan(self, name: str, on_calendar: str, action: dict) -> dict:
+        return self.req("POST", "/plans",
+                        {"name": name, "on_calendar": on_calendar,
+                         "action": action, "enabled": True})
+
+    def list_plans(self) -> dict:
+        return self.req("GET", "/plans")
+
+    def patch_plan(self, pid, fields: dict) -> dict:
+        return self.req("PATCH", f"/plans/{pid}", fields)
+
+    def delete_plan(self, pid) -> dict:
+        return self.req("DELETE", f"/plans/{pid}")

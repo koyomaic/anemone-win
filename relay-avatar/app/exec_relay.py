@@ -54,6 +54,60 @@ class ExecRelay:
                        backend=self.name, task_id=tid)
         return r
 
+    # ---- 计划（定时任务）：声明存 relay 本机库，root 侧 tick 到点触发 ----
+
+    def create_plan(self, name: str, on_calendar: str, action: dict,
+                    uid: str = "") -> dict:
+        r = self.relay.create_plan(name, on_calendar, action)
+        if "_error" not in r:
+            self.audit.log("plan_create", uid, f"{name} @ {on_calendar}",
+                           backend=self.name, plan_id=r.get("id"))
+        return r
+
+    def list_plans(self, uid: str = "") -> dict:
+        return self.relay.list_plans()
+
+    def patch_plan(self, pid, fields: dict, uid: str = "") -> dict:
+        r = self.relay.patch_plan(pid, fields)
+        if "_error" not in r:
+            self.audit.log("plan_update", uid, f"#{pid} {fields}",
+                           backend=self.name, plan_id=pid)
+        return r
+
+    def delete_plan(self, pid, uid: str = "") -> dict:
+        r = self.relay.delete_plan(pid)
+        if "_error" not in r:
+            self.audit.log("plan_delete", uid, f"#{pid}",
+                           backend=self.name, plan_id=pid)
+        return r
+
+    # ---- 计划（定时任务）：声明存 relay 本机库，root 侧 tick 到点触发 ----
+
+    def create_plan(self, name: str, on_calendar: str, action: dict,
+                    uid: str = "") -> dict:
+        r = self.relay.create_plan(name, on_calendar, action)
+        if "_error" not in r:
+            self.audit.log("plan_create", uid, f"{name} @ {on_calendar}",
+                           backend=self.name, plan_id=r.get("id"))
+        return r
+
+    def list_plans(self, uid: str = "") -> dict:
+        return self.relay.list_plans()
+
+    def patch_plan(self, pid, fields: dict, uid: str = "") -> dict:
+        r = self.relay.patch_plan(pid, fields)
+        if "_error" not in r:
+            self.audit.log("plan_update", uid, f"#{pid} {fields}",
+                           backend=self.name, plan_id=pid)
+        return r
+
+    def delete_plan(self, pid, uid: str = "") -> dict:
+        r = self.relay.delete_plan(pid)
+        if "_error" not in r:
+            self.audit.log("plan_delete", uid, f"#{pid}",
+                           backend=self.name, plan_id=pid)
+        return r
+
     def wait_terminal(self, tid, timeout_sec: int = 0,
                       interval: float = 3.0) -> dict:
         """轮询到终态（avatar-cli 用）。timeout_sec=0 不限时。"""
