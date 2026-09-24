@@ -703,23 +703,44 @@ AVA_SRC="$RES_ROOT/relay-avatar"
 AVA_DIR=/opt/team/relay-avatar
 AVA_STATE="$WORKSPACE/avatar"
 AVA_UNIT=relay-avatar.service
-AVA_MARKER=/etc/relay-avatar.enabled
+  AVA_MARKER=/etc/relay-avatar.enabled
+  AVA_NOTE=""
 if [ ! -d "$AVA_SRC" ]; then warn "资源树无 relay-avatar 目录（旧版本？）"
 else
-  if heal; then
-    mkdir -p "$AVA_DIR"
-    rm -rf "$AVA_DIR/app"
-    cp -r "$AVA_SRC/app" "$AVA_DIR/app"
-    cp -f "$AVA_SRC/avatar-cli" "$AVA_SRC/policy.example.toml" "$AVA_SRC/README.md" "$AVA_DIR/" 2>/dev/null
-    cp -f "$AVA_SRC/relay-avatar.service.template" "$AVA_DIR/" 2>/dev/null
-    find "$AVA_DIR" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
-    chmod 755 "$AVA_DIR/avatar-cli"
-    "$VENV/bin/python" "$AVA_DIR/app/migrate.py" --workspace "$WORKSPACE" >/dev/null 2>&1 \
-      || warn "状态迁移失败（手动排查: $VENV/bin/python $AVA_DIR/app/migrate.py --workspace $WORKSPACE）"
-    sed -e "s|@VENV_PY@|$VENV/bin/python|" -e "s|@AVATAR_DIR@|$AVA_DIR|" -e "s|@STATE_DIR@|$AVA_STATE|" \
-        "$AVA_SRC/relay-avatar.service.template" > "$UNIT_DIR/$AVA_UNIT"
-    systemctl daemon-reload
-  fi
+    if heal; then
+      mkdir -p "$AVA_DIR"
+      # 代码漂移检测必须在覆盖**之前**做：下面的 enable --now 对已在运行的服务
+      # 是 no-op（不会重启），故代码更新若不显式 restart 就**永远不生效**——
+      # 2026-09-25 local 内核沙箱部署后，磁盘上是新代码而进程仍跑旧代码即此因，
+      # 且 [47] 一路 PASS（它只查 enabled+active+心跳），故障在清单上完全隐形。
+      AVA_DRIFT=0
+      if [ -d "$AVA_DIR/app" ] && \
+         ! diff -rq -x __pycache__ "$AVA_SRC/app" "$AVA_DIR/app" >/dev/null 2>&1; then
+        AVA_DRIFT=1
+      fi
+      rm -rf "$AVA_DIR/app"
+      cp -r "$AVA_SRC/app" "$AVA_DIR/app"
+      cp -f "$AVA_SRC/avatar-cli" "$AVA_SRC/policy.example.toml" "$AVA_SRC/README.md" "$AVA_DIR/" 2>/dev/null
+      cp -f "$AVA_SRC/relay-avatar.service.template" "$AVA_DIR/" 2>/dev/null
+      find "$AVA_DIR" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+      chmod 755 "$AVA_DIR/avatar-cli"
+      "$VENV/bin/python" "$AVA_DIR/app/migrate.py" --workspace "$WORKSPACE" >/dev/null 2>&1 \
+        || warn "状态迁移失败（手动排查: $VENV/bin/python $AVA_DIR/app/migrate.py --workspace $WORKSPACE）"
+      sed -e "s|@VENV_PY@|$VENV/bin/python|" -e "s|@AVATAR_DIR@|$AVA_DIR|" -e "s|@STATE_DIR@|$AVA_STATE|" \
+          "$AVA_SRC/relay-avatar.service.template" > "$UNIT_DIR/$AVA_UNIT"
+      systemctl daemon-reload
+      if [ "$AVA_DRIFT" = 1 ] && systemctl is-active --quiet "$AVA_UNIT"; then
+        # 重启会打断在途 local 任务，但 app/main.py 的 _reap_local/_reap_stale_local
+        # 会在启动时清理孤儿 LOCAL 态并改投 relay + 通知用户（2026-09-24 加的兜底），
+        # 故可无条件重启；不重启的代价是新代码永久不生效，更糟。
+        if systemctl restart "$AVA_UNIT"; then
+          AVA_NOTE="（代码有漂移，已重启生效）"
+          sleep 5
+        else
+          warn "avatar 代码有漂移但重启失败（journalctl -u $AVA_UNIT）——新代码未生效"
+        fi
+      fi
+    fi
   if [ -f "$AVA_MARKER" ]; then
     if heal; then systemctl enable --now "$AVA_UNIT" 2>/dev/null; fi
     if ! systemctl is-active --quiet "$AVA_UNIT"; then
@@ -733,7 +754,7 @@ else
       if [ "$HB_AGE" -gt 120 ]; then bad "服务活但心跳不新鲜（age=${HB_AGE}s，判活=进程在+心跳新鲜）"
       elif ! curl -sf -m 3 "http://127.0.0.1:$DASH_PORT/health" >/dev/null 2>&1; then
         warn "服务活+心跳新鲜，但看板 :$DASH_PORT 不可达（dashboard_enabled=false 时属预期）"
-      else ok "enabled+active 心跳${HB_AGE}s前 看板:$DASH_PORT（策略 $AVA_STATE/policy.toml）"; fi
+      else ok "enabled+active 心跳${HB_AGE}s前 看板:$DASH_PORT${AVA_NOTE}（策略 $AVA_STATE/policy.toml）"; fi
     fi
   else
     if heal; then systemctl disable --now "$AVA_UNIT" 2>/dev/null; fi
