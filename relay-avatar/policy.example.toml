@@ -116,6 +116,22 @@ l2_sandbox_dir = "/mnt/vol-eltaah12/workspace/shared/work"
 l2_add_dirs = []               # local 后端额外只读目录：subagent 要读 Agents/G-Skills/
                                # Z-Skills/knowledge 时必须在此给出，否则规格与知识读不到
                                #（sandbox 只是 cwd，兄弟目录不会自动可达）
+# local 通路作用域写：非空即开启，只放开列出的目录、只出 HTML/MD/CSV 等**文本件**。
+# 机制经 claude 实测：文件写权限只认 Edit(//绝对路径/**) 作用域规则（裸 Write/Edit
+# 放 --allowedTools 不生效），配 --permission-prompts none 时越界写**自动拒绝**
+# （fail-closed）。开启后 policy.py 自动从 local_orchestrate_disallowed 摘除
+# Write/Edit，**Bash 始终禁用**——故 pptx/docx/xlsx 等需跑 python 的件由
+# needs_bash_backend 前置判定直接送 relay 门禁，不进 local 空转。
+# **刻意不给** knowledge/Agents/G-Skills/Z-Skills/memory/data/templates/secrets/mcp：
+# memory 会自动并入每个任务的 CLAUDE.md（改它＝向所有后续任务注入提示词）、
+# data 是经营数据入站真源（可写＝能伪造后续报告引用的"真实数据"）、
+# Agents/*-Skills 是机队行为定义。这些一律只读，要改走 relay 门禁。
+local_write_dirs = []
+# local 通路**可删**目录（```delete_file``` 标记的作用域）。刻意比 local_write_dirs
+# 更窄：只给草稿区 shared/work。shared/report 是正式交付区、local 又不做 baseline
+# 快照，删了不可追溯，故不开放——要删交付件走 relay 门禁（那边有 baseline +
+# 冲突检测 + 审批）。留空＝local 完全无删除能力（agent 请求删件会被拒并留审计）。
+local_delete_dirs = []
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）
