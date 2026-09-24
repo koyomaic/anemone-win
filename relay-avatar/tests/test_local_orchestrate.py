@@ -1219,3 +1219,100 @@ def test_relay_delivery_rule_group_vs_o2o(av, cfg, shared):
     s["reply"] = {"is_group": False, "open_dingtalk_id": "x", "sender": ""}
     r = av._relay_delivery_rule(s)
     assert "单聊" in r and "发起人" in r          # 无 sender 名时回落通称
+
+
+def test_task_artifact_roots_follows_resume_chain(av, cfg, shared, monkeypatch):
+    """续跑任务的出件在**上一轮**的 workdir 里，必须沿 resume_from 回溯放行。
+
+    2026-09-25 #245（resume 自 #243）的标记指向 tasks/243/output/这次真行.pptx，
+    只放行当前 workdir 导致三份件全部「拒绝代投」——用户第 7 次收不到文件。
+    """
+    w243 = _mk_task_dir(shared, 243)
+    w245 = _mk_task_dir(shared, 245)
+    monkeypatch.setattr(av.exec_relay, "poll",
+                        lambda tid: {"id": 243, "workdir": str(w243)},
+                        raising=False)
+    roots = av._task_artifact_roots({"id": 245, "workdir": str(w245),
+                                     "resume_from": 243})
+    names = sorted(os.path.basename(r) for r in roots)
+    assert names == ["output", "output", "work", "work"]     # 两轮各 output/+work/
+    assert os.path.realpath(str(w243 / "output")) in roots   # 上一轮的出件可代投
+    assert os.path.realpath(str(w245 / "output")) in roots
+
+
+def test_task_artifact_roots_chain_excludes_context_files(av, cfg, shared,
+                                                          monkeypatch):
+    """回溯到的上一轮 workdir 同样只给 output//work/，CLAUDE.md 与 .claude/ 不放行。"""
+    w243 = _mk_task_dir(shared, 243)
+    w245 = _mk_task_dir(shared, 245)
+    monkeypatch.setattr(av.exec_relay, "poll",
+                        lambda tid: {"id": 243, "workdir": str(w243)},
+                        raising=False)
+    roots = av._task_artifact_roots({"id": 245, "workdir": str(w245),
+                                     "resume_from": 243})
+    assert os.path.realpath(str(w243)) not in roots
+    assert not any(r.endswith(".claude") for r in roots)
+
+
+def test_task_artifact_roots_chain_terminates_on_cycle(av, cfg, shared,
+                                                       monkeypatch):
+    """resume 链成环时必须终止（限 6 跳 + tid 去重），否则死循环拖垮收尾。"""
+    w = _mk_task_dir(shared, 250)
+    calls = []
+
+    def cyclic(tid):
+        calls.append(tid)
+        return {"id": tid, "workdir": str(w), "resume_from": 251}
+
+    monkeypatch.setattr(av.exec_relay, "poll", cyclic, raising=False)
+    roots = av._task_artifact_roots({"id": 252, "workdir": str(w),
+                                     "resume_from": 251})
+    assert len(calls) <= 6
+    assert roots
+
+
+def test_task_artifact_roots_poll_failure_degrades(av, cfg, shared, monkeypatch):
+    """回溯时 relay 查询失败不得抛异常（收尾路径抛出会盖掉任务结果）。"""
+    w = _mk_task_dir(shared, 260)
+
+    def boom(tid):
+        raise RuntimeError("relay 挂了")
+
+    monkeypatch.setattr(av.exec_relay, "poll", boom, raising=False)
+    roots = av._task_artifact_roots({"id": 260, "workdir": str(w),
+                                     "resume_from": 259})
+    assert os.path.realpath(str(w / "output")) in roots      # 当前轮仍可用
+
+
+def test_send_result_delivers_resumed_task_output(av, cfg, shared, monkeypatch):
+    """端到端：续跑任务引用上一轮出件 → 代投成功，不再「拒绝代投」。"""
+    write_ready(cfg, shared)
+    w243 = _mk_task_dir(shared, 243)
+    w245 = _mk_task_dir(shared, 245)
+    p = w243 / "output" / "这次真行.pptx"
+    p.write_bytes(b"fake")
+    monkeypatch.setattr(av.exec_relay, "poll",
+                        lambda tid: {"id": 243, "workdir": str(w243)},
+                        raising=False)
+    s = sess_of(av)
+    row = {"id": 245, "workdir": str(w245), "resume_from": 243,
+           "result": '```send_file\n{"path": "%s"}\n```' % p}
+    av._send_result(s, row)
+    assert any("[file]" in c and "这次真行.pptx" in c for _, c in av.dws.sent)
+
+
+def test_send_result_still_refuses_other_users_task(av, cfg, shared,
+                                                    monkeypatch):
+    """不放开 tasks/ 根：无关任务的出件仍拒（标记路径可被用户输入间接诱导）。"""
+    write_ready(cfg, shared)
+    mine = _mk_task_dir(shared, 270)
+    other = _mk_task_dir(shared, 271)
+    secret = other / "output" / "别人的件.xlsx"
+    secret.write_bytes(b"x")
+    monkeypatch.setattr(av.exec_relay, "poll",
+                        lambda tid: {"id": tid}, raising=False)
+    s = sess_of(av)
+    row = {"id": 270, "workdir": str(mine),
+           "result": '```send_file\n{"path": "%s"}\n```' % secret}
+    av._send_result(s, row)
+    assert not any("[file]" in c for _, c in av.dws.sent)

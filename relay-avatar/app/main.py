@@ -1205,20 +1205,46 @@ class Avatar:
                 (self.cfg.section("security").get(key) or [])]
 
     def _task_artifact_roots(self, row: dict) -> list:
-        """relay 任务的出件目录：workdir 下的 output/ 与 work/。
+        """relay 任务可代投的出件目录：本任务 + 其 resume 链上各任务的 output/ 与 work/。
 
-        **只给这两个子目录、不给整个 workdir**——workdir 里还有 .baseline.json、
-        .claude/（会话数据）、.xdg/、CLAUDE.md（注入的上下文与知识片段），
-        这些都不该被代投出去。
+        **为什么必须含 resume 链**：会话续跑时新任务的 workdir 是空的，agent 自然
+        引用上一轮已生成的件。2026-09-25 #245（resume 自 #243）的标记指向
+        `tasks/243/output/这次真行.pptx`，只放行当前 workdir 导致三份件全部
+        「拒绝代投：不在可写作用域内」——用户第 7 次收不到文件。
+
+        **只给 output/ 与 work/ 两个子目录、不给整个 workdir**：里面还有
+        .baseline.json、.claude/（会话数据）、.xdg/、CLAUDE.md（注入的上下文与
+        知识片段），都不该被代投出去。
+
+        **也不放开整个 tasks/ 根**：标记路径来自模型输出、可被用户输入间接诱导，
+        放开根目录等于允许把别人任务的出件发给当前会话。故严格沿 resume_from
+        逐跳回溯（限 6 跳，防环与防拖慢）。
         """
-        w = str((row or {}).get("workdir") or "").strip()
-        if not w:
-            return []
-        out = []
-        for sub in ("output", "work"):
-            p = os.path.realpath(os.path.join(w, sub))
-            if os.path.isdir(p):
-                out.append(p)
+        out: list = []
+        seen_dirs: set = set()
+        seen_tids: set = set()
+        cur = row if isinstance(row, dict) else {}
+        for _ in range(6):
+            w = str(cur.get("workdir") or "").strip()
+            if w:
+                for sub in ("output", "work"):
+                    p = os.path.realpath(os.path.join(w, sub))
+                    if p not in seen_dirs and os.path.isdir(p):
+                        seen_dirs.add(p)
+                        out.append(p)
+            nxt = cur.get("resume_from")
+            if not nxt:
+                break
+            key = str(nxt)
+            if key in seen_tids:
+                break                                  # 防环
+            seen_tids.add(key)
+            try:
+                cur = self.exec_relay.poll(nxt) or {}
+            except Exception:
+                break
+            if not isinstance(cur, dict):
+                break
         return out
 
     def _consume_send_markers(self, result: str, s: dict, tid, uid: str,
