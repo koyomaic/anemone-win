@@ -282,3 +282,32 @@ def test_plan_permission_gate(avatar):
                          "description": "y"}, s, uid="999")
     assert not avatar.exec_relay.created
     assert "权限" in "\n".join(texts(avatar))
+
+
+def test_exec_relay_plan_audit_real(cfg):
+    """回归：真实 ExecRelay + 真实 Audit（此前用假 exec 漏掉了 audit.log 非法 kwarg 崩溃）。"""
+    from app.audit import Audit
+    from app.exec_relay import ExecRelay
+    from app.storage import Storage
+
+    class StubRelay:
+        configured = True
+
+        def create_plan(self, n, c, a):
+            return {"id": 1, "name": n, "on_calendar": c, "enabled": True, "next_run": 0}
+
+        def list_plans(self):
+            return {"plans": []}
+
+        def patch_plan(self, pid, f):
+            return {"ok": True}
+
+        def delete_plan(self, pid):
+            return {"ok": True}
+
+    ex = ExecRelay(cfg, StubRelay(), Storage(cfg), Audit(cfg.state))
+    ex.create_plan("x", "*-*-* 08:00:00", {"type": "task", "description": "d"}, uid="18434")
+    ex.patch_plan(1, {"enabled": False}, uid="18434")
+    ex.delete_plan(1, uid="18434")
+    lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "plan_create" in lines and "plan_update" in lines and "plan_delete" in lines
