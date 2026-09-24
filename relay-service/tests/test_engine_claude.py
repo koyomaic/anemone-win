@@ -336,3 +336,30 @@ exit 0
     t = wait_task(base, tok, tid, timeout=60)
     assert t["status"] in ("review", "done"), t
     assert t["result"] == "all good" and t["engine"] == "claude" and t["tokens"] == 3
+
+
+def test_claude_engine_e2e_oversized_stream_line(relay_factory, tmp_path):
+    """单行 stream-json 远超 asyncio 默认 64KB 缓冲时不得崩任务。
+
+    回归守护：executor 未给 create_subprocess_exec 传 limit 时，readline() 抛
+    ValueError('Separator is found, but chunk is longer than limit')，任务以
+    internal error 失败（生产实测任务 #195）。大工具结果/长文本块/内联图片都会触发。
+    """
+    script = tmp_path / "fake_claude_big.sh"
+    script.write_text("""#!/bin/sh
+printf '%s\\n' '{"type":"system","subtype":"init","session_id":"ses_big"}'
+BIG=$(head -c 200000 /dev/zero | tr '\\0' 'x')
+printf '{"type":"result","subtype":"success","session_id":"ses_big","result":"%s","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":2}}\\n' "$BIG"
+exit 0
+""")
+    script.chmod(0o755)
+    r = relay_factory(engine="claude", agent_bin=str(script), task_timeout=60)
+    base = r["base"]
+    admin_c = httpx.Client(base_url=base, headers={"Authorization": "Bearer admin-test"},
+                           timeout=30)
+    tok = admin_c.post("/users", json={"name": "big"}).json()["token"]
+    tid = submit(base, tok, "读一个很大的东西")["task_id"]
+    t = wait_task(base, tok, tid, timeout=60)
+    assert "Separator" not in str(t.get("error") or ""), t
+    assert t["status"] in ("review", "done"), t
+    assert str(t.get("result") or "").startswith("x" * 1000)

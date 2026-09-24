@@ -19,6 +19,10 @@ from . import shared_knowledge
 _ENV_DROP_PREFIXES = ("RELAY_",)
 _ENV_DROP_EXACT = {"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GITLAB_TOKEN", "NPM_TOKEN"}
 
+# 子进程 stdout 的 StreamReader 缓冲上限。asyncio 默认 2**16=64KB，对 stream-json
+# 远远不够（单行含大工具结果/长文本/内联图片时 readline() 抛 ValueError 致任务失败）。
+_STREAM_LIMIT = 64 * 1024 * 1024
+
 
 def _scrubbed_environ() -> dict:
     return {k: v for k, v in os.environ.items()
@@ -241,6 +245,11 @@ class Executor:
             cwd=workdir,
             env=env,
             start_new_session=True,
+            # stream-json 单行可远超 asyncio 默认 64KB(2**16) 缓冲：大工具结果、
+            # 长文本块、内联图片都会撑爆，readline() 直接抛
+            # ValueError('Separator is found, but chunk is longer than limit')，
+            # 任务以 internal error 失败（实测任务 #195）。放宽到 64MB。
+            limit=_STREAM_LIMIT,
         )
         parse = _parse_opencode if self.cfg.engine == "opencode" else _parse_claude
         res = AgentResult()
