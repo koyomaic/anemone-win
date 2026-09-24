@@ -352,17 +352,28 @@ class DB:
 
     def create_task(self, *, user: str, description: str, project: str = "",
                     targets: list[str] | None = None, priority: str = "normal",
-                    resume_from: int | None = None, read_only: bool = False) -> int:
+                    resume_from: int | None = None, read_only: bool = False,
+                    status: str = "queued", engine: str = "",
+                    started_at: float | None = None) -> int:
+        """建任务行。
+
+        status/engine/started_at 供 local 影子记录用：avatar 的 local 通路在本机
+        跑 claude，relay 不执行它，但要让它在任务列表里**可见**（否则 local 任务
+        无 task_id、看板与 /tasks 全查不到，出事故只能翻 journal+audit+state.json
+        三处对账）。影子记录直接以 status='running'、engine='local' 落库，
+        **绝不进调度器**，故不占 max_concurrent 额度（/health 的 active 取
+        sched.active，是调度器进程内计数，非 DB 查询）。
+        """
         args = (user, description, project, json.dumps(targets or [], ensure_ascii=False),
-                priority, resume_from, read_only, time.time())
+                priority, resume_from, read_only, status, engine, started_at,
+                time.time())
+        sql = ('INSERT INTO tasks("user", description, project, targets, priority,'
+               ' resume_from, read_only, status, engine, started_at, created_at)'
+               " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         if self._pg:
-            row = self._q(
-                'INSERT INTO tasks("user", description, project, targets, priority, resume_from, read_only, created_at)'
-                " VALUES(?, ?, ?, ?, ?, ?, ?, ?) RETURNING id", args, one=True)
+            row = self._q(sql + " RETURNING id", args, one=True)
             return row["id"]
-        self._q(
-            'INSERT INTO tasks("user", description, project, targets, priority, resume_from, read_only, created_at)'
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?)", args)
+        self._q(sql, args)
         rows, _ = self._run("SELECT last_insert_rowid() AS id")
         return rows[0]["id"]
 
@@ -393,7 +404,15 @@ class DB:
         return [_row_to_task(r) for r in rows]
 
     def active_tasks(self) -> list[dict]:
-        rows = self._q("SELECT * FROM tasks WHERE status IN ('queued', 'running', 'pending_approval') ORDER BY id")
+        """在途任务（冲突检测用）。
+
+        排除 engine='local' 的影子记录：local 通路只写 local_write_dirs 作用域内的
+        文本件、且不做 baseline 快照，其 changed_files 只能由 agent 自报（不可信），
+        拿它参与 targets 重叠判定只会产生假信号。
+        """
+        rows = self._q("SELECT * FROM tasks WHERE status IN"
+                       " ('queued', 'running', 'pending_approval')"
+                       " AND engine != 'local' ORDER BY id")
         return [_row_to_task(r) for r in rows]
 
     def tasks_with_file(self, rel_file: str, exclude: int,
@@ -438,6 +457,18 @@ class DB:
         ph = ",".join("?" * len(states))
         rows = self._q(f"SELECT * FROM tasks WHERE status IN ({ph}) AND created_at < ? ORDER BY created_at",
                        (*states, cutoff))
+        return [_row_to_task(r) for r in rows]
+
+    def stale_local_tasks(self, cutoff: float) -> list[dict]:
+        """engine='local' 且仍 running、created_at 早于 cutoff 的影子记录。
+
+        avatar 崩溃或被 kill 时来不及回报终态，影子记录会永远停在 running。
+        这是唯一能发现它的地方——local 任务没有 workdir、没有 baseline、
+        relay 也不执行它，sweep 不兜就是一条永久 running 的僵尸行。
+        """
+        rows = self._q("SELECT * FROM tasks WHERE engine = 'local'"
+                       " AND status = 'running' AND created_at < ?"
+                       " ORDER BY created_at", (cutoff,))
         return [_row_to_task(r) for r in rows]
 
     def mark_stale_done(self, task_id: int, marker: str) -> bool:

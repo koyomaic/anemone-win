@@ -235,6 +235,8 @@ class FakeExec:
 
     def __init__(self):
         self.submitted = []
+        self.shadows = []          # local 影子记录
+        self.local_status = []     # 影子记录终态回报
 
     def available(self):
         return True
@@ -243,6 +245,16 @@ class FakeExec:
         tid = len(self.submitted) + 1
         self.submitted.append({"tid": tid, "desc": desc, "uid": uid})
         return {"task_id": tid, "status": "queued"}
+
+    def create_local_record(self, desc, uid=""):
+        tid = 900 + len(self.shadows) + 1
+        self.shadows.append({"tid": tid, "desc": desc, "uid": uid})
+        return {"task_id": tid, "status": "running", "backend": "local"}
+
+    def report_local_status(self, tid, status, uid="", result="", error=""):
+        self.local_status.append({"tid": tid, "status": status, "uid": uid,
+                                  "result": result, "error": error})
+        return {"task_id": tid, "status": status, "already_terminal": False}
 
     def poll(self, tid):
         return {"id": tid, "status": "queued"}
@@ -287,8 +299,11 @@ def test_flush_routes_to_local(av, cfg, shared):
     av.exec_local = FakeExecLocal()
     s = sess_of(av)
     av._flush(s, uid="200")
-    assert s["state"] == "LOCAL" and s["task_id"] is None
-    assert av.exec_relay.submitted == []           # 没走 relay
+    # task_id 现在是**影子记录**号（只登记不派发），不再是 None；
+    # 但仍未走 relay 执行通路（submitted 为空）。
+    assert s["state"] == "LOCAL" and s["task_id"] == 901
+    assert av.exec_relay.submitted == []           # 没走 relay 执行
+    assert len(av.exec_relay.shadows) == 1         # 建了影子记录
     assert wait_local(s) is not None
     av._drain_local()
     assert s["state"] == "IDLE"
@@ -646,3 +661,98 @@ def test_html_task_still_uses_local(av, cfg, shared):
 ])
 def test_needs_bash_backend(text, want):
     assert needs_bash_backend(text) is want
+
+
+# ── F. local 影子记录（任务列表可见性）──
+# 缺陷：local 任务无 relay task_id → 任务列表/看板/`/tasks` 全查不到。
+# 2026-09-24 毕倩那条就是靠翻 journal + audit.log + state.json 三处对账才拼出真相。
+# 影子记录只登记不派发：relay 不执行它、不占 max_concurrent（/health 的 active
+# 取 sched.active，是调度器进程内计数），终态由 avatar 回报，avatar 死了由
+# relay 的 sweep_stale 兜底判 failed。
+
+def test_shadow_record_created_on_local_start(av, cfg, shared):
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    assert len(av.exec_relay.shadows) == 1
+    assert av.exec_relay.shadows[0]["desc"] == "统计门店日销"
+    assert s["task_id"] == 901
+
+
+def test_shadow_reported_done_with_result(av, cfg, shared):
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": "结论正文", "escalate": False})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    rep = av.exec_relay.local_status
+    assert len(rep) == 1
+    assert rep[0]["tid"] == 901 and rep[0]["status"] == "done"
+    assert rep[0]["result"] == "结论正文"
+    assert s["task_id"] is None                    # 回报后摘掉，避免被误轮询
+
+
+def test_shadow_reported_cancelled_before_escalate(av, cfg, shared):
+    """升级 relay 时必须**先**报影子记录终态——_flush 会覆盖 task_id，晚了就丢。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": "", "escalate": True})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    rep = av.exec_relay.local_status
+    assert len(rep) == 1
+    assert rep[0]["tid"] == 901 and rep[0]["status"] == "cancelled"
+    assert "升级 relay" in rep[0]["error"]
+    # 影子记录已摘掉，s["task_id"] 现在是真 relay 任务号
+    assert s["state"] == "RUNNING" and s["task_id"] == 1
+    assert len(av.exec_relay.submitted) == 1
+
+
+def test_shadow_reported_failed_on_reap(av, cfg, shared):
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av)
+    s["task_id"] = 901                             # 模拟已有影子记录
+    av._reap_stale_local()
+    rep = av.exec_relay.local_status
+    assert len(rep) == 1
+    assert rep[0]["tid"] == 901 and rep[0]["status"] == "failed"
+    assert "中断" in rep[0]["error"]
+    # 改投 relay 后 task_id 换成真任务号
+    assert s["state"] == "RUNNING" and s["task_id"] == 1
+
+
+def test_shadow_failure_does_not_block_local(av, cfg, shared):
+    """建影子记录失败（relay 不可达）不得阻断 local 执行——可见性是增益不是前提。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": "结论", "escalate": False})
+
+    def boom(desc, uid=""):
+        raise OSError("relay unreachable")
+    av.exec_relay.create_local_record = boom
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    assert s["state"] == "LOCAL" and s["task_id"] is None
+    assert wait_local(s) is not None               # 照常执行
+    av._drain_local()
+    assert any("结论" in c for _, c in av.dws.sent)   # 照常回话
+    assert av.exec_relay.local_status == []        # 无影子记录则不回报
+
+
+def test_poll_sessions_skips_local_shadow(av, cfg, shared):
+    """_poll_sessions 只管 RUNNING/WAIT_*，不得去轮询 LOCAL 的影子记录
+    （relay 不执行它，轮询只会永远看到 running）。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    assert s["state"] == "LOCAL" and s["task_id"] == 901
+    polled = []
+    av.exec_relay.poll = lambda tid: polled.append(tid) or {"id": tid,
+                                                            "status": "running"}
+    av._poll_sessions()
+    assert polled == []                            # 没去轮询
+    assert s["state"] == "LOCAL"                   # 态未被改

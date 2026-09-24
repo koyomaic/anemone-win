@@ -745,14 +745,29 @@ class Avatar:
                                + 60)
         s["notified_followup"] = False
         self._swap_ack(s, "")
+        # 影子记录：让 local 任务在 relay 任务列表/看板可见（否则无 task_id，
+        # 出事故只能翻 journal+audit+state.json 三处对账）。建记录失败**不阻断**
+        # local 执行——降级回今天的无记录行为，可见性不该成为可用性前提。
+        rec = {}
+        try:
+            rec = self.exec_relay.create_local_record(desc, uid)
+        except Exception as e:
+            log("local shadow record failed:", repr(e)[:120])
+        if "_error" not in rec and rec.get("task_id"):
+            s["task_id"] = rec["task_id"]
+        else:
+            s["task_id"] = None
         self.st.archive_round(f"local-{uid}", "submit", {
             "desc": desc[:500], "backend": "local",
+            "shadow_task_id": s.get("task_id"),
             "tier": self.policy.get_level(uid),
             "sandbox": cons.get("sandbox", ""),
+            "write_dirs": list(cons.get("write_dirs") or []),
             "add_dirs": list(cons.get("add_dirs") or [])})
         threading.Thread(target=self._local_worker,
                          args=(s, uid, desc, biz), daemon=True).start()
-        log(f"local task started for {uid} (tier={cons['tier']})")
+        log(f"local task started for {uid} (tier={cons['tier']}"
+            + (f", shadow=#{s['task_id']})" if s.get("task_id") else ", no shadow)"))
         return True
 
     def _local_worker(self, s: dict, uid: str, desc: str, biz: str):
@@ -805,6 +820,11 @@ class Avatar:
                 why = str(r.get("error") or "")[:60]
                 log(f"local task escalate→relay for {uid}"
                     + (f" ({why})" if why else ""))
+                # 必须在 _flush 之前回报：_flush 会把 s["task_id"] 覆盖成新 relay
+                # 任务号，晚了就找不到影子记录、留一条永久 running 的僵尸行。
+                self._report_local(s, "cancelled", uid=uid,
+                                   error="升级 relay 门禁"
+                                         + (f"：{why}" if why else ""))
                 self._flush(s, uid=uid, force_relay=True)
                 continue
             s["state"] = "IDLE"
@@ -814,6 +834,7 @@ class Avatar:
             s["local_started"] = 0
             s["local_deadline"] = 0
             s["local_reap_count"] = 0
+            self._report_local(s, "done", uid=uid, result=out)
             self.st.archive_round(f"local-{uid}", "done",
                                   {"backend": "local", "chars": len(out),
                                    "out": out[:500]})
@@ -830,6 +851,27 @@ class Avatar:
                 s["state"] = "FOLLOWUP"        # 交 _tick 的 due() 正常 flush
                 s["deadline"] = time.time() + 1
 
+    def _report_local(self, s: dict, status: str, uid: str = "",
+                      result: str = "", error: str = ""):
+        """回报 local 影子记录终态并摘掉 task_id。
+
+        无影子记录（建记录时 relay 不可达）则静默跳过——可见性是增益，
+        不能反过来成为 local 通路的可用性前提。
+        回报失败只记日志不抛：relay 侧有 sweep_stale 兜底（超 local_stale_minutes
+        未回报即判 failed），不会因为一次网络抖动就把会话态搞坏。
+        """
+        tid = s.get("task_id")
+        if not tid:
+            return
+        s["task_id"] = None
+        try:
+            r = self.exec_relay.report_local_status(tid, status, uid=uid,
+                                                    result=result, error=error)
+            if "_error" in r:
+                log(f"local status report #{tid} -> {r.get('_error')}")
+        except Exception as e:
+            log(f"local status report #{tid} failed:", repr(e)[:120])
+
     def _reap_local(self, key: str, s: dict, reason: str):
         """清理已死的 LOCAL 态会话：改投 relay（持久、可轮询、跨重启存活）+ 如实回执。
 
@@ -844,16 +886,20 @@ class Avatar:
         desc = str(s.get("local_desc") or "").strip()
         uid = s.get("uid") or ""
         n = int(s.get("local_reap_count") or 0)
+        why = ("服务重启" if reason == "restart" else "执行超时")
         s["state"] = "IDLE"
         s["local_result"] = None
         s["local_deadline"] = 0
         s["local_reap_count"] = n + 1
+        # 影子记录标 failed。必须在 _flush 之前——_flush 会覆盖 s["task_id"]。
+        # 三个分支（无 desc／重投护栏／正常改投）都要报，故放在分支之前。
+        self._report_local(s, "failed", uid=uid,
+                           error=f"local 任务中断（{why}），未产出结果")
         self.audit.log("local_reaped", uid,
                        f"conv={key} reason={reason} resubmit={n + 1} "
                        f"started={s.get('local_started')}",
                        backend="local")
         log(f"reaping stale LOCAL session {key} (reason={reason})")
-        why = ("服务重启" if reason == "restart" else "执行超时")
         if not desc:
             self._notify_session(
                 s, f"⚠️ 上一条任务因{why}中断，且未留存任务内容，"

@@ -67,6 +67,24 @@ class RelayClient:
     def cancel(self, tid) -> dict:
         return self.req("POST", f"/tasks/{tid}/cancel")
 
+    # ---- local 影子记录（只登记不派发，让 local 任务在任务列表可见）----
+
+    def create_local_record(self, description: str) -> dict:
+        """建 local 影子记录。relay 不执行它，终态由 report_local_status 回报。"""
+        return self.req("POST", "/tasks",
+                        {"description": description, "priority": "normal",
+                         "project": "avatar-local", "backend": "local"})
+
+    def report_local_status(self, tid, status: str, result: str = "",
+                            error: str = "", tokens: int = 0,
+                            cost: float = 0.0,
+                            changed_files: list | None = None) -> dict:
+        """回报 local 影子记录终态（幂等；relay 侧拒绝从终态再转）。"""
+        return self.req("POST", f"/tasks/{tid}/local_status",
+                        {"status": status, "result": result, "error": error,
+                         "tokens": tokens, "cost": cost,
+                         "changed_files": changed_files or []})
+
     # ---- 计划（定时任务）----
 
     def create_plan(self, name: str, on_calendar: str, action: dict) -> dict:

@@ -54,6 +54,25 @@ class ExecRelay:
                        backend=self.name, task_id=tid)
         return r
 
+    # ---- local 影子记录：只登记不派发，让 local 任务在任务列表可见 ----
+
+    def create_local_record(self, desc: str, uid: str = "") -> dict:
+        r = self.relay.create_local_record(desc)
+        if "_error" not in r:
+            self.audit.log("local_shadow", uid, f"#{r.get('task_id')}",
+                           backend="local", task_id=r.get("task_id"))
+        return r
+
+    def report_local_status(self, tid, status: str, uid: str = "",
+                            result: str = "", error: str = "") -> dict:
+        """回报影子记录终态。relay 侧幂等且拒绝从终态再转，故重试安全。"""
+        r = self.relay.report_local_status(tid, status, result=result[:4000],
+                                           error=error[:300])
+        if "_error" not in r:
+            self.audit.log("local_status", uid, f"#{tid} {status}",
+                           backend="local", task_id=tid)
+        return r
+
     # ---- 计划（定时任务）：声明存 relay 本机库，root 侧 tick 到点触发 ----
 
     def create_plan(self, name: str, on_calendar: str, action: dict,

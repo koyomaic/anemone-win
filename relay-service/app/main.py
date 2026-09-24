@@ -88,6 +88,7 @@ td.desc{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 .running{background:#164e63;color:#67e8f9}.queued{background:#334155;color:#cbd5e1}
 .failed{background:#7f1d1d;color:#fca5a5}.conflict{background:#78350f;color:#fcd34d}
 .cancelled{background:#334155;color:#94a3b8}.pending_approval{background:#713f12;color:#fde047}
+.local{background:#3b0764;color:#d8b4fe}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 </style></head><body><div class="wrap">
 <header><h1>团队中转服务 <sub id="upd"></sub></h1>
@@ -182,7 +183,7 @@ async function refresh(){
      const bc=t.blocked_cmd||t.error||"";
      const act=blocked?`<a href="#" class="act" data-k="appr" data-n="${t.id}" title="${esc(bc)}" style="color:#4ade80">批准</a>
       <a href="#" class="act" data-k="deny" data-n="${t.id}" style="color:#f87171">拒绝</a>`:"";
-     return `<tr><td>${t.id}</td><td>${esc(t.user)}</td><td>${badge(t.status)}</td>
+     return `<tr><td>${t.id}</td><td>${esc(t.user)}</td><td>${badge(t.status)}${t.engine==="local"?` <span class="b local" title="本机 local 通路：作用域写（仅 report/work 文本件）、无 Bash、不过门禁审批、无 baseline 快照；changed_files 为 agent 自报、未经核验">local</span>`:""}</td>
     <td style="font-size:12px;color:#94a3b8" title="${esc(t.error||'')}">${esc((t.error||'').slice(0,24))}</td>
     <td class="desc" title="${esc(t.description)}">${esc(t.description)}</td>
     <td>${fmtT(t.created_at)}</td><td>${fmtT(t.finished_at)}</td><td class="num">${t.tokens||0}</td>
@@ -481,6 +482,19 @@ class NewTask(BaseModel):
     force: bool = False
     read_only: bool = False  # 纯读声明：跳过事前防碰；事后若发现文件改动仍会置 conflict
     resume_from: int | None = None
+    # relay=正常派发执行（默认）；local=只建**影子记录**不派发——调用方（avatar）
+    # 在自己进程里跑 claude，relay 仅负责让它在任务列表可见、可查状态变更历史。
+    backend: str = "relay"
+
+
+class LocalStatus(BaseModel):
+    """local 影子记录的状态回报（avatar → relay）。"""
+    status: str                       # done | failed | cancelled
+    result: str = ""
+    error: str = ""
+    tokens: int = 0
+    cost: float = 0.0
+    changed_files: list[str] = Field(default_factory=list)  # agent 自报，未核验
 
 
 class NewUser(BaseModel):
@@ -598,6 +612,10 @@ def _launch_boot(boot: str) -> tuple[bool, str]:
 def sweep_stale(db, bus, audit, cfg, ws) -> list[int]:
     """把停留超时（created_at 早于阈值）的 review/待审批 任务自动置为 done 并标记。
 
+    另兜 local 影子记录的孤儿：avatar 崩溃/被 kill 时来不及回报终态，记录会永远
+    停在 running，超 local_stale_minutes 即判 failed（否则任务列表里挂一条僵尸行，
+    谁也看不出它是死了还是在跑）。
+
     返回被清扫的 task_id 列表。
     """
     cutoff = time.time() - cfg.stale_timeout_hours * 3600
@@ -609,6 +627,14 @@ def sweep_stale(db, bus, audit, cfg, ws) -> list[int]:
                        f"停留超过 {cfg.stale_timeout_hours:g}h，超时自动done")
             ws.cleanup_terminal(t)
             swept.append(t["id"])
+    lcut = time.time() - cfg.local_stale_minutes * 60
+    for t in db.stale_local_tasks(lcut):
+        err = (f"avatar 未回报（running 超过 {cfg.local_stale_minutes:g} 分钟），"
+               f"判为进程重启或崩溃所致")
+        db.set(t["id"], status="failed", finished_at=time.time(), error=err)
+        bus.publish(t["id"], t="status", s="failed", error=err)
+        audit.line(t["id"], t["user"], "local_orphan_swept", err)
+        swept.append(t["id"])
     return swept
 
 
@@ -985,6 +1011,22 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     async def submit_task(body: NewTask, principal: dict = Depends(auth)):
         if body.priority not in ("normal", "urgent"):
             raise HTTPException(status_code=422, detail="priority must be normal|urgent")
+        if body.backend not in ("relay", "local"):
+            raise HTTPException(status_code=422, detail="backend must be relay|local")
+        if body.backend == "local":
+            # 影子记录：只登记不派发。**绝不调 sched.submit**——relay 不执行它，
+            # 它也没有 workdir/baseline。直接以 running 落库，终态由 avatar 经
+            # POST /tasks/{id}/local_status 回报；avatar 若死掉由 sweep_stale 兜底。
+            task_id = db.create_task(
+                user=principal["name"], description=body.description,
+                project=body.project or "avatar-local", targets=[],
+                priority=body.priority, resume_from=None, read_only=True,
+                status="running", engine="local", started_at=time.time())
+            audit.line(task_id, principal["name"], "submit_local",
+                       body.description[:120])
+            bus.publish(task_id, t="status", s="running")
+            return {"task_id": task_id, "status": "running",
+                    "backend": "local", "warnings": None}
         if body.resume_from is not None and not db.task(body.resume_from):
             raise HTTPException(status_code=404, detail="resume_from task not found")
         read_only = body.read_only or _declares_read_only(body.description)
@@ -1048,6 +1090,45 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             return {"task_id": task_id, "status": "cancelling"}
         raise HTTPException(status_code=409,
                             detail=f"task already {row['status']}, cannot cancel")
+
+    @app.post("/tasks/{task_id}/local_status")
+    async def local_status(task_id: int, body: LocalStatus,
+                           principal: dict = Depends(auth)):
+        """local 影子记录的终态回报（avatar → relay）。
+
+        幂等：已是终态则原样返回、不重复写——avatar 重试与 sweep_stale 兜底可能
+        并发到达，谁先落谁算，后者不得覆盖（否则一次崩溃会被记成两种结局）。
+        只接受 engine='local' 的记录：普通 relay 任务的状态由 executor 自己写，
+        外部不得改。
+        """
+        row = db.task(task_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="task not found")
+        if row.get("engine") != "local":
+            raise HTTPException(status_code=409,
+                                detail="not a local shadow record")
+        if body.status not in ("done", "failed", "cancelled"):
+            raise HTTPException(status_code=422,
+                                detail="status must be done|failed|cancelled")
+        if row["status"] in ("done", "failed", "cancelled", "conflict"):
+            return {"task_id": task_id, "status": row["status"],
+                    "already_terminal": True}
+        fields: dict = {"status": body.status, "finished_at": time.time()}
+        if body.result:
+            fields["result"] = body.result
+        if body.error:
+            fields["error"] = body.error
+        if body.tokens:
+            fields["tokens"] = body.tokens
+        if body.cost:
+            fields["cost"] = body.cost
+        if body.changed_files:      # agent 自报，未经 baseline 核验
+            fields["changed_files"] = body.changed_files
+        db.set(task_id, **fields)
+        audit.line(task_id, principal["name"], "local_status", body.status)
+        bus.publish(task_id, t="status", s=body.status)
+        return {"task_id": task_id, "status": body.status,
+                "already_terminal": False}
 
     @app.post("/tasks/{task_id}/confirm")
     async def confirm_task(task_id: int, body: ConfirmBody, _: dict = Depends(auth)):

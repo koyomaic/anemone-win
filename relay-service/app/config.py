@@ -92,6 +92,10 @@ class Settings:
     dashboard_password: str = ""
     event_history_max: int = 500
     stale_timeout_hours: float = 24.0   # review/待审批 停留超时 → 自动 done
+    # local 影子记录超期未回报 → 判 failed。默认 15min：avatar 侧 local 硬截止是
+    # reply_timeout_sec(600) + 60s 宽限 ≈ 11min，留 4min 余量给回报本身，
+    # 既不会抢在 avatar 正常回报前误判，也不会让僵尸行挂太久。
+    local_stale_minutes: float = 15.0
     sweep_interval_sec: float = 300.0   # 超时清扫周期
     blocked_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_PATTERNS))
     rm_safe_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_RM_SAFE_PREFIXES))
@@ -129,6 +133,7 @@ class Settings:
             xdg_config_home=os.environ.get("RELAY_XDG_CONFIG_HOME", ""),
             dashboard_password=os.environ.get("RELAY_DASHBOARD_PASSWORD", ""),
             stale_timeout_hours=float(os.environ.get("RELAY_STALE_TIMEOUT_HOURS", "24")),
+            local_stale_minutes=float(os.environ.get("RELAY_LOCAL_STALE_MINUTES", "15")),
             sweep_interval_sec=float(os.environ.get("RELAY_SWEEP_INTERVAL_SEC", "300")),
             blocked_patterns=_blocked_patterns_from_env(),
             rm_safe_prefixes=_rm_safe_prefixes_from_env(),
