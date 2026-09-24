@@ -1148,17 +1148,35 @@ def _mk_task_dir(shared, tid=901):
 
 
 def test_task_artifact_roots_only_output_and_work(av, cfg, shared):
-    """只给 output/ 与 work/，不给整个 workdir——workdir 里还有 .claude/（会话数据）、
-    CLAUDE.md（注入上下文）、.baseline.json，都不该被代投出去。"""
+    """只给 output/ 与 work/，不给任务根——根下还有 .claude/（会话数据）、
+    CLAUDE.md（注入上下文）、.xdg/、.baseline.json，都不该被代投出去。"""
     w = _mk_task_dir(shared)
     roots = av._task_artifact_roots({"workdir": str(w)})
-    assert sorted(os.path.basename(r) for r in roots) == ["output", "work"]
-    assert not any(r == os.path.realpath(str(w)) for r in roots)
+    assert os.path.realpath(str(w / "output")) in roots
+    assert os.path.realpath(str(w / "work")) in roots
+    assert os.path.realpath(str(w)) not in roots
 
 
-def test_task_artifact_roots_empty_without_workdir(av, cfg, shared):
+def test_task_artifact_roots_ignores_unreliable_workdir_field(av, cfg, shared):
+    """**不依赖 row["workdir"]**：relay 对续跑任务该字段不可靠——#242/#243/#245
+    三个任务 API 全报 workdir=tasks/242，而 agent 实际把件写进了 tasks/243/output/，
+    tasks/245 目录甚至不存在（2026-09-25 02:17 三份件全被拒、用户第 7 次收不到）。
+    故改为枚举 tasks/ 下实存的 output//work/，row 传什么都不影响结果。"""
+    w = _mk_task_dir(shared, 243)
+    for row in ({}, {"workdir": "/nonexistent/xyz"},
+                {"workdir": str(shared.parent / "tasks" / "242"),
+                 "resume_from": 243}):
+        roots = av._task_artifact_roots(row)
+        assert os.path.realpath(str(w / "output")) in roots, row
+
+
+def test_task_artifact_roots_empty_when_no_tasks_dir(av, cfg, shared):
+    """tasks/ 根不存在时返回空列表，不抛异常（收尾路径抛出会盖掉任务结果）。"""
+    import shutil
+    tr = av._tasks_root()
+    if os.path.isdir(tr):
+        shutil.rmtree(tr)
     assert av._task_artifact_roots({}) == []
-    assert av._task_artifact_roots({"workdir": "/nonexistent/xyz"}) == []
 
 
 def test_send_result_delivers_relay_task_output(av, cfg, shared):
@@ -1221,98 +1239,52 @@ def test_relay_delivery_rule_group_vs_o2o(av, cfg, shared):
     assert "单聊" in r and "发起人" in r          # 无 sender 名时回落通称
 
 
-def test_task_artifact_roots_follows_resume_chain(av, cfg, shared, monkeypatch):
-    """续跑任务的出件在**上一轮**的 workdir 里，必须沿 resume_from 回溯放行。
-
-    2026-09-25 #245（resume 自 #243）的标记指向 tasks/243/output/这次真行.pptx，
-    只放行当前 workdir 导致三份件全部「拒绝代投」——用户第 7 次收不到文件。
-    """
-    w243 = _mk_task_dir(shared, 243)
-    w245 = _mk_task_dir(shared, 245)
-    monkeypatch.setattr(av.exec_relay, "poll",
-                        lambda tid: {"id": 243, "workdir": str(w243)},
-                        raising=False)
-    roots = av._task_artifact_roots({"id": 245, "workdir": str(w245),
-                                     "resume_from": 243})
-    names = sorted(os.path.basename(r) for r in roots)
-    assert names == ["output", "output", "work", "work"]     # 两轮各 output/+work/
-    assert os.path.realpath(str(w243 / "output")) in roots   # 上一轮的出件可代投
-    assert os.path.realpath(str(w245 / "output")) in roots
-
-
-def test_task_artifact_roots_chain_excludes_context_files(av, cfg, shared,
-                                                          monkeypatch):
-    """回溯到的上一轮 workdir 同样只给 output//work/，CLAUDE.md 与 .claude/ 不放行。"""
-    w243 = _mk_task_dir(shared, 243)
-    w245 = _mk_task_dir(shared, 245)
-    monkeypatch.setattr(av.exec_relay, "poll",
-                        lambda tid: {"id": 243, "workdir": str(w243)},
-                        raising=False)
-    roots = av._task_artifact_roots({"id": 245, "workdir": str(w245),
-                                     "resume_from": 243})
-    assert os.path.realpath(str(w243)) not in roots
-    assert not any(r.endswith(".claude") for r in roots)
-
-
-def test_task_artifact_roots_chain_terminates_on_cycle(av, cfg, shared,
-                                                       monkeypatch):
-    """resume 链成环时必须终止（限 6 跳 + tid 去重），否则死循环拖垮收尾。"""
-    w = _mk_task_dir(shared, 250)
-    calls = []
-
-    def cyclic(tid):
-        calls.append(tid)
-        return {"id": tid, "workdir": str(w), "resume_from": 251}
-
-    monkeypatch.setattr(av.exec_relay, "poll", cyclic, raising=False)
-    roots = av._task_artifact_roots({"id": 252, "workdir": str(w),
-                                     "resume_from": 251})
-    assert len(calls) <= 6
-    assert roots
-
-
-def test_task_artifact_roots_poll_failure_degrades(av, cfg, shared, monkeypatch):
-    """回溯时 relay 查询失败不得抛异常（收尾路径抛出会盖掉任务结果）。"""
-    w = _mk_task_dir(shared, 260)
-
-    def boom(tid):
-        raise RuntimeError("relay 挂了")
-
-    monkeypatch.setattr(av.exec_relay, "poll", boom, raising=False)
-    roots = av._task_artifact_roots({"id": 260, "workdir": str(w),
-                                     "resume_from": 259})
-    assert os.path.realpath(str(w / "output")) in roots      # 当前轮仍可用
-
-
-def test_send_result_delivers_resumed_task_output(av, cfg, shared, monkeypatch):
-    """端到端：续跑任务引用上一轮出件 → 代投成功，不再「拒绝代投」。"""
+def test_send_result_delivers_artifact_from_other_task_dir(av, cfg, shared):
+    """端到端：agent 引用**非当前 workdir** 的出件（续跑会话沿用上一轮路径的真实
+    情形）→ 代投成功。这是 2026-09-25 02:17 那次「拒绝代投」的复现与修复验证。"""
     write_ready(cfg, shared)
-    w243 = _mk_task_dir(shared, 243)
-    w245 = _mk_task_dir(shared, 245)
+    _mk_task_dir(shared, 242)                      # API 报的 workdir（本轮）
+    w243 = _mk_task_dir(shared, 243)               # agent 实际写件的地方
     p = w243 / "output" / "这次真行.pptx"
     p.write_bytes(b"fake")
-    monkeypatch.setattr(av.exec_relay, "poll",
-                        lambda tid: {"id": 243, "workdir": str(w243)},
-                        raising=False)
     s = sess_of(av)
-    row = {"id": 245, "workdir": str(w245), "resume_from": 243,
+    row = {"id": 245, "workdir": str(shared.parent / "tasks" / "242"),
+           "resume_from": 243,
            "result": '```send_file\n{"path": "%s"}\n```' % p}
     av._send_result(s, row)
     assert any("[file]" in c and "这次真行.pptx" in c for _, c in av.dws.sent)
 
 
-def test_send_result_still_refuses_other_users_task(av, cfg, shared,
-                                                    monkeypatch):
-    """不放开 tasks/ 根：无关任务的出件仍拒（标记路径可被用户输入间接诱导）。"""
+def test_send_result_refuses_task_context_files_any_task(av, cfg, shared):
+    """放开 tasks/*/output|work 后仍守住：任何任务的 CLAUDE.md（注入上下文与知识
+    片段）、.claude/（会话数据）、.baseline.json 都不得被代投。"""
     write_ready(cfg, shared)
-    mine = _mk_task_dir(shared, 270)
-    other = _mk_task_dir(shared, 271)
-    secret = other / "output" / "别人的件.xlsx"
-    secret.write_bytes(b"x")
-    monkeypatch.setattr(av.exec_relay, "poll",
-                        lambda tid: {"id": tid}, raising=False)
+    w = _mk_task_dir(shared, 280)
     s = sess_of(av)
-    row = {"id": 270, "workdir": str(mine),
-           "result": '```send_file\n{"path": "%s"}\n```' % secret}
-    av._send_result(s, row)
-    assert not any("[file]" in c for _, c in av.dws.sent)
+    for name in ("CLAUDE.md", ".baseline.json", ".claude/settings.json"):
+        f = w / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("内部上下文", encoding="utf-8")
+        av.dws.sent.clear()
+        av._send_result(s, {"id": 280, "workdir": str(w),
+                            "result": '```send_file\n{"path": "%s"}\n```' % f})
+        assert not any("[file]" in c for _, c in av.dws.sent), f"{name} 不该被代投"
+
+
+def test_send_result_refuses_escape_via_task_dir(av, cfg, shared):
+    """tasks/ 下的 `../` 穿越与符号链接逃逸仍被 realpath 归一后拦下。"""
+    write_ready(cfg, shared)
+    w = _mk_task_dir(shared, 281)
+    secret = _mk(str(shared / "secrets" / "cred.env"), "TOPSECRET")
+    link = w / "output" / "leak.env"
+    try:
+        os.symlink(secret, str(link))
+    except OSError:
+        pytest.skip("无法建符号链接")
+    s = sess_of(av)
+    for bad in (str(link), str(w / "output" / ".." / ".." / ".."
+                             / "shared" / "secrets" / "cred.env")):
+        av.dws.sent.clear()
+        av._send_result(s, {"id": 281, "workdir": str(w),
+                            "result": '```send_file\n{"path": "%s"}\n```' % bad})
+        assert not any("[file]" in c for _, c in av.dws.sent), bad

@@ -1205,47 +1205,53 @@ class Avatar:
                 (self.cfg.section("security").get(key) or [])]
 
     def _task_artifact_roots(self, row: dict) -> list:
-        """relay 任务可代投的出件目录：本任务 + 其 resume 链上各任务的 output/ 与 work/。
+        """relay 任务可代投的出件目录：`tasks/*/output` 与 `tasks/*/work`（实存者）。
 
-        **为什么必须含 resume 链**：会话续跑时新任务的 workdir 是空的，agent 自然
-        引用上一轮已生成的件。2026-09-25 #245（resume 自 #243）的标记指向
-        `tasks/243/output/这次真行.pptx`，只放行当前 workdir 导致三份件全部
-        「拒绝代投：不在可写作用域内」——用户第 7 次收不到文件。
+        为什么不用 row["workdir"] + resume 链（第一版做法，实测无效）：
+        relay 对续跑任务的 workdir 字段**不可靠**——#242/#243/#245 三个任务 API 全报
+        workdir=tasks/242，而 agent 实际把件写进了 tasks/243/output/（续跑会话沿用
+        上一轮路径），tasks/245 目录甚至不存在。沿 resume_from 回溯拿到的仍是 242，
+        三份件照样「拒绝代投」（2026-09-25 02:17，用户第 7 次收不到文件）。
 
-        **只给 output/ 与 work/ 两个子目录、不给整个 workdir**：里面还有
-        .baseline.json、.claude/（会话数据）、.xdg/、CLAUDE.md（注入的上下文与
-        知识片段），都不该被代投出去。
+        为什么放开到 tasks/ 下所有任务的 output//work/ 是可接受的：
+        relay 任务本来就有 Bash 且沙箱可读整个 workspace，**机密性边界是 relay 门禁
+        与 systemd 沙箱，不是代投作用域**——代投再窄也挡不住 agent 直接读。
+        （local 通路不同：那边 local_write_dirs 刻意窄，且 send_file 是它唯一的
+        出件通道，故 local 的作用域不在此放宽。）
 
-        **也不放开整个 tasks/ 根**：标记路径来自模型输出、可被用户输入间接诱导，
-        放开根目录等于允许把别人任务的出件发给当前会话。故严格沿 resume_from
-        逐跳回溯（限 6 跳，防环与防拖慢）。
+        仍然守住的两条：
+        · **只给 output/ 与 work/ 子目录**，不给任务根——CLAUDE.md（注入的上下文与
+          知识片段）、.claude/（会话数据）、.xdg/、.baseline.json 一律不可代投；
+        · 只收**实际存在**的目录，且逐个 realpath（符号链接逃逸由 _scoped_path 再兜一层）。
         """
         out: list = []
-        seen_dirs: set = set()
-        seen_tids: set = set()
-        cur = row if isinstance(row, dict) else {}
-        for _ in range(6):
-            w = str(cur.get("workdir") or "").strip()
-            if w:
-                for sub in ("output", "work"):
-                    p = os.path.realpath(os.path.join(w, sub))
-                    if p not in seen_dirs and os.path.isdir(p):
-                        seen_dirs.add(p)
-                        out.append(p)
-            nxt = cur.get("resume_from")
-            if not nxt:
-                break
-            key = str(nxt)
-            if key in seen_tids:
-                break                                  # 防环
-            seen_tids.add(key)
-            try:
-                cur = self.exec_relay.poll(nxt) or {}
-            except Exception:
-                break
-            if not isinstance(cur, dict):
-                break
+        root = self._tasks_root()
+        if not root:
+            return out
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            return out
+        for name in entries:
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            for sub in ("output", "work"):
+                p = os.path.realpath(os.path.join(d, sub))
+                if os.path.isdir(p):
+                    out.append(p)
         return out
+
+    def _tasks_root(self) -> str:
+        """relay 任务工作区根。默认 <store_root 的父>/tasks，可用
+        security.relay_tasks_root 覆盖。"""
+        cfgd = str(self.cfg.get("security", "relay_tasks_root", "") or "").strip()
+        if cfgd:
+            return os.path.realpath(cfgd)
+        try:
+            return os.path.realpath(str(Path(self.cfg.store_root).parent / "tasks"))
+        except Exception:
+            return ""
 
     def _consume_send_markers(self, result: str, s: dict, tid, uid: str,
                               extra_roots: list | None = None):
