@@ -23,6 +23,47 @@ from pathlib import Path
 from .storage import atomic_write_text
 
 
+def send_accepted(r) -> tuple:
+    """判定 dws message send 响应是否「已受理」，返回 (ok, openTaskId, 错误摘要)。
+
+    为什么需要它：Dws.run() 的失败返回形态很多——{"_timeout":True}、{"_error":…}、
+    {"raw":…}（stdout 非 JSON，通常就是报错文本）、{"error":{…}}（dws 业务错误）。
+    而旧判定是
+        ok = bool(r) and "_exc" not in r and r.get("success") is not False
+    它把上述**全部当成成功**：真实成功响应里 success 嵌在 data 下、顶层没有该键，
+    于是 r.get("success") 恒为 None、`is not False` 恒真。结果就是「审计记
+    send_file 成功、用户什么都没收到」，且日志里查不到任何失败痕迹。
+    2026-09-25 用户连续 6 次反馈文件发不出来即此因（叠加提示词仍宣称无 Bash
+    导致格式降级，两个缺陷互相掩盖）。
+
+    注意 ok=True 只代表**受理**：dws 文件发送是异步的（outcome=pending），
+    真到没到要用 send_status(openTaskId) 查 sendStatus。
+    """
+    if not isinstance(r, dict) or not r:
+        return False, "", "空响应"
+    for k in ("_exc", "_error", "_timeout"):
+        if k in r:
+            return False, "", f"{k}={str(r[k])[:110]}"
+    if isinstance(r.get("error"), (dict, str)):
+        e = r["error"]
+        msg = e.get("message") if isinstance(e, dict) else str(e)
+        return False, "", str(msg)[:120]
+    if "raw" in r and r.get("ok") is not True:
+        return False, "", f"非 JSON 响应: {str(r['raw'])[:110]}"
+    data = r.get("data") if isinstance(r.get("data"), dict) else {}
+    if data.get("errorCode"):
+        return False, "", f"{data.get('errorCode')}: {data.get('errorMsg')}"
+    if data.get("success") is False or r.get("ok") is False:
+        return False, "", str(data.get("errorMsg") or "success=false")[:120]
+    if r.get("dry"):
+        return True, "", ""                      # dry-run：视为已处理
+    if r.get("ok") is True or data.get("success") is True:
+        res = data.get("result")
+        tid = str((res or {}).get("openTaskId") or "") if isinstance(res, dict) else ""
+        return True, tid, ""
+    return False, "", "响应无 ok/success 标记"
+
+
 def card_biz_id(resp) -> str:
     """从 card_create 响应提取 bizId（兼容测试桩直接返回字符串）。"""
     if isinstance(resp, str):
@@ -129,6 +170,19 @@ class Dws:
                         self._target_args(target) +
                         ["--msg-type", "file", "--file", path,
                          "-y", "-f", "json"], timeout=120)
+
+    def send_status(self, open_task_id: str) -> dict:
+        """查异步发送的真实投递结果。
+
+        dws 的 message send 是**异步**的：返回 `outcome: "pending"`、
+        `meta.operation.state: "processing"` 与一个 openTaskId，`data.success: true`
+        只代表**请求被受理**，不代表投递成功。要确认真到没到必须查这个端点
+        （响应里的 `next_command` 就是它）。2026-09-25：用户连续 6 次反馈
+        「文件发不出来」，而审计一路记 send_file 成功，就是因为只看了受理态。
+        """
+        return self.run(["chat", "message", "query-send-status",
+                         "--open-task-id", str(open_task_id),
+                         "-y", "-f", "json"], timeout=30)
 
     def react(self, conv_id: str, msg_id: str, emoji: str) -> dict:
         return self.run(["chat", "message", "add-emoji",

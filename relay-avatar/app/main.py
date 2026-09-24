@@ -32,7 +32,7 @@ from app.file_inbox import FileInbox, extract_file_from_event, find_media_ids
 from app.group_watch import GroupWatch, parse_watch_cmd
 from app.ingress_dingtalk import (Dws, EventIngress, InboundHealth, SelfMark,
                                   SelfPoller, SentEcho, card_biz_id,
-                                  md_hardbreak)
+                                  md_hardbreak, send_accepted)
 from app.ingress_relay import RelayClient
 from app.knowledge import Knowledge, parse_learn_cmd
 from app.monitor import Monitor
@@ -1205,14 +1205,38 @@ class Avatar:
                 r = self.dws.send_file(s["reply"], p)
             except Exception as e:
                 r = {"_exc": repr(e)[:120]}
-            ok = bool(r) and "_exc" not in r and r.get("success") is not False
-            self.audit.log("send_file" if ok else "send_failed", uid,
-                           f"{p[:120]} ({os.path.getsize(p)}B)",
+            ok, otid, err = send_accepted(r)
+            # **受理 ≠ 到达**：dws 文件发送是异步的（outcome=pending、
+            # state=processing），data.success=true 只代表请求被受理。必须查
+            # sendStatus 才知道真到没到——2026-09-25 用户连续 6 次反馈「文件
+            # 发不出来」而审计一路记成功，就是只看受理态 + 判定过松叠加的结果。
+            delivered = None
+            if ok and otid:
+                for _ in range(4):
+                    time.sleep(2)
+                    try:
+                        sr = self.dws.send_status(otid)
+                    except Exception:
+                        break
+                    res = sr.get("result") if isinstance(sr, dict) else None
+                    stt = res.get("sendStatus") if isinstance(res, dict) else None
+                    if stt:
+                        delivered = (str(stt).upper() == "SUCCESS")
+                        if not delivered:
+                            err = f"sendStatus={stt}"
+                        break
+            good = ok and delivered is not False
+            tail = (f" 投递={delivered}" if delivered is not None
+                    else (" 受理未确认" if ok else f" err={err[:90]}"))
+            self.audit.log("send_file" if good else "send_failed", uid,
+                           f"{p[:120]} ({os.path.getsize(p)}B){tail}",
                            backend="local", task_id=tid)
-            sent += 1 if ok else 0
-            notes.append(f"📎 已发文件：`{os.path.basename(p)}`" if ok
-                         else f"⚠️ 文件发送失败：`{os.path.basename(p)}` "
-                              f"{str(r.get('_exc') or r.get('errorMsg') or '')[:80]}")
+            sent += 1 if good else 0
+            if good:
+                notes.append(f"📎 已发文件：`{os.path.basename(p)}`"
+                             + ("" if delivered else "（已受理，投递状态未确认）"))
+            else:
+                notes.append(f"⚠️ 文件发送失败：`{os.path.basename(p)}` {err[:80]}")
         return clean, notes
 
     def _consume_delete_markers(self, result: str, s: dict, tid, uid: str):

@@ -825,6 +825,60 @@ def test_send_marker_delivers_and_strips(av, cfg, shared):
     assert any("[file]" in c and p in c for _, c in av.dws.sent)
 
 
+def test_send_marker_confirms_delivery_via_status(av, cfg, shared, monkeypatch):
+    """**受理 ≠ 到达**：响应带 openTaskId 时必须查 sendStatus 确认；确认成功则
+    附注不带「未确认」后缀。dws 文件发送是异步的（outcome=pending），只看受理态
+    就是 2026-09-25「审计记成功、用户没收到」的成因之一。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/y.html", "<html>x</html>")
+    s = sess_of(av)
+    monkeypatch.setattr(av.dws, "send_file", lambda t, path: {
+        "ok": True, "outcome": "pending",
+        "data": {"success": True, "result": {"openTaskId": "T1"}}})
+    calls = []
+
+    def fake_status(tid):
+        calls.append(tid)
+        return {"result": {"sendStatus": "SUCCESS"}, "success": True}
+
+    monkeypatch.setattr(av.dws, "send_status", fake_status, raising=False)
+    monkeypatch.setattr(time, "sleep", lambda _: None)      # 别真等
+    _, notes = av._consume_send_markers(_send_block(p), s, 11, "200")
+    assert calls == ["T1"]                                  # 确实去查了投递状态
+    assert any("已发文件" in n and "未确认" not in n for n in notes)
+
+
+def test_send_marker_reports_delivery_failure(av, cfg, shared, monkeypatch):
+    """sendStatus 非 SUCCESS → 必须如实报失败，不得因为「受理成功」就报已发。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/z.html", "<html>x</html>")
+    s = sess_of(av)
+    monkeypatch.setattr(av.dws, "send_file", lambda t, path: {
+        "ok": True, "outcome": "pending",
+        "data": {"success": True, "result": {"openTaskId": "T2"}}})
+    monkeypatch.setattr(av.dws, "send_status", lambda tid: {
+        "result": {"sendStatus": "FAILED"}, "success": True}, raising=False)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    _, notes = av._consume_send_markers(_send_block(p), s, 12, "200")
+    assert any("发送失败" in n for n in notes)
+    assert any("sendStatus=FAILED" in n for n in notes)
+    assert not any("已发文件" in n for n in notes)
+
+
+def test_send_marker_unconfirmed_delivery_says_so(av, cfg, shared, monkeypatch):
+    """查不到投递状态时如实标「已受理，投递状态未确认」，不谎报成功。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/w.html", "<html>x</html>")
+    s = sess_of(av)
+    monkeypatch.setattr(av.dws, "send_file", lambda t, path: {
+        "ok": True, "data": {"success": True, "result": {"openTaskId": "T3"}}})
+    monkeypatch.setattr(av.dws, "send_status", lambda tid: {"result": {}},
+                        raising=False)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    _, notes = av._consume_send_markers(_send_block(p), s, 13, "200")
+    assert any("已发文件" in n and "未确认" in n for n in notes)
+
+
 def test_send_marker_refuses_out_of_scope(av, cfg, shared):
     """护栏①：作用域外路径一律拒（哪怕文件真实存在）。"""
     _, wd = write_ready(cfg, shared)
