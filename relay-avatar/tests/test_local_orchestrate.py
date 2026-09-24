@@ -408,3 +408,121 @@ def test_defaults_not_aliased_by_config(cfg):
     c2 = C.Config(C._deep_merge(C.DEFAULTS, {}), {}, cfg.state)
     assert c2.get("execution", "l2_backend") == "relay"
     assert c2.get("claude", "permission_mode_l2") == "default"
+
+
+# ── D. LOCAL 态重启/超时清理（2026-09-24 事故回归） ──
+# 事故：11:03 服务重启打断 10:58 起跑的 local 任务。local 通路无 relay task_id，
+# daemon 线程随进程消失，而 state="LOCAL" 已落盘 → _drain_local 永远等不到
+# local_result，_try_local_task 又因 state=="LOCAL" 拒接新任务：会话永久砖化，
+# 用户既拿不到结果、也发不出下一条，且收不到任何失败回执。
+
+def stale_local(av, sid="sid200", text="统计门店日销", uid="200", desc=None,
+                deadline=None, reap=0):
+    """构造上一进程遗留的 LOCAL 态会话（模拟重启后自 state.json 恢复）。"""
+    s = sess_of(av, sid=sid, text=text)
+    s.update(state="LOCAL", task_id=None, local_result=None, uid=uid,
+             local_desc=text if desc is None else desc,
+             local_started=time.time() - 300,
+             local_deadline=(time.time() + 600 if deadline is None
+                             else deadline),
+             buffer=[], followups=[], deadline=0)
+    if reap:
+        s["local_reap_count"] = reap
+    av.dws.sent.clear()
+    return s
+
+
+def test_try_local_task_persists_recovery_metadata(av, cfg, shared):
+    """起跑即落恢复元数据（desc/started/deadline）——重启才有救。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    assert s["state"] == "LOCAL"
+    assert s["local_desc"] == "统计门店日销"
+    assert s["local_started"] > 0
+    assert s["local_deadline"] > s["local_started"]
+
+
+def test_stale_local_reaped_and_resubmitted_on_restart(av, cfg, shared):
+    """重启遗留的 LOCAL 态必须被清理并改投 relay（持久、可轮询、跨重启存活）。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av)
+    av._reap_stale_local()
+    assert s["state"] == "RUNNING"
+    assert len(av.exec_relay.submitted) == 1
+    assert av.exec_relay.submitted[0]["desc"] == "统计门店日销"
+    assert s["task_id"] == 1
+    assert s["local_reap_count"] == 1
+    assert any("中断" in c for _, c in av.dws.sent)      # 如实回执，不静默
+
+
+def test_stale_local_without_desc_asks_resend(av, cfg, shared):
+    """升级兼容：旧版落盘无 local_desc 时不瞎猜内容，请用户重发。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av, desc="")
+    av._reap_stale_local()
+    assert s["state"] == "IDLE"
+    assert av.exec_relay.submitted == []
+    assert any("再发一次" in c for _, c in av.dws.sent)
+
+
+def test_reap_guard_stops_after_two_attempts(av, cfg, shared):
+    """反复中断（崩溃循环）不得无限自动重投，避免任务风暴。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av, reap=2)
+    av._reap_stale_local()
+    assert s["state"] == "IDLE"
+    assert av.exec_relay.submitted == []
+    assert any("不再自动重试" in c for _, c in av.dws.sent)
+
+
+def test_local_deadline_timeout_reaps(av, cfg, shared):
+    """同进程内 worker 卡死/异常退出：超硬截止即判失败并改投 relay。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av, deadline=time.time() - 1)
+    av._drain_local()
+    assert s["state"] == "RUNNING"
+    assert len(av.exec_relay.submitted) == 1
+
+
+def test_local_within_deadline_keeps_waiting(av, cfg, shared):
+    """回归保护：未超截止的在跑 local 任务不得被误清理。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av, deadline=time.time() + 600)
+    av._drain_local()
+    assert s["state"] == "LOCAL"
+    assert av.exec_relay.submitted == []
+
+
+def test_session_not_bricked_after_reap(av, cfg, shared):
+    """清理后会话必须能重新接活（原缺陷：LOCAL 态永久拒接新任务）。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal()
+    s = stale_local(av)
+    av._reap_stale_local()
+    assert s["state"] == "RUNNING"
+    s.update(state="IDLE", task_id=None, buffer=["再来一个"])   # 模拟 relay 任务收尾
+    av._flush(s, uid="200")
+    assert s["state"] == "LOCAL"
+    assert wait_local(s) is not None               # 后台线程异步，必须等
+    assert len(av.exec_local.calls) == 1
+
+
+def test_reap_count_cleared_on_success(av, cfg, shared):
+    """成功收尾必须清零 local_reap_count，否则累计 2 次后永久禁用自动重投。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": "结论正文", "escalate": False})
+    s = sess_of(av)
+    s["local_reap_count"] = 1                      # 曾被清理过一次
+    av._flush(s, uid="200")
+    assert wait_local(s) is not None
+    av._drain_local()
+    assert s["state"] == "IDLE"
+    assert s["local_reap_count"] == 0
+    assert s["local_desc"] == "" and s["local_deadline"] == 0

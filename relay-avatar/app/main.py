@@ -727,6 +727,15 @@ class Avatar:
         s["task_id"] = None
         s["state"] = "LOCAL"
         s["local_result"] = None
+        # 重启恢复元数据。local 通路没有 relay task_id，进程一退 daemon 线程即
+        # 消失，仅凭 state="LOCAL" 无法区分「正在跑」与「上一进程遗留」。落任务
+        # 原文 + 起跑时刻 + 硬截止，供 _reap_local（启动清理／超时兜底）改投 relay。
+        s["local_desc"] = desc
+        s["local_started"] = time.time()
+        s["local_deadline"] = (s["local_started"]
+                               + float(self.cfg.get("claude",
+                                                    "reply_timeout_sec", 600))
+                               + 60)
         s["notified_followup"] = False
         self._swap_ack(s, "")
         self.st.archive_round(f"local-{uid}", "submit", {
@@ -773,6 +782,12 @@ class Avatar:
                 continue
             res = s.get("local_result")
             if not res:
+                # 超时兜底：worker 线程若异常退出或被卡死，local_result 永远为空。
+                # 无限等待会让会话砖化（_try_local_task 见 LOCAL 即拒绝新任务），
+                # 故超过硬截止判失败并改投 relay。
+                dl = float(s.get("local_deadline") or 0)
+                if dl and time.time() > dl:
+                    self._reap_local(key, s, "timeout")
                 continue                       # 仍在跑
             s["local_result"] = None
             r, biz, uid = res["r"], res["biz"], res["uid"]
@@ -786,6 +801,12 @@ class Avatar:
                 self._flush(s, uid=uid, force_relay=True)
                 continue
             s["state"] = "IDLE"
+            # 成功收尾即清恢复元数据：local_reap_count 若只增不减，累计 2 次后
+            # （哪怕中间都成功）会永久禁用自动重投。
+            s["local_desc"] = ""
+            s["local_started"] = 0
+            s["local_deadline"] = 0
+            s["local_reap_count"] = 0
             self.st.archive_round(f"local-{uid}", "done",
                                   {"backend": "local", "chars": len(out),
                                    "out": out[:500]})
@@ -801,6 +822,54 @@ class Avatar:
             if s.get("followups"):
                 s["state"] = "FOLLOWUP"        # 交 _tick 的 due() 正常 flush
                 s["deadline"] = time.time() + 1
+
+    def _reap_local(self, key: str, s: dict, reason: str):
+        """清理已死的 LOCAL 态会话：改投 relay（持久、可轮询、跨重启存活）+ 如实回执。
+
+        为什么必须清理：local 任务跑在 daemon 线程里，进程一退线程即消失，而
+        state="LOCAL" 已落盘。不清理则该会话**永久砖化**——_drain_local 永远等不到
+        local_result，_try_local_task 又因 state=="LOCAL" 拒绝新任务，用户既收不到
+        结果也发不出下一条，且不会收到任何失败回执（2026-09-24 事故：11:03 重启
+        打断 10:58 的任务，用户等待 40+ 分钟无任何下文）。
+
+        reason: restart（启动清理上一进程遗留）| timeout（同进程内超硬截止）。
+        """
+        desc = str(s.get("local_desc") or "").strip()
+        uid = s.get("uid") or ""
+        n = int(s.get("local_reap_count") or 0)
+        s["state"] = "IDLE"
+        s["local_result"] = None
+        s["local_deadline"] = 0
+        s["local_reap_count"] = n + 1
+        self.audit.log("local_reaped", uid,
+                       f"conv={key} reason={reason} resubmit={n + 1} "
+                       f"started={s.get('local_started')}",
+                       backend="local")
+        log(f"reaping stale LOCAL session {key} (reason={reason})")
+        why = ("服务重启" if reason == "restart" else "执行超时")
+        if not desc:
+            self._notify_session(
+                s, f"⚠️ 上一条任务因{why}中断，且未留存任务内容，"
+                   f"麻烦你再发一次。")
+            return
+        if n >= 2:
+            # 反复中断（如崩溃循环）不再自动重投，避免任务风暴；交回人工。
+            self._notify_session(
+                s, f"⚠️ 上一条任务因{why}中断，且已自动重投 2 次仍未跑成，"
+                   f"先不再自动重试。请稍后重发，或联系管理员。")
+            return
+        self._notify_session(
+            s, f"⚠️ 上一条任务因{why}中断，未产出结果。已自动改投持久通道重跑，"
+               f"跑完主动回你。")
+        s["buffer"] = [desc]
+        self._flush(s, uid=uid, force_relay=True)
+
+    def _reap_stale_local(self):
+        """启动时清理上一进程遗留的 LOCAL 态会话（见 _reap_local）。"""
+        for key, s in list(self.sess.sessions.items()):
+            if s.get("state") == "LOCAL":
+                self._reap_local(key, s, "restart")
+        self.sess.save()
 
     # ── 流式卡片（fenshen 样式：叶子+粗体名+引用行；提交即开卡，跳变更新，完成定格） ──
     def _card_open(self, s: dict, tid, desc: str):
@@ -1201,6 +1270,8 @@ class Avatar:
                     s["gate_cmd"] = row.get("blocked_cmd") or ""
                 s["last_reprompt"] = 0
                 self._reprompt(s)
+        # 重启后清理 LOCAL 态遗留会话：改投 relay + 回执（否则会话永久砖化）
+        self._reap_stale_local()
         if self.inject:
             self._run_inject()
             return
