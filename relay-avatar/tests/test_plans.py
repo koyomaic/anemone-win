@@ -145,7 +145,7 @@ def test_create_marker_executed_and_stripped(avatar):
               '{"op":"create","name":"经营日报","on_calendar":"*-*-* 08:00:00",'
               '"description":"生成昨日经营日报并发送给王洪彬","priority":"normal","read_only":false}\n'
               "```")
-    _run_with_result(avatar, "每天8点跑经营日报", result)
+    _run_with_result(avatar, "帮我安排每天8点跑经营日报", result)
     # 执行：create_plan 被调用，参数正确
     assert len(avatar.exec_relay.created) == 1
     name, on_cal, action = avatar.exec_relay.created[0]
@@ -210,7 +210,7 @@ def test_no_marker_normal_flow(avatar):
 
 def test_marker_executed_once_per_task(avatar):
     """review→done 二次回流同一 result：只执行一次（plan_applied 守卫）。"""
-    avatar.on_event(ev("每天8点跑日报", n="1"))
+    avatar.on_event(ev("帮我安排每天8点跑日报", n="1"))
     s = avatar.sess.sessions["o:sid200"]
     avatar._flush(s, uid="200")
     tid = s["task_id"]
@@ -240,6 +240,18 @@ def test_direct_create_does_not_reach_brain(avatar):
     assert avatar.sess.sessions["o:sid200"]["state"] == "IDLE"
     joined = "\n".join(texts(avatar))
     assert "已创建定时计划「跑经营日报」" in joined and "下次" in joined
+
+
+def test_broadened_create_intercepts_before_brain(avatar):
+    """放宽触发：无前缀但句首节奏词+完整钟点 → 进大脑前拦截建计划，绝不提交任务。"""
+    avatar.on_event(ev("每天8点跑经营日报", n="6"))
+    assert len(avatar.exec_relay.created) == 1
+    name, on_cal, action = avatar.exec_relay.created[0]
+    assert name == "跑经营日报" and on_cal == "*-*-* 08:00:00"
+    assert action["type"] == "task" and "经营日报" in action["description"]
+    assert avatar.exec_relay.submitted == []
+    assert avatar.sess.sessions["o:sid200"]["state"] == "IDLE"
+    assert "已创建定时计划「跑经营日报」" in "\n".join(texts(avatar))
 
 
 def test_direct_list(avatar):

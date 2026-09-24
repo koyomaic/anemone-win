@@ -53,10 +53,26 @@ def test_parse_schedule_no_time():
     ("计划停用 巡检", "disable"),
     ("计划启用 巡检", "enable"),
     ("定时 每天8点 跑日报", "create"),
+    # 放宽触发：无前缀，句首节奏词 + 完整可解析
+    ("每天8点跑经营日报", "create"),
+    ("每周一9:30提醒我开会", "create"),
+    ("每隔30分钟检查库存", "create"),
+    ("工作日9点汇总数据", "create"),
+    ("帮我每天8点跑日报", "create"),        # 礼貌前导剥离
+    ("提醒我每天8点喝水", "create"),         # 提醒我作前导
 ])
 def test_parse_plan_cmd(text, cmd):
     r = P.parse_plan_cmd(text)
     assert r and r["cmd"] == cmd
+
+
+def test_parse_plan_cmd_broadened_fields():
+    r = P.parse_plan_cmd("每天8点跑经营日报")
+    assert r["on_calendar"] == "*-*-* 08:00:00"
+    assert r["description"] == "跑经营日报"
+    assert r["name"] == "跑经营日报"
+    r2 = P.parse_plan_cmd("每周一9:30提醒我开会")
+    assert r2["on_calendar"] == "Mon *-*-* 09:30:00"
 
 
 def test_parse_plan_cmd_create_fail():
@@ -71,6 +87,12 @@ def test_parse_plan_cmd_create_fail():
     "统计每天的销量",          # 普通一次性任务，绝不拦
     "查一下今天的日程",
     "你好",
+    # 放宽触发后仍须放行的"像定时却非排期命令"
+    "分析每天8点的成交量",      # 动词开头，每天在句中 → 不拦
+    "每天跑日报",              # daily 缺钟点 → 不拦
+    "看看每周的数据",          # 无具体星期/时间 → 不拦
+    "周一9点开会",             # 无"每"前缀，视为一次性 → 不拦
+    "每天8点",                 # 只有节奏无动作 → 不拦
 ])
 def test_parse_plan_cmd_none(text):
     assert P.parse_plan_cmd(text) is None

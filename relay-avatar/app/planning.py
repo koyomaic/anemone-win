@@ -2,12 +2,17 @@ from __future__ import annotations
 
 """自然语言 → 定时计划（relay-avatar 侧，确定性解析，无 LLM 往返）。
 
-主路径：消息以「定时」或「计划」开头（显式前缀，避免误拦"统计每天的销量"这类一次性活），
-在进大脑之前就地解析建计划——大脑没机会去"当场执行"。
+两条创建路径，都在进大脑之前就地拦截建计划（大脑没机会"当场执行"）：
+  1) 显式前缀「定时/计划」：如「定时 每天8点 跑经营日报」；解析不出会 create_fail 提示。
+  2) 放宽触发（无前缀）：剥离礼貌前导后，句子以节奏词（每天/每周/每月/每隔/每小时/
+     工作日…）开头，且能解析出完整计划（daily/weekly/monthly 等还须带钟点）才拦截；
+     否则一律放行走大脑——故"统计每天的销量""分析每天8点的量"这类动词开头的一次性活
+     不会被误建计划。
 （大脑产 ```plan 标记的兜底路径见 main.py 的 _consume_plan_markers。）
 
-  定时 每天8点 跑经营日报          → 创建
-  计划 每周一9:30 提醒我开会        → 创建
+  定时 每天8点 跑经营日报          → 创建（前缀）
+  每天8点跑经营日报                → 创建（放宽）
+  每周一9:30 提醒我开会            → 创建（放宽）
   计划列表 / 我的计划              → 列表
   计划删除 <name> / 删除计划 <name> → 删除
   计划停用 <name> / 计划启用 <name> → 启停
@@ -36,6 +41,14 @@ MERIDIEM_AM = ("早上", "早晨", "上午", "凌晨", "清晨")
 # 创建意图里"像定时"的提示词（区分 create_fail 与普通任务）
 _HINT = re.compile(r"每天|每日|天天|每周|每月|每隔|工作日|每小时|定时|提醒|"
                    r"\d+\s*点|" + _NUMCLS + r"+点|\d{1,2}[:：]\d{2}")
+
+# 放宽触发（无前缀）：先剥离礼貌/命令前导，再要求句子以"节奏词"开头，
+# 且能解析出完整计划才拦截建计划；否则放行走大脑，避免误伤"统计每天的销量"。
+_LEADIN = re.compile(
+    r"^(?:请|帮我|帮忙|给我|麻烦|然后|就|要|想|来|现在|立刻|马上|顺便|"
+    r"记得|别忘了|提醒我|通知我|叫我)+[\s,，、:：]*")
+_CADENCE_ANCHOR = re.compile(
+    r"^(?:每\s*[天日]|天天|每隔|每\s*小时|每\s*周|每\s*星期|每\s*礼拜|每\s*月|工作日)")
 
 
 def cn2int(s: str) -> int | None:
@@ -235,4 +248,11 @@ def parse_plan_cmd(text: str) -> dict | None:
         if _HINT.search(rest):
             return {"cmd": "create_fail", "reason": "unparsed", "raw": rest}
         return None  # 无定时意图，放行走普通任务
+    # 放宽触发：无前缀，但剥离礼貌前导后以节奏词开头，且能解析出完整计划才拦截；
+    # 解析不出（缺钟点的"每天跑日报"、动词开头的"统计每天的销量"）一律放行走大脑。
+    core = _LEADIN.sub("", t).lstrip()
+    if _CADENCE_ANCHOR.match(core):
+        sch = parse_schedule(core)
+        if sch and not sch.get("error") and sch["description"] != "定时任务":
+            return {"cmd": "create", **sch}
     return None
