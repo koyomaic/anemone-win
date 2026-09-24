@@ -678,7 +678,8 @@ class Avatar:
         if not force_relay and self._try_local_task(s, uid, desc, followup):
             return
         resume = self.sess.resume_candidate(s)
-        r = self.exec_relay.submit(desc, resume_from=resume, uid=uid)
+        r = self.exec_relay.submit(desc + self._relay_delivery_rule(s),
+                                   resume_from=resume, uid=uid)
         if "_error" in r:
             self._notify_session(s, f"⚠️ 提交失败了：{r['_error']} "
                                     f"{str(r.get('_detail', ''))[:120]}，稍后再试～")
@@ -1062,10 +1063,60 @@ class Avatar:
         return ("🚧 任务里有高危操作待审批。\n\n"
                 "回复「确认」放行，「拒绝」终止。")
 
+    def _relay_delivery_rule(self, s: dict) -> str:
+        """附在 relay 任务描述末尾的投递铁律：告知发起人是谁 + 禁止自行发送。
+
+        为什么必须显式写进描述：relay 任务的 CLAUDE.md **不含发起人身份**（#242 的
+        CLAUDE.md 里搜不到任何收件人口径），而 shared/skills/dingtalk-send/SKILL.md
+        明写「本技能里的"我/本人"一律指**当前登录 dws 的账号**」+「**免确认直发**
+        — 发个人/本人是标准动作，不要反问确认或问发到哪」。本机 dws 登录账号就是
+        机器人自己（identity.local.json: selfName=鲁大师, selfUserId=37505774），
+        于是用户说「发我钉钉」被 agent 如实执行成**发给机器人自己**：
+        query-send-status 真返回 SUCCESS，发起人什么都收不到，agent 还会反过来
+        猜「可能是客户端会话列表未刷新」（2026-09-25 #242/#243 事故）。
+
+        agent 没做错任何一步——是「本人」的语义在分身场景下根本是错的，且它没有
+        别的投递通道可用。故这里同时给出口径与替代路径（```send_file``` 标记）。
+        """
+        r = s.get("reply") or {}
+        who = str(r.get("sender") or "").strip() or "发起人"
+        conv = "群聊" if r.get("is_group") else "单聊"
+        return (
+            f"\n\n---\n【投递铁律｜由分身代投，禁止自行发送】\n"
+            f"本任务由「{who}」通过钉钉分身（{conv}）发起，结果会回到该会话。\n"
+            f"· **不要自己跑 dws 或任何钉钉发送命令**。本机 dws 登录账号是机器人"
+            f"「{self.cfg.avatar_name}」，dingtalk-send 技能里的\"我/本人\"指的是它、"
+            f"不是发起人；自行直发会把文件发给机器人自己，发起人收不到，而 "
+            f"sendStatus 仍返回 SUCCESS（已发生过事故）。\n"
+            f"· 要交付文件：把件放在本任务工作区的 output/ 或 work/ 下，然后在"
+            f"**结果正文**里用围栏块声明，由分身代投给发起会话（收件人系统锁定、"
+            f"标记里写什么都改不了）：\n"
+            f"  ```send_file\n"
+            f'  {{"path": "<绝对路径，必须在本任务 output/ 或 work/ 内>"}}\n'
+            f"  ```\n"
+            f"· 一次最多 5 件；用户要几种格式就声明几个块，不要合并成一个。"
+            f"标记块不会展示给用户，正文不必重复解释。\n"
+            f"· 做不到的格式要**如实说明做不了及原因**，可给替代件但必须讲清"
+            f"「你要的 X 没做到、给的是 Y」，严禁静默降级改名糊弄。")
+
     def _send_result(self, s: dict, row: dict, prefix: str = ""):
         tid = row.get("id")
+        uid = str(s.get("uid") or "")
         result = (row.get("result") or "").strip()
         result, notes = self._consume_plan_markers(result, s, tid)
+        # relay 通路同样消费 ```send_file``` 标记。**必须接上**：此前只有 local
+        # 通路（_drain_local）消费，relay 任务没有标记代投这条路可走，agent 只能
+        # 自己跑 dws 发送——而本机 dws 登录账号就是机器人「鲁大师」，
+        # shared/skills/dingtalk-send/SKILL.md 又明写「本技能里的"我/本人"一律指
+        # **当前登录 dws 的账号**」且「免确认直发…不要反问确认或问发到哪」，于是
+        # 用户说「发我钉钉」被如实执行成**发给机器人自己**：query-send-status 真的
+        # 返回 SUCCESS，发起人却什么都收不到，agent 还会反过来猜「客户端未刷新」。
+        # （2026-09-25 任务 #242/#243，用户自 20:36 起连续 6 次反馈文件收不到。）
+        # 收件人必须由系统锁定为发起会话——这正是标记代投存在的理由。
+        # 作用域额外给本任务 workdir 下的 output/ 与 work/（relay 出件落在那里）。
+        result, sn = self._consume_send_markers(
+            result, s, tid, uid, extra_roots=self._task_artifact_roots(row))
+        notes += sn
         if notes:
             result = (result + ("\n\n" if result else "")
                       + "\n\n".join(notes)).strip()
@@ -1153,7 +1204,25 @@ class Avatar:
         return [os.path.realpath(str(x)) for x in
                 (self.cfg.section("security").get(key) or [])]
 
-    def _consume_send_markers(self, result: str, s: dict, tid, uid: str):
+    def _task_artifact_roots(self, row: dict) -> list:
+        """relay 任务的出件目录：workdir 下的 output/ 与 work/。
+
+        **只给这两个子目录、不给整个 workdir**——workdir 里还有 .baseline.json、
+        .claude/（会话数据）、.xdg/、CLAUDE.md（注入的上下文与知识片段），
+        这些都不该被代投出去。
+        """
+        w = str((row or {}).get("workdir") or "").strip()
+        if not w:
+            return []
+        out = []
+        for sub in ("output", "work"):
+            p = os.path.realpath(os.path.join(w, sub))
+            if os.path.isdir(p):
+                out.append(p)
+        return out
+
+    def _consume_send_markers(self, result: str, s: dict, tid, uid: str,
+                              extra_roots: list | None = None):
         """解析 ```send_file``` 标记并由 avatar 代投文件，返回 (净化正文, 附注)。
 
         为什么由 avatar 代投而不是给 local 开 Bash：relay-avatar.service **没有任何
@@ -1176,7 +1245,7 @@ class Avatar:
         if not specs or s.get("send_applied") == tid:
             return clean, []
         s["send_applied"] = tid
-        roots = self._roots("local_write_dirs")
+        roots = self._roots("local_write_dirs") + list(extra_roots or [])
         maxb = int(self.cfg.get("security", "media_max_size_mb", 20)) * 1024 * 1024
         notes: list = []
         sent = 0

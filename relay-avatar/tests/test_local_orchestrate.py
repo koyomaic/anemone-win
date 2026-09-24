@@ -8,6 +8,7 @@
 另覆盖：升级不降级（越权→relay 且不死循环）、LOCAL 态不被 _poll_sessions 误重置、
 LOCAL 态收到「取消」不得重置会话态（否则卡片永远停在处理中）。
 """
+import os
 import re
 import time
 
@@ -469,7 +470,9 @@ def test_stale_local_reaped_and_resubmitted_on_restart(av, cfg, shared):
     av._reap_stale_local()
     assert s["state"] == "RUNNING"
     assert len(av.exec_relay.submitted) == 1
-    assert av.exec_relay.submitted[0]["desc"] == "统计门店日销"
+    d = av.exec_relay.submitted[0]["desc"]
+    assert d.startswith("统计门店日销")                 # 用户原文在最前
+    assert "投递铁律" in d and "send_file" in d          # 附了代投口径（防自发 dws）
     assert s["task_id"] == 1
     assert s["local_reap_count"] == 1
     assert any("中断" in c for _, c in av.dws.sent)      # 如实回执，不静默
@@ -1125,3 +1128,94 @@ def test_delete_dirs_narrower_than_write_dirs(cfg, storage, audit, policy,
     cons = policy.constraints("200")
     assert set(cons["delete_dirs"]) <= set(cons["write_dirs"])
     assert cons["delete_dirs"] == dd
+
+
+# ── H. relay 通路的 send_file 代投（2026-09-25 #242/#243 事故修复）──
+# 事故：relay 任务没有标记代投这条路，agent 只能自己跑 dws；而本机 dws 登录账号
+# 就是机器人自己，dingtalk-send 技能又明写「"我/本人"一律指当前登录 dws 的账号」
+# 且「免确认直发」，于是「发我钉钉」被如实执行成发给机器人自己——sendStatus 真
+# SUCCESS、发起人收不到，agent 还反过来猜「客户端未刷新」。
+
+def _mk_task_dir(shared, tid=901):
+    """造一个 relay 任务工作区：output/ work/ + 不该被代投的 .claude/ CLAUDE.md。"""
+    w = shared.parent / "tasks" / str(tid)
+    (w / "output").mkdir(parents=True, exist_ok=True)
+    (w / "work").mkdir(parents=True, exist_ok=True)
+    (w / ".claude").mkdir(parents=True, exist_ok=True)
+    (w / "CLAUDE.md").write_text("注入的上下文", encoding="utf-8")
+    (w / ".baseline.json").write_text("{}", encoding="utf-8")
+    return w
+
+
+def test_task_artifact_roots_only_output_and_work(av, cfg, shared):
+    """只给 output/ 与 work/，不给整个 workdir——workdir 里还有 .claude/（会话数据）、
+    CLAUDE.md（注入上下文）、.baseline.json，都不该被代投出去。"""
+    w = _mk_task_dir(shared)
+    roots = av._task_artifact_roots({"workdir": str(w)})
+    assert sorted(os.path.basename(r) for r in roots) == ["output", "work"]
+    assert not any(r == os.path.realpath(str(w)) for r in roots)
+
+
+def test_task_artifact_roots_empty_without_workdir(av, cfg, shared):
+    assert av._task_artifact_roots({}) == []
+    assert av._task_artifact_roots({"workdir": "/nonexistent/xyz"}) == []
+
+
+def test_send_result_delivers_relay_task_output(av, cfg, shared):
+    """relay 任务的结果正文里带 send_file 标记 → 由 avatar 代投给发起会话。"""
+    write_ready(cfg, shared)
+    w = _mk_task_dir(shared, 902)
+    p = w / "output" / "我行.pptx"
+    p.write_bytes(b"fake-pptx-bytes")
+    s = sess_of(av)
+    row = {"id": 902, "workdir": str(w),
+           "result": '做好了\n\n```send_file\n{"path": "%s"}\n```' % p}
+    av._send_result(s, row)
+    assert any("[file]" in c and "我行.pptx" in c for _, c in av.dws.sent), \
+        "relay 出件应被代投"
+
+
+def test_send_result_refuses_paths_outside_task_dirs(av, cfg, shared):
+    """护栏①对 relay 同样生效：任务工作区与 local_write_dirs 之外一律拒。"""
+    write_ready(cfg, shared)
+    w = _mk_task_dir(shared, 903)
+    outside = _mk(str(shared / "knowledge" / "secret.md"), "内部知识")
+    s = sess_of(av)
+    row = {"id": 903, "workdir": str(w),
+           "result": '```send_file\n{"path": "%s"}\n```' % outside}
+    av._send_result(s, row)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_send_result_refuses_task_context_files(av, cfg, shared):
+    """.claude/ 与 CLAUDE.md 在 workdir 内但不在 output//work/，不得被代投。"""
+    write_ready(cfg, shared)
+    w = _mk_task_dir(shared, 904)
+    s = sess_of(av)
+    row = {"id": 904, "workdir": str(w),
+           "result": '```send_file\n{"path": "%s"}\n```' % (w / "CLAUDE.md")}
+    av._send_result(s, row)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_relay_delivery_rule_names_requester_and_forbids_dws(av, cfg, shared):
+    """提交 relay 时必须附上发起人身份 + 禁止自行 dws 发送 + 标记代投口径。
+    缺了它，agent 只能按 dingtalk-send 技能把「本人」理解成机器人自己。"""
+    s = sess_of(av)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "sid200",
+                  "conversation_id": "c1", "sender": "王洪彬"}
+    rule = av._relay_delivery_rule(s)
+    assert "王洪彬" in rule                      # 告知发起人是谁
+    assert "不要自己跑 dws" in rule               # 明确禁止自发
+    assert "send_file" in rule                   # 给出替代路径
+    assert "SUCCESS" in rule                     # 点明「成功也没送到」这个坑
+    assert av.cfg.avatar_name in rule            # 点明 dws 账号是机器人自己
+
+
+def test_relay_delivery_rule_group_vs_o2o(av, cfg, shared):
+    s = sess_of(av)
+    s["reply"] = {"is_group": True, "conversation_id": "cg", "sender": "李四"}
+    assert "群聊" in av._relay_delivery_rule(s)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "x", "sender": ""}
+    r = av._relay_delivery_rule(s)
+    assert "单聊" in r and "发起人" in r          # 无 sender 名时回落通称
