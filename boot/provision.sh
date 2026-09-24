@@ -516,23 +516,34 @@ else
   # 目录骨架 + index 配置（纯文件系统，幂等，无 DB 副作用）
   [ -f "$STORE_BIN" ] && "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" skeleton >/dev/null 2>&1
   # 台账探活：区分「缺表」（首次未 init，WARN）、「DB 不可达」（relay 依赖同一个库，
-  # 通常意味着服务已瘫，记 FAIL → boot.sh 钉钉预警）与「任务侧凭据失效」（rc=3）。
+  # 通常意味着服务已瘫，记 FAIL → boot.sh 钉钉预警）与「任务侧凭据失效」（rc=3，
+  # store init 可自愈，故自动修一次再复验）。
   #
-  # rc=3 **刻意不自动轮换**：store_task 是全机队共享的单一 PG 角色（10.189.21.235 上
-  # 8 台机器 10.189.51.23/.29-.35 同库），而 store-task.env 是每机本地文件
-  # （/mnt/vol-eltaah12 为 /dev/vdc 本地盘，非网络挂载）。任何一台轮换密码都会让其余
-  # 7 台立即失效 → 各自 provision 检测到 rc=3 再轮换 → 夜夜互相打断，且每轮都报
-  # 「已自愈 PASS」而在清单上隐形（2026-09-25 发现；此前的自动自愈分支即为风暴源）。
-  # 轮换共享秘密必然使其他持有者失效——自愈只有在凭据本机私有时才安全。
-  # 根治方案：TASK_ROLE 改为每机独立（store_task_<machine-id>），落地后方可恢复自愈。
+  # rc=3 的自动轮换**只在角色每机私有后才安全**。store_task 曾是全机队共享的单一
+  # PG 角色（10.189.21.235 上 8 台机器 10.189.51.23/.29-.35 同库），而
+  # store-task.env 是每机本地文件（/mnt/vol-eltaah12 为 /dev/vdc 本地 ext4，非网络
+  # 挂载）。共享角色下任何一台轮换都让其余 7 台立即失效 → 各自 provision 检测 rc=3
+  # 再轮换 → 夜夜互相打断，且每轮都报「已自愈 PASS」而在清单上隐形（2026-09-25
+  # 轮换风暴）。store 已改为 TASK_ROLE=store_task_<machine-id 前 8 位>，轮换只影响
+  # 本机，故此处恢复自愈。**升级顺序要求**：本步骤在 CLI 同步之后，故 release 内的
+  # boot/store/store 必须已是每机私有角色版，否则这里会轮换到共享角色上。
   if [ ! -f "$STORE_BIN" ]; then
     bad "store CLI 安装失败"
   else
     "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" ping >/dev/null 2>&1
     rc=$?
+    if [ "$rc" = 3 ] && heal; then
+      # 宿主侧正常、任务侧凭据认证不过（或 env 内仍是旧共享角色 DSN）。此前 ping
+      # 只查角色存在不验密码，于是这一路 PASS 而任务里 store add 全失败
+      # （2026-09-24：三份交付件没进台账）。
+      "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" init >/dev/null 2>&1
+      "$VENV/bin/python" "$STORE_BIN" --root "$STORE_ROOT" ping >/dev/null 2>&1
+      rc=$?
+      [ "$rc" = 0 ] && ok "任务侧凭据已自愈（每机私有角色，不影响机队其他机器）"
+    fi
     if [ "$rc" = 0 ]; then ok "CLI+骨架+台账就绪（root=$STORE_ROOT）"
     elif [ "$rc" = 2 ]; then bad "PG 不可达——relay 依赖同一个库，通常意味着服务已瘫，需人工介入"
-    elif [ "$rc" = 3 ]; then warn "任务侧 store_task 凭据失效——该角色为机队 8 台共享，自动轮换会打断其余机器，故不自愈；任务内台账登记会失败。勿直接 store init --rotate-task-role，待每机独立角色方案落地"
+    elif [ "$rc" = 3 ]; then bad "任务侧凭据失效且自愈失败——任务内台账登记会全部失败，需人工 store init"
     else warn "台账表未建；首次需人工执行: $STORE_BIN init（会建表，故不自动跑）"
     fi
   fi

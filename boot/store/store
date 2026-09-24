@@ -379,18 +379,52 @@ def cmd_skeleton(a) -> None:
          "note": "仅建目录与 index 配置，未触碰数据库"})
 
 
-TASK_ROLE = "store_task"
+def _machine_tag() -> str:
+    """本机稳定标识：/etc/machine-id 前 8 位（缺失回落 hostname）。
+
+    为什么任务侧角色必须**每机私有**：store_task 曾是全机队共享的单一 PG 角色
+    （10.189.21.235 上 8 台机器 10.189.51.23/.29-.35 同库，另带 pgautofailover），
+    而 index/store-task.env 是每机本地文件（/mnt/vol-eltaah12 为 /dev/vdc 本地
+    ext4，非网络挂载）。共享角色 + 每机密码文件 + 自动轮换 = 任何一台轮换都让
+    其余 7 台立即失效 → 各自 provision 检测到 rc=3 再轮换 → 夜夜互相打断，且
+    每轮都报「已自愈 PASS」而在检查清单上隐形（2026-09-25 轮换风暴）。
+
+    轮换共享秘密必然使其他持有者失效——自愈只有在凭据本机私有时才安全。
+    """
+    try:
+        mid = open("/etc/machine-id", encoding="utf-8").read().strip()
+    except OSError:
+        mid = ""
+    tag = re.sub(r"[^a-z0-9]", "", mid.lower())[:8]
+    if not tag:
+        tag = re.sub(r"[^a-z0-9]", "", os.uname().nodename.lower())[:8]
+    return tag or "local"
+
+
+def _task_role() -> str:
+    """任务侧 PG 角色名（每机私有）。STORE_TASK_ROLE 可覆盖（测试/特殊机）。
+
+    角色名是 SQL 标识符、无法参数化绑定，只能拼进语句，故必须校验字符集防注入。
+    """
+    r = (os.environ.get("STORE_TASK_ROLE") or f"store_task_{_machine_tag()}").strip()
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", r):
+        raise SystemExit(f"STORE_TASK_ROLE 非法（须匹配 ^[a-z_][a-z0-9_]{{0,62}}$）: {r!r}")
+    return r
+
+
+TASK_ROLE = _task_role()
 
 # 任务侧最小权限：只给 store_* 表与 tasks 的 id/status 两列。
 # users/devices（成员 token 与设备密钥）明确不授权，REVOKE 兜底防默认权限泄漏。
 # 台账允许任务写（add/set），但 doctor 以磁盘为准对账，篡改可被发现。
-GRANTS = [
-    "GRANT USAGE ON SCHEMA public TO store_task",
-    "GRANT SELECT, INSERT, UPDATE ON store_files, store_refs, store_wiki_sync TO store_task",
-    "GRANT SELECT ON store_senders, store_domains TO store_task",
-    "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO store_task",
-    "GRANT SELECT (id, status) ON tasks TO store_task",
-    "REVOKE ALL ON users, devices FROM store_task",
+# 角色名每机私有（见 _machine_tag），故用 {r} 模板而非硬编码角色名。
+GRANT_TMPL = [
+    "GRANT USAGE ON SCHEMA public TO {r}",
+    "GRANT SELECT, INSERT, UPDATE ON store_files, store_refs, store_wiki_sync TO {r}",
+    "GRANT SELECT ON store_senders, store_domains TO {r}",
+    "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {r}",
+    "GRANT SELECT (id, status) ON tasks TO {r}",
+    "REVOKE ALL ON users, devices FROM {r}",
 ]
 
 
@@ -433,6 +467,8 @@ def ensure_task_role(cur, root: str, rotate: bool = False) -> dict:
     权限受限的连库路径，否则 store 在任务内完全不可用。
 
     自愈：沿用现有凭据前先**实测能否连上**，连不上就强制轮换（见 _task_dsn_works）。
+    轮换现在是安全的——角色每机私有（TASK_ROLE 见 _machine_tag），只影响本机，
+    不会像共享 store_task 那样打断机队其余机器（2026-09-25 轮换风暴）。
     """
     import secrets as _sec
     from urllib.parse import urlparse, quote
@@ -454,8 +490,8 @@ def ensure_task_role(cur, root: str, rotate: bool = False) -> dict:
         cur.execute((f"ALTER ROLE {TASK_ROLE} WITH LOGIN PASSWORD %s" if existed
                      else f"CREATE ROLE {TASK_ROLE} WITH LOGIN PASSWORD %s"), (pw,))
     cur.execute(f"ALTER ROLE {TASK_ROLE} SET statement_timeout = '60s'")
-    for g in GRANTS:
-        cur.execute(g)
+    for g in GRANT_TMPL:
+        cur.execute(g.format(r=TASK_ROLE))
     if pw:
         netloc = f"{TASK_ROLE}:{quote(pw, safe='')}@{u.hostname}" + (f":{u.port}" if u.port else "")
         os.makedirs(os.path.dirname(env_p), exist_ok=True)
@@ -503,16 +539,19 @@ def cmd_ping(a) -> None:
         role_ok = bool(cur.fetchone())
     conn.close()
     env_p = os.path.join(a.root, "index", "store-task.env")
-    if not missing and role_ok:
-        # 只在文件存在时实测；文件缺失属"未 init"，由下面的 hint 覆盖
-        if os.path.isfile(env_p):
-            task_dsn_ok = _task_dsn_works(env_p)
+    if not missing and os.path.isfile(env_p):
+        # 实测任务侧**真正使用**的凭据。刻意不以 role_ok 为前提：迁移到每机私有
+        # 角色期间新角色名尚未创建 → role_ok=False，而 env 里仍是旧共享角色的失效
+        # DSN；若因 role_ok 跳过实测就会报 ok、而任务里 store add 全失败——正是
+        # 2026-09-24 那类「清单全绿但功能已死」的静默失败。env 才是任务实际读的。
+        task_dsn_ok = _task_dsn_works(env_p)
     hint = ""
     if missing:
         hint = "首次需人工执行: store init（会建表，属有副作用操作）"
     elif task_dsn_ok is False:
-        hint = (f"任务侧凭据失效（{TASK_ROLE} 密码认证不过）——"
-                f"执行 store init 即可自愈轮换（幂等，不动表数据）")
+        hint = (f"任务侧凭据失效（{TASK_ROLE} 认证不过，或 env 内仍是旧共享角色 DSN）——"
+                f"执行 store init 即可自愈：建每机私有角色并轮换（幂等、不动表数据、"
+                f"不影响机队其他机器）")
     out({"ok": not missing and task_dsn_ok is not False,
          "missing_tables": missing, "store_files_rows": n,
          "task_role": TASK_ROLE if role_ok else None,

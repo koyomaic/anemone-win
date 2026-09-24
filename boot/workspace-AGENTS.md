@@ -73,7 +73,7 @@ store sync scan|push|verify|backfill          # jingboWiki 同步
 
 落盘新文件后**必须** `store add`（或 `store scan`）登记一行，否则台账与磁盘漂移。
 
-任务内 `store` 同样可用：它会自动降级到 `index/store-task.env` 里的**最小权限连接串**（PG 角色 `store_task`，只授 `store_*` 表的 SELECT/INSERT/UPDATE 与 `tasks` 的 `id`/`status` 两列；`users`/`devices`/`tasks.description` 一律拒绝，也不能 DELETE/CREATE/DROP）。所以**不需要也不允许**为了连库去翻 `relay.env` 或 `/proc/<pid>/environ`。若 `store ping` 报 DB 不可达，如实报告即可——那属需要人工介入的故障，不要自行绕过。
+任务内 `store` 同样可用：它会自动降级到 `index/store-task.env` 里的**最小权限连接串**（PG 角色本机私有、形如 `store_task_<机器标识>`，只授 `store_*` 表的 SELECT/INSERT/UPDATE 与 `tasks` 的 `id`/`status` 两列；`users`/`devices`/`tasks.description` 一律拒绝，也不能 DELETE/CREATE/DROP）。所以**不需要也不允许**为了连库去翻 `relay.env` 或 `/proc/<pid>/environ`。若 `store ping` 报 DB 不可达，如实报告即可——那属需要人工介入的故障，不要自行绕过。
 
 ### 凭据边界（硬性）
 

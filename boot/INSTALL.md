@@ -114,9 +114,11 @@ store ping      # 探活：DB 可连且 5 张表在（缺表退出码 1）
 
 `init` 会建表，属有副作用操作，所以 install 模式只同步 CLI、建目录骨架、跑 `ping` 探活；表缺失时 WARN 并提示人工执行。需要 `RELAY_DB` 指向的库有建表权限（`pg_trgm` 需 superuser 或对该库有 CREATE）。
 
-**任务侧连库（最小权限角色）**：任务环境拿不到 `RELAY_DB`（`executor._scrubbed_environ` 滤掉 `RELAY_*` 前缀），也读不到 `relay.env`（`relay.service` 的 `InaccessiblePaths` 物理屏蔽），所以 `store init` 会另建 PG 角色 `store_task` 并把连接串写进 `index/store-task.env`（644，任务可读）。CLI 的解析顺序是 `RELAY_DB` env → `relay.env` → `STORE_DB` env → `index/store-task.env`，宿主自动走全权限、任务自动降到最小权限，同一条命令两边都能用。
+**任务侧连库（最小权限角色）**：任务环境拿不到 `RELAY_DB`（`executor._scrubbed_environ` 滤掉 `RELAY_*` 前缀），也读不到 `relay.env`（`relay.service` 的 `InaccessiblePaths` 物理屏蔽），所以 `store init` 会另建 PG 角色并把连接串写进 `index/store-task.env`（644，任务可读）。CLI 的解析顺序是 `RELAY_DB` env → `relay.env` → `STORE_DB` env → `index/store-task.env`，宿主自动走全权限、任务自动降到最小权限，同一条命令两边都能用。
 
-授权范围（`GRANTS` 常量）：
+角色名**每机私有**：`store_task_<machine-id 前 8 位>`（`STORE_TASK_ROLE` env 可覆盖）。为什么不能全机队共用一个 `store_task`：库是共享的（8 台机器同连 `10.189.21.235`），而 `index/store-task.env` 是每机本地文件（`/mnt/vol-eltaah12` 为本地 ext4，非网络挂载）——共享角色 + 每机密码文件 + 自动轮换，会让任何一台的轮换立即打断其余 7 台，各自 `provision` 检测到 `ping` rc=3 再轮换，夜夜互相失效且每轮都报 PASS（2026-09-25 轮换风暴）。轮换共享秘密必然使其他持有者失效，自愈只有在凭据本机私有时才安全。旧的共享 `store_task` 角色保留不删，供尚未升级的机器继续使用。
+
+授权范围（`GRANT_TMPL` 常量，`{r}` 为角色名占位）：
 
 | 对象 | 权限 |
 |---|---|

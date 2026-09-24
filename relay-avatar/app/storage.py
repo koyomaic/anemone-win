@@ -10,7 +10,8 @@
 - avatar 私有目录（$STATE）只放运行态：state/rounds/audit/events/run，不进台账。
 - 原子写（tmp+rename）；禁同名覆盖，改版 vN+1；正式目录禁留 .bak-*/.tmp。
 - store 连接走最小权限：STORE_ENV 指向不存在路径屏蔽 relay.env，落到
-  index/store-task.env 的 store_task 角色；禁读 relay.env 与任何 /proc/<pid>/environ。
+    index/store-task.env 的每机私有角色（store_task_<machine-id 前 8 位>）；
+    禁读 relay.env 与任何 /proc/<pid>/environ。
 - DB 不可达：文件先落 run/staging 暂存并回执，恢复后补登记（不静默绕过）。
 """
 from __future__ import annotations
