@@ -74,12 +74,51 @@ def test_promote_by_index_range(cfg, storage):
     assert "超出范围" in r["error"]
 
 
-def test_promote_invalid_domain_falls_back(cfg, storage, shared, monkeypatch):
+def test_promote_invalid_domain_rejected(cfg, storage, shared, monkeypatch):
+    """非法域不再静默回落默认域：返回 error + 可选域清单，笔记保留待重发。"""
     k = Knowledge(cfg, storage)
     note = k.save_note("内容")
-    monkeypatch.setattr(storage, "_store", lambda a, timeout=60: (0, ""))
+    called = []
+    monkeypatch.setattr(storage, "_store",
+                        lambda a, timeout=60: (called.append(a) or (0, "")))
     r = k.promote(note, "不存在的域")
-    assert "/工具运维/" in r["path"]   # 非法域回落默认
+    assert "不存在" in r["error"] and "path" not in r
+    assert "工具运维" in r["domains"] and "可选域" in r["hint"]
+    assert not called            # 未落盘、未登记台账
+    assert note.exists()         # 笔记保留，改域后可重发
+
+
+def test_domains_discovered_from_disk(cfg, storage, shared):
+    """域清单随磁盘自动发现，新增域无需改代码；report 域不得混入。"""
+    (shared / "knowledge" / "案例库").mkdir(parents=True, exist_ok=True)
+    (shared / "knowledge" / "规则库").mkdir(parents=True, exist_ok=True)
+    ds = Knowledge(cfg, storage).domains()
+    assert "案例库" in ds and "规则库" in ds      # 磁盘新增域即时生效
+    assert "工具运维" in ds                        # 兜底域始终可用
+    assert "经营分析" not in ds and "会议纪要" not in ds
+
+
+def test_domains_policy_supplement(cfg, storage, shared):
+    """policy.toml [knowledge] domains 可补充尚未建目录的域。"""
+    cfg._p.setdefault("knowledge", {})["domains"] = "案例库, 模型库"
+    ds = Knowledge(cfg, storage).domains()
+    assert "案例库" in ds and "模型库" in ds
+    assert "工具运维" in ds                        # 兜底域不被配置挤掉
+
+
+def test_promote_to_discovered_domain(cfg, storage, shared, monkeypatch):
+    """磁盘上真实存在但旧硬编码缺失的域（如案例库）应可正常升格。"""
+    (shared / "knowledge" / "案例库").mkdir(parents=True, exist_ok=True)
+    k = Knowledge(cfg, storage)
+    note = k.save_note("某次调价案例")
+    calls = []
+    monkeypatch.setattr(storage, "_store",
+                        lambda a, timeout=60: (calls.append(a) or (0, "")))
+    r = k.promote(note, "案例库", "调价案例")
+    assert r["store_ok"] and Path(r["path"]).parent == \
+        shared / "knowledge" / "案例库"
+    add = [c for c in calls if c[0] == "add"][0]
+    assert "--wiki-tag" in add and "案例库" in add
 
 
 def test_search_wiki_mocked(cfg, storage, monkeypatch):

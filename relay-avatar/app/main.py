@@ -460,7 +460,10 @@ class Avatar:
             n, domain, topic = lc
             r = self.know.promote_by_index(n, domain, topic)
             if r.get("error"):
-                self._notify_session(s, f"⚠️ {r['error']}")
+                # 带 hint（可选域清单）一并回话，否则用户不知道该怎么改
+                self._notify_session(
+                    s, f"⚠️ {r['error']}"
+                       + (f"\n\n{r['hint']}" if r.get("hint") else ""))
                 return
             wiki = ("已双写 jingboWiki（受理即成功，解析后台进行）"
                     if r.get("wiki") == "pushed"

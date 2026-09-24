@@ -128,6 +128,11 @@ wiki_env = "/mnt/vol-eltaah12/workspace/shared/secrets/jingbowiki.env"
 wiki_kb_id = ""                # 留空=取 jingbowiki.env 的 JINGBOWIKI_KB_ID
 recall_max_files = 6
 recall_char_budget = 3000
+domains = ""                     # 知识域白名单（逗号分隔，可空）。空=自动发现 local_dir 下
+                                 # 子目录 ∪ 内置兜底域（口径方法论/组织制度/工具运维/外部资料）；
+                                 # 仅在需要补充「尚未建目录」的新域时才填。域清单不硬编码，
+                                 # 封装件新增域后无需改代码。「学 N <域>」遇非法域直接报错并
+                                 # 回话可选域清单，不静默改归默认域（避免知识落错域无感知）。
 
 [group_watch]
 enabled = false                # P4：群监控采集/提炼全链路；开启需显式改本文件+评审
