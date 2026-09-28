@@ -87,7 +87,7 @@ class Avatar:
         self.selfmark = SelfMark(self.st)
         self.echo = SentEcho(self.st)
         self.monitor = Monitor(cfg, self.st, self.dws, self.audit)
-        self.dashboard = Dashboard(cfg, self.st, self.audit)
+        self.dashboard = Dashboard(cfg, self.st, self.audit, policy=self.policy)
         self.q: queue.Queue = queue.Queue()
         self.stop = threading.Event()
         self.contacts = self.st.run / "contacts.json"

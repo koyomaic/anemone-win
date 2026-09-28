@@ -58,6 +58,154 @@ justify-content:center;background:#0f172a;color:#e2e8f0;font:15px/1.6
 system-ui,sans-serif"><div style="text-align:center">尝试次数过多，已临时锁定
 <br>请约 __MIN__ 分钟后再试</div></body></html>"""
 
+# ── 「用户与权限」页签（dws 用户维护）：样式/结构/脚本，纯字符串常量 ──
+
+USERS_CSS = """
+.tabs{max-width:860px;margin:0 auto 14px;display:flex;gap:8px}
+.tb{padding:6px 16px;border-radius:8px;border:1px solid #d0d5dd;background:#fff;
+color:#475467;font-size:14px;cursor:pointer}
+.tb.on{background:#2563eb;border-color:#2563eb;color:#fff}
+#view-users{max-width:860px;margin:0 auto}
+#view-users h2{margin:20px 0 8px;font-size:15px;color:#344054}
+#view-users table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;
+overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+#view-users th,#view-users td{padding:7px 10px;text-align:left;
+border-bottom:1px solid #f0f1f4;font-size:13px}
+#view-users th{background:#f8fafc;color:#667085;font-weight:500}
+#view-users td.n,#view-users th.n{text-align:right;font-variant-numeric:tabular-nums}
+.dim{color:#98a2b3;font-size:12px}
+.chip{display:inline-block;background:#f2f4f7;border-radius:8px;padding:1px 8px;
+margin:2px 4px 2px 0;font-size:12px}
+.bt{padding:3px 10px;border-radius:6px;border:0;font-size:12px;cursor:pointer;margin-right:6px}
+.bt.ok{background:#12b76a;color:#fff}.bt.no{background:#f04438;color:#fff}
+.frow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.frow input,.frow select{padding:7px 10px;border-radius:8px;border:1px solid #d0d5dd;font-size:13px}
+.frow input{flex:1;min-width:110px}
+#view-users code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+"""
+
+USERS_HTML = """
+<div id="view-users" style="display:none">
+<div id="u-pend"></div>
+<div id="u-dyn"></div>
+<h2>手动授权</h2>
+<div class="frow">
+<input id="g-uid" placeholder="userId（工号）或 openId" style="flex:2">
+<input id="g-name" placeholder="姓名（备注用，可空）" style="flex:1">
+<select id="g-tier"><option value="L2">L2 · 中转任务</option>
+<option value="L3">L3 · 仅文件投递</option></select>
+<input id="g-days" type="number" min="1" max="3650" placeholder="有效天数" style="width:110px;flex:none">
+<button id="btn-grant" class="bt ok">授权</button>
+</div>
+<p class="dim">授权/撤销立即生效（策略热读，无需重启）；到期自动回落 guest（静默）。
+静态名单（super / L2 白名单 / bot 黑名单）改 policy.toml 后重启生效，本页只读展示。</p>
+<div id="u-static"></div>
+<div id="u-rate"></div>
+</div>
+"""
+
+USERS_JS = """
+<script>
+const TB_KEY="avatar_dash_tab";
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function fmtTs(t){if(!t)return"-";const d=new Date(t*1000);
+return d.toLocaleDateString("zh",{month:"2-digit",day:"2-digit"})+" "+d.toLocaleTimeString("zh",{hour12:false})}
+function showTab(v){
+ document.getElementById("view-host").style.display=v==="host"?"":"none";
+ document.getElementById("view-users").style.display=v==="users"?"":"none";
+ document.getElementById("tb-host").className="tb"+(v==="host"?" on":"");
+ document.getElementById("tb-users").className="tb"+(v==="users"?" on":"");
+ try{localStorage.setItem(TB_KEY,v)}catch(e){}
+ if(v==="users")loadUsers();
+}
+document.getElementById("tb-host").addEventListener("click",()=>showTab("host"));
+document.getElementById("tb-users").addEventListener("click",()=>showTab("users"));
+function uname(uid,d){
+ const rec=(d.dynamic||{})[uid]||(d.pending||{})[uid];
+ if(rec&&rec.name)return rec.name;
+ const c=(d.contacts||{})[uid];
+ return c?uid+"（"+c+"）":uid;
+}
+async function loadUsers(){
+ try{
+  const r=await fetch("/api/users");if(!r.ok)return;
+  const d=await r.json();
+  if(d.error){document.getElementById("u-pend").innerHTML='<p class="dim">policy 不可用</p>';return;}
+  document.getElementById("g-days").placeholder="有效天数（默认 "+d.grant_valid_days+"）";
+  const pk=Object.keys(d.pending||{});
+  document.getElementById("u-pend").innerHTML='<h2>待审批申请</h2>'+(pk.length?
+   '<table><tr><th>姓名</th><th>userId</th><th>头衔/理由</th><th>时间</th><th>操作</th></tr>'+
+   pk.map(uid=>{const p=d.pending[uid];
+    return '<tr><td>'+esc(p.name||"-")+'</td><td><code>'+esc(uid)+'</code></td>'+
+    '<td class="dim">'+esc(p.title||"")+'</td><td class="dim">'+fmtTs(p.ts)+'</td>'+
+    '<td><button class="bt ok" data-a="approve" data-u="'+esc(uid)+'">批准 L2</button>'+
+    '<button class="bt ok" data-a="approve_l3" data-u="'+esc(uid)+'">批准 L3</button>'+
+    '<button class="bt no" data-a="deny" data-u="'+esc(uid)+'">拒绝</button></td></tr>'}).join("")+"</table>"
+   :'<p class="dim">无</p>');
+  const dk=Object.keys(d.dynamic||{}),now=Date.now()/1000;
+  document.getElementById("u-dyn").innerHTML='<h2>动态白名单</h2>'+(dk.length?
+   '<table><tr><th>姓名</th><th>userId/openId</th><th>级别</th><th>授予人</th><th>到期</th><th>操作</th></tr>'+
+   dk.map(uid=>{const w=d.dynamic[uid];
+    const left=w.expires?Math.ceil((w.expires-now)/86400):null;
+    return '<tr><td>'+esc(w.name||"-")+'</td><td><code>'+esc(uid)+'</code></td>'+
+    '<td>'+esc(w.tier||"L2")+'</td><td class="dim">'+esc(w.by||"")+'</td>'+
+    '<td class="dim">'+(w.expires?fmtTs(w.expires)+(left!==null?"（剩 "+left+" 天）":""):"永久")+'</td>'+
+    '<td><button class="bt no" data-a="revoke" data-u="'+esc(uid)+'">撤销</button></td></tr>'}).join("")+"</table>"
+   :'<p class="dim">无（自聊审批或本页手动授权后出现在这里）</p>');
+  const chip=a=>(a||[]).map(x=>'<span class="chip"><code>'+esc(x)+'</code>'+
+   ((d.contacts||{})[x]?" · "+esc(d.contacts[x]):"")+'</span>').join("")||'<span class="dim">-</span>';
+  document.getElementById("u-static").innerHTML='<h2>静态名单（policy.toml · 只读）</h2><table>'+
+   '<tr><td style="width:110px">super</td><td>'+chip(d.superadmin)+'</td></tr>'+
+   '<tr><td>L1 管理员</td><td>'+chip(d.admins)+'</td></tr>'+
+   '<tr><td>L2 白名单</td><td>'+chip(d.whitelist)+'</td></tr>'+
+   '<tr><td>L3 文件投递</td><td>'+chip(d.file_uploaders)+'</td></tr>'+
+   '<tr><td>用户黑名单</td><td>'+chip(d.blacklist)+'</td></tr>'+
+   '<tr><td>bot 拦截</td><td>'+chip(d.bot_blocklist)+'</td></tr>'+
+   '<tr><td>名单外 guest</td><td class="dim">'+esc(d.guest_mode)+'（silent=彻底静默，不回话）</td></tr></table>';
+  const ck=Object.keys(d.today_counts||{});
+  document.getElementById("u-rate").innerHTML='<h2>今日用量</h2>'+(ck.length?
+   '<table><tr><th>userId</th><th>姓名</th><th class="n">今日任务</th><th class="n">限额</th></tr>'+
+   ck.sort((a,b)=>d.today_counts[b]-d.today_counts[a]).map(uid=>
+    '<tr><td><code>'+esc(uid)+'</code></td><td>'+esc(uname(uid,d))+'</td>'+
+    '<td class="n">'+d.today_counts[uid]+'</td><td class="n">'+d.rate_limit+'</td></tr>').join("")+"</table>"
+   :'<p class="dim">今日暂无任务（限额 '+d.rate_limit+'/人/日）</p>');
+ }catch(e){}
+}
+async function userAct(a,uid){
+ const r=await fetch("/api/users",{method:"POST",
+  headers:{"Content-Type":"application/json"},body:JSON.stringify({action:a,uid:uid})});
+ if(!r.ok){let m="";try{m=JSON.stringify(await r.json())}catch(e){}
+  alert("操作失败 "+r.status+" "+m);return;}
+ loadUsers();
+}
+document.getElementById("view-users").addEventListener("click",e=>{
+ const b=e.target.closest("button.bt");if(!b)return;
+ const a=b.dataset.a,u=b.dataset.u;
+ if(a==="revoke"&&!confirm("撤销 "+u+" 的动态白名单？立即生效。"))return;
+ if(a==="deny"&&!confirm("拒绝 "+u+" 的申请？"))return;
+ userAct(a,u);
+});
+document.getElementById("btn-grant").addEventListener("click",()=>{
+ const uid=document.getElementById("g-uid").value.trim();
+ const name=document.getElementById("g-name").value.trim();
+ const tier=document.getElementById("g-tier").value;
+ const days=parseInt(document.getElementById("g-days").value||"0",10);
+ if(!uid){alert("请填写 userId/openId");return;}
+ if(!confirm("授权 "+uid+(name?"（"+name+"）":"")+" 为 "+tier+
+   (days?"，有效 "+days+" 天":"（默认有效期）")+"？"))return;
+ fetch("/api/users",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({action:"grant",uid:uid,name:name,tier:tier,days:days||null})})
+  .then(async r=>{if(!r.ok){let m="";try{m=JSON.stringify(await r.json())}catch(e){}
+    alert("授权失败 "+r.status+" "+m);return;}
+   document.getElementById("g-uid").value="";document.getElementById("g-name").value="";
+   document.getElementById("g-days").value="";loadUsers();});
+});
+setInterval(()=>{if(document.getElementById("view-host").style.display!=="none")location.reload()},30000);
+(function(){let v="host";try{v=localStorage.getItem(TB_KEY)||"host"}catch(e){}
+ if(v==="users")showTab("users");})();
+</script>
+"""
+
 
 class LoginGuard:
     """口令校验 + 会话 + 防爆破（与 relay 面板同参数：5 次/15 分钟锁）。"""
@@ -122,13 +270,105 @@ class LoginGuard:
 
 
 class Dashboard:
-    def __init__(self, cfg, storage, audit=None):
+    def __init__(self, cfg, storage, audit=None, policy=None):
         self.cfg = cfg
+        self.st = storage
+        self.audit = audit
+        self.policy = policy
         self.mon = storage.run / "monitor"
         self.port = int(cfg.get("monitor", "dashboard_port", 8791))
         self.token = str(cfg.env.get("AVATAR_DASHBOARD_TOKEN", "") or "")
         self.guard = LoginGuard(
             str(cfg.env.get("AVATAR_DASHBOARD_PASSWORD", "") or ""), audit)
+
+    # ── 用户与权限（dws 用户维护）──
+
+    def _users_body(self) -> dict:
+        """花名册总览：静态（policy.toml 只读）+ 动态白名单/待审（可操作）+ 当日用量。"""
+        p = self.policy
+        if p is None:
+            return {"error": "policy unavailable"}
+        rate = {}
+        try:
+            rj = json.loads((self.st.run / "rate.json").read_text("utf-8"))
+            if str(rj.get("date", "")) == time.strftime("%Y%m%d"):
+                rate = {str(k): int(v)
+                        for k, v in (rj.get("counts") or {}).items()}
+        except Exception:
+            pass
+        contacts = {}
+        try:
+            contacts = json.loads(
+                (self.st.run / "contacts.json").read_text("utf-8"))
+        except Exception:
+            pass
+        return {
+            "rate_limit": p.rate_limit,
+            "grant_valid_days": p.grant_valid_days,
+            "guest_mode": str(self.cfg.get("permissions", "guest_mode",
+                                           "silent")),
+            "today_counts": rate,
+            "contacts": contacts,
+            "superadmin": sorted(p.superadmin),
+            "admins": sorted(p.admins),
+            "whitelist": sorted(p.whitelist),
+            "file_uploaders": sorted(p.file_uploaders),
+            "blacklist": sorted(p.blacklist),
+            "bot_blocklist": sorted(p.bot_blocklist),
+            "dynamic": p.load_dynamic_wl(),
+            "pending": p.load_pending(),
+        }
+
+    def _user_action(self, h, body: dict):
+        """写操作（仅人类口令会话）：approve/approve_l3/deny/grant/revoke。
+
+        动态白名单文件被 Policy 每次判定时热读，改完即生效，无需重启。
+        静态名单（policy.toml）不在此写——toml 回写风险高，仍走配置文件。
+        """
+        p = self.policy
+        if p is None:
+            return h._send(b'{"error":"policy unavailable"}',
+                           "application/json", 500)
+        act = str(body.get("action", ""))
+        uid = str(body.get("uid", "")).strip()[:64]
+        if not uid or act not in ("approve", "approve_l3", "deny",
+                                  "grant", "revoke"):
+            return h._send(b'{"error":"bad action/uid"}',
+                           "application/json", 400)
+        if act in ("approve", "approve_l3"):
+            info = p.load_pending().get(uid, {})
+            name = str(body.get("name") or info.get("name") or "")[:40]
+            tier = "L3" if act == "approve_l3" else "L2"
+            p.grant(uid, name, tier=tier, by_name="dashboard")
+            detail = f"grant {tier} name={name}"
+        elif act == "deny":
+            p.revoke_pending(uid)
+            detail = "deny pending"
+        elif act == "grant":
+            name = str(body.get("name") or "").strip()[:40]
+            tier = str(body.get("tier") or "L2")
+            if tier not in ("L2", "L3"):
+                return h._send(b'{"error":"tier must be L2|L3"}',
+                               "application/json", 400)
+            try:
+                days = int(body.get("days") or p.grant_valid_days)
+            except (TypeError, ValueError):
+                days = p.grant_valid_days
+            days = max(1, min(days, 3650))
+            p.grant(uid, name, tier=tier, by_name="dashboard",
+                    valid_days=days)
+            detail = f"grant {tier} days={days} name={name}"
+        else:  # revoke
+            if not p.revoke_dynamic(uid):
+                return h._send(b'{"error":"not in dynamic whitelist"}',
+                               "application/json", 404)
+            detail = "revoke dynamic"
+        if self.audit:
+            try:
+                self.audit.log(f"dash_user_{act}", uid, detail)
+            except Exception:
+                pass
+        return h._send(b'{"ok":true}', "application/json")
 
     def load_snaps(self) -> list:
         out = []
@@ -162,7 +402,7 @@ class Dashboard:
                       f'内存 {r.get("mem_used_pct", "?")}%</div>'
                       f'{iss}{rows}</div>')
         return ("<!doctype html><meta charset=utf-8>"
-                "<meta http-equiv=refresh content=30>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'>"
                 "<title>relay-avatar 看板</title><style>"
                 "body{font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif;"
                 "background:#f4f6f9;margin:0;padding:20px}"
@@ -176,10 +416,16 @@ class Dashboard:
                 ".res{color:#6b7280;font-size:13px;margin-bottom:8px}"
                 ".r{display:flex;gap:8px;padding:4px 0;border-top:1px solid #f0f1f4;font-size:14px}"
                 ".r i{margin-left:auto;color:#9aa4b2;font-style:normal;font-family:monospace;font-size:12px}"
-                ".i{padding:4px 0;font-size:14px}</style>"
+                ".i{padding:4px 0;font-size:14px}"
+                + USERS_CSS + "</style>"
                 f"<h1>🛰️ relay-avatar 看板<small>:{self.port}</small>"
                 "<a href=/logout>退出</a></h1>"
-                + (cards or "<p style='text-align:center;color:#9aa4b2'>暂无快照，等待采集…</p>"))
+                '<div class="tabs"><button id="tb-host" class="tb on">主机状态</button>'
+                '<button id="tb-users" class="tb">用户与权限</button></div>'
+                '<div id="view-host">'
+                + (cards or "<p style='text-align:center;color:#9aa4b2'>暂无快照，等待采集…</p>")
+                + '</div>'
+                + USERS_HTML + USERS_JS)
 
     def _handler(self):
         dash = self
@@ -264,6 +510,11 @@ class Dashboard:
                         json.dumps(dash.load_snaps(),
                                    ensure_ascii=False).encode(),
                         "application/json; charset=utf-8")
+                if path == "/api/users":
+                    return self._send(
+                        json.dumps(dash._users_body(), ensure_ascii=False,
+                                   default=str).encode(),
+                        "application/json; charset=utf-8")
                 self._send(dash.render().encode(), "text/html; charset=utf-8")
 
             def do_POST(self):
@@ -279,6 +530,12 @@ class Dashboard:
                 except Exception:
                     return self._send(b'{"error":"bad body"}',
                                       "application/json", 400)
+                if path == "/api/users":
+                    # 写操作只认人类口令会话；机访 token 仅可读（防脚本误改名单）
+                    if not self._session_ok():
+                        return self._send(b'{"error":"session required"}',
+                                          "application/json", 403)
+                    return dash._user_action(self, body)
                 if path == "/report":
                     host = re.sub(r"[^\w一-龥-]", "",
                                   str(body.get("host") or "unknown"))[:40]

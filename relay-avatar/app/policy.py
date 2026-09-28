@@ -349,6 +349,18 @@ class Policy:
             del d[str(uid)]
             self._save(self._pend_file, d)
 
+    def load_pending(self) -> dict:
+        return self._load(self._pend_file, {})
+
+    def revoke_dynamic(self, uid: str) -> bool:
+        """撤销动态白名单（热读，立即生效）。返回是否确有该记录。"""
+        wl = self.load_dynamic_wl()
+        rec = wl.pop(str(uid), None)
+        if rec is None:
+            return False
+        self._save(self._dyn_file, wl)
+        return True
+
     def has_pending(self) -> bool:
         return bool(self._load(self._pend_file, {}))
 
