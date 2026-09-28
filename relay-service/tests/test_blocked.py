@@ -106,3 +106,96 @@ def test_rm_task_home_still_guarded(ex):
     assert ex._is_blocked('rm -rf "$DIR/x"', WORKDIR) is not None  # 其它变量无法展开
     assert ex._is_blocked("rm -rf ./cache", WORKDIR) is not None  # 相对路径照拦
     assert ex._is_blocked("rm -rf /tmp/a $HOME/../../shared/knowledge", WORKDIR) is not None  # 混有逃逸目标
+
+
+# ---- 凭据枚举拦截（2026-09-28 加固）----
+#
+# 任务环境本就没有 relay 凭据（executor._ENV_DROP_PREFIXES 剔除 RELAY_*），但 agent
+# 不知道，会花几分钟刨 env / /opt/team / relay 源码找 token。#278 为「现在有几个
+# 定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash，CronList 只调了 1 次。
+# 下面的"应拦"用例全部取自 #278 会话 transcript 里的**真实命令**，不是构造的。
+
+# #12/#13/#27/#71：env 管道找凭据
+_HUNT_ENV = [
+    'echo "=== 本任务环境里 relay 相关变量（只看不回显值）===\nenv | grep -iE "relay|ta_|token|auth|device" | sed -E \'s/=(.{0,3}).*/=\\1…(len hidden)/\' 2>&1',
+    'env | grep -iE "relay|ta_|device|sign" | cut -d= -f1',
+    'env | grep -iE "device|secret" | cut -d= -f1 || echo "(无)"',
+    'env | grep -iE "RELAY_DEVICE|RELAY_ADMIN" | cut -d= -f1 || echo "(无凭据)"',
+    'printenv | grep -i token',
+    'env|grep secret',
+]
+
+# #22/#23/#24/#25：刨 /opt/team 下的分身与部署凭据落点
+_HUNT_OPT = [
+    'ls -la /opt/team/relay-avatar/ 2>/dev/null',
+    'find /opt/team/relay-avatar/ -maxdepth 2 -type f -name "*secret*" 2>/dev/null | head',
+    '/opt/team/relay-boot/avatar-cli --help 2>&1 | head -40',
+    '/opt/team/relay-avatar/avatar-cli --help 2>&1 | head -50',
+]
+
+# #14/#21/#26/#29：grep relay 源码里的具体凭据标识符
+_HUNT_IDENT = [
+    'grep -nE "x-device-id|x-signature|RELAY_TASK|Bearer|token" relay-avatar/app/exec_relay.py',
+    'grep -rnE "RELAY_DEVICE_ID|RELAY_DEVICE_SECRET|device_secret" relay-service/app/*.py',
+    'grep -nE "RELAY_TASK_USER|RELAY_DEVICE|environ" relay-service/app/executor.py',
+    'echo "确认 RELAY_DEVICE_SECRET 被滤除"; sed -n \'27,45p\' relay-service/app/executor.py',
+]
+
+
+@pytest.mark.parametrize("cmd", _HUNT_ENV)
+def test_credential_env_enumeration_blocked(ex, cmd):
+    assert ex._is_blocked(cmd) is not None
+
+
+@pytest.mark.parametrize("cmd", _HUNT_OPT)
+def test_credential_opt_team_hunting_blocked(ex, cmd):
+    assert ex._is_blocked(cmd) is not None
+
+
+@pytest.mark.parametrize("cmd", _HUNT_IDENT)
+def test_credential_identifier_grep_blocked(ex, cmd):
+    assert ex._is_blocked(cmd) is not None
+
+
+def test_proc_environ_blocked(ex):
+    assert ex._is_blocked("cat /proc/1234/environ") is not None
+    assert ex._is_blocked("cat /proc/self/environ | tr '\\0' '\\n'") is not None
+    assert ex._is_blocked("tr '\\0' '\\n' < /proc/self/environ") is not None
+
+
+# ---- 不得误伤：正常业务命令 ----
+
+def test_credential_patterns_not_over_blocking(ex):
+    # env 管道但无凭据关键词
+    assert ex._is_blocked("env | grep -i path") is None
+    assert ex._is_blocked("env | sort | head -20") is None
+    assert ex._is_blocked("printenv HOME") is None
+    assert ex._is_blocked("env -i python3 script.py") is None
+    # 跨命令不得连坐：前段 env 管道干净，后段独立 grep 到 "token" 一词
+    assert ex._is_blocked("env | grep PATH; grep token notes.txt") is None
+    assert ex._is_blocked("env | grep -i home\ngrep -r token shared/knowledge/") is None
+    # 业务侧正常出现 device/token 字样（无 env 管道、无具体凭据标识符）
+    assert ex._is_blocked('grep -rn "device" shared/knowledge/') is None
+    assert ex._is_blocked('grep -c "token" report.md') is None
+    assert ex._is_blocked("python3 -c 'import os; print(len(os.environ))'") is None
+    # /opt/team 其它子目录不拦（只锁 relay-avatar 与 avatar-cli）
+    assert ex._is_blocked("ls -la /opt/team/skills/") is None
+    assert ex._is_blocked("ls /opt/team/") is None
+    # 回归：boot.sh 是既有放行项（test_hardening.py），收窄口径后仍须放行
+    assert ex._is_blocked("cat /opt/team/relay-boot/boot.sh") is None
+    assert ex._is_blocked("bash /opt/team/relay-boot/boot.sh --check") is None
+    assert ex._is_blocked("tail -50 /var/log/relay-boot.log") is None
+    # 既有放行项未被新规则波及
+    assert ex._is_blocked("curl -s http://127.0.0.1:8787/health") is None
+    assert ex._is_blocked('systemd-analyze calendar "*-*-* 07:35:00"') is None
+    assert ex._is_blocked("store q --tag 市场分析") is None
+    assert ex._is_blocked("ls -la /mnt/vol-eltaah12/workspace/shared/data/Daily/") is None
+
+
+def test_credential_block_does_not_break_existing_allow(ex):
+    """回归：#9 那条曾被误拦的真实命令（同步 dws 凭证进任务 HOME）仍须放行。
+    它含 "auth-token" 字样，是新增凭据规则最可能的误伤面。"""
+    cmd = ('rm -rf "$HOME/.local/share/dws-cli/dws-cli" && '
+           'cp /root/.local/share/dws-cli/auth-token.enc "$HOME/.local/share/dws-cli/" 2>&1; '
+           'ls -la "$HOME/.local/share/dws-cli/"')
+    assert ex._is_blocked(cmd, WORKDIR) is None

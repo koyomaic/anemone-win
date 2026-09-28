@@ -81,6 +81,20 @@ store sync scan|push|verify|backfill          # jingboWiki 同步
 
 > 为什么单列这条：任务 agent 与 relay 服务同为 root，`relay.env` 的 `600` 与 `/proc/<pid>/environ` 的 `400` 对 agent 并无实际约束力，只能靠规则约束。
 
+## 定时任务／计划（硬性：出标记由分身代办，不要自找凭据）
+
+- **任务环境里没有 relay 凭据**（`RELAY_*` 已被剔除）。翻 `env`、翻 `/opt/team/`、grep relay 源码、探测 relay 路由（`/plans`、`/openapi.json`、`/dashboard/*`）**都拿不到**，只会白烧时限（任务超时上限 1800 秒）。缺凭据不是"做不了"，而是"该出标记让分身代办"。
+- **查**「现在有几个定时任务／我的计划」→ 直接调 `CronList` 工具，或在结果正文出 ```plan``` 块 `{"op": "list"}`。
+- **建／删／停／启**计划 → 在**结果正文**出 ```plan``` 围栏块，由分身带凭据执行：
+
+  ```plan
+  {"op": "create", "name": "<计划名>", "on_calendar": "*-*-* 07:35:00", "description": "<到点要执行的任务描述>"}
+  ```
+
+  `op` ∈ `create`/`delete`/`disable`/`enable`/`list`；`delete`/`disable`/`enable` 只需 `name`。`on_calendar` 是 systemd OnCalendar 表达式（每日 07:35 即 `*-*-* 07:35:00`，可用 `systemd-analyze calendar "<表达式>"` 自检）。可选 `priority`(`normal`|`urgent`)、`read_only`(bool)。**`name` 与 `description` 必须填实义值**——留着 `<...>` 占位符会被拒建。
+- 计划创建受权限门禁（仅团队成员）与数量上限（每人 20 个）约束。被拒时分身会把原因原样告知用户，**不要换写法重试绕过**。
+- 为什么单列这一节：2026-09-28 任务 #278 为「现在有几个定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash 去刨 relay 路由、源码与凭据，`CronList` 只调了 1 次；#281 的「建每日 7:35 定时任务」因不知道有代建通道，最终回报「当前凭据下我建不了，需人工执行」——而发起人权限本来就够，机制也早就部署了。
+
 ## 共享知识（取消隔离，个人上传即全员可用）
 
 - `shared/skills/`：团队技能，已自动加载，按技能名直接用。其中**基础技能**（入库到 git `skills/` 的，安装位由技能内 `.dest` 指定，缺省 shared/skills）以 git 为真源：改动须提交回仓库，否则夜间 provision 以仓库版覆盖本机改动（旧版备份 `*.bak-provision-*`）；未入库的本地/实验技能不受限

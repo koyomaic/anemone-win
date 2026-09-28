@@ -386,3 +386,59 @@ def test_plan_ops_are_audited(avatar, cfg):
     lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
     assert "plan_op" in lines and "audited" in lines
     assert "plan_denied" in lines
+
+
+# ── 占位符防护（2026-09-28 补，随 ```plan``` 示例写进任务描述/AGENTS.md 而来）──
+#
+# _relay_marker_rules 与 workspace/AGENTS.md 现在都含字面示例
+# {"name": "<计划名>", "description": "<到点要执行的任务描述>"}。agent 若把示例
+# 原样回显进结果，消费侧会照单建出一个每天到点跑占位符描述的垃圾计划——而它
+# **真会起任务、真会烧配额**。故含 <...> 的 name/description 一律拒建。
+
+
+def test_plan_create_rejects_placeholder_description(avatar, cfg):
+    note = avatar._exec_plan_op(
+        _spec(name="计划名", desc="<到点要执行的任务描述>"), "200")
+    assert not avatar.exec_relay.created
+    assert "占位符" in note and "未创建" in note
+
+
+def test_plan_create_rejects_placeholder_name(avatar, cfg):
+    note = avatar._exec_plan_op(
+        _spec(name="<计划名>", desc="生成昨日经营日报"), "200")
+    assert not avatar.exec_relay.created
+    assert "占位符" in note
+
+
+def test_plan_create_placeholder_rejection_is_audited(avatar, cfg):
+    avatar._exec_plan_op(_spec(desc="<到点要执行的任务描述>"), "200")
+    lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "plan_denied" in lines and "占位符" in lines
+
+
+def test_plan_create_real_values_still_pass(avatar, cfg):
+    """不能误伤：实义描述照建。含尖括号的合法业务文本（如 <html>）也不该被拦，
+    但占位符形态 `<中文短词>` 必须拦——故这里只验正常路径不受影响。"""
+    note = avatar._exec_plan_op(
+        _spec(name="每日成品油预测", desc="调 B0 智能体出成品油价格预测报告，落盘 data/Daily"),
+        "200")
+    assert len(avatar.exec_relay.created) == 1
+    assert "已创建定时计划「每日成品油预测」" in note
+
+
+def test_marker_rules_examples_are_placeholder_guarded(avatar):
+    """自证一致：_relay_marker_rules 里给 agent 照抄的 create 示例，本身必须被
+    占位符防护拦住——否则文档就在教 agent 造垃圾计划。"""
+    import json as _json
+    from app.main import PLAN_BLOCK_RE, _PLACEHOLDER_RE
+    s = {"reply": {"is_group": True, "conversation_id": "cg", "sender": "赵兴峰"}}
+    for blk in PLAN_BLOCK_RE.findall(avatar._relay_marker_rules(s)):
+        sp = _json.loads(blk)
+        if sp.get("op") != "create":
+            continue
+        assert _PLACEHOLDER_RE.search(str(sp.get("description") or "")) \
+            or _PLACEHOLDER_RE.search(str(sp.get("name") or "")), \
+            "文档 create 示例未含占位符：要么已填实值（更好），要么防护失配"
+        assert avatar._exec_plan_op(sp, "200") is not None
+        assert not avatar.exec_relay.created, "示例被当真建出来了"
+

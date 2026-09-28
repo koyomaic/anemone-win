@@ -8,6 +8,7 @@
 另覆盖：升级不降级（越权→relay 且不死循环）、LOCAL 态不被 _poll_sessions 误重置、
 LOCAL 态收到「取消」不得重置会话态（否则卡片永远停在处理中）。
 """
+import json
 import os
 import re
 import time
@@ -15,7 +16,7 @@ import time
 import pytest
 
 from app.exec_local import ExecLocal
-from app.main import Avatar
+from app.main import PLAN_BLOCK_RE, Avatar
 
 
 def setcfg(cfg, section, **kw):
@@ -1216,13 +1217,13 @@ def test_send_result_refuses_task_context_files(av, cfg, shared):
     assert not any("[file]" in c for _, c in av.dws.sent)
 
 
-def test_relay_delivery_rule_names_requester_and_forbids_dws(av, cfg, shared):
+def test_relay_marker_rules_names_requester_and_forbids_dws(av, cfg, shared):
     """提交 relay 时必须附上发起人身份 + 禁止自行 dws 发送 + 标记代投口径。
     缺了它，agent 只能按 dingtalk-send 技能把「本人」理解成机器人自己。"""
     s = sess_of(av)
     s["reply"] = {"is_group": False, "open_dingtalk_id": "sid200",
                   "conversation_id": "c1", "sender": "王洪彬"}
-    rule = av._relay_delivery_rule(s)
+    rule = av._relay_marker_rules(s)
     assert "王洪彬" in rule                      # 告知发起人是谁
     assert "不要自己跑 dws" in rule               # 明确禁止自发
     assert "send_file" in rule                   # 给出替代路径
@@ -1230,13 +1231,75 @@ def test_relay_delivery_rule_names_requester_and_forbids_dws(av, cfg, shared):
     assert av.cfg.avatar_name in rule            # 点明 dws 账号是机器人自己
 
 
-def test_relay_delivery_rule_group_vs_o2o(av, cfg, shared):
+def test_relay_marker_rules_group_vs_o2o(av, cfg, shared):
     s = sess_of(av)
     s["reply"] = {"is_group": True, "conversation_id": "cg", "sender": "李四"}
-    assert "群聊" in av._relay_delivery_rule(s)
+    assert "群聊" in av._relay_marker_rules(s)
     s["reply"] = {"is_group": False, "open_dingtalk_id": "x", "sender": ""}
-    r = av._relay_delivery_rule(s)
+    r = av._relay_marker_rules(s)
     assert "单聊" in r and "发起人" in r          # 无 sender 名时回落通称
+
+
+# ── J. ```plan``` 标记告知（2026-09-28 #281：机制就绪但没人告诉 agent）──
+#
+# 消费侧 _consume_plan_markers、门禁 _plan_gate、审计、配额全都早已部署，但
+# relay 任务的 CLAUDE.md（= workspace/AGENTS.md + shared/memory）grep `plan`
+# 零命中，_relay_marker_rules 此前也只讲 send_file。结果 #281 第 3 项请求
+# 「建每日 7:35 定时任务」的 agent 只能自己翻凭据——翻不到（RELAY_* 已被
+# _scrubbed_environ 剔除），最终回报「当前凭据下我建不了，需人工/授权执行」。
+# 发起人 L2、门禁本就放行：一个能自动完成的请求因缺一行文档变成人工待办。
+
+
+def test_relay_marker_rules_documents_plan_marker(av, cfg, shared):
+    """plan 标记的格式、字段、on_calendar 语法必须写进 relay 任务描述。"""
+    s = sess_of(av)
+    s["reply"] = {"is_group": True, "conversation_id": "cg", "sender": "赵兴峰"}
+    r = av._relay_marker_rules(s)
+    assert "```plan" in r                        # 围栏块字面量，agent 照抄
+    assert '"op": "create"' in r
+    assert "on_calendar" in r and "description" in r
+    assert "*-*-* 07:35:00" in r                 # systemd OnCalendar 实例
+    assert "delete/disable/enable" in r          # 其余 op 也要知道
+    assert "CronList" in r                       # 「有几个定时任务」的正规入口
+
+
+def test_relay_marker_rules_forbids_credential_hunting(av, cfg, shared):
+    """必须显式禁止自找凭据——#278 为此烧掉 5.5 分钟 / 32 次 Bash。"""
+    s = sess_of(av)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "x", "sender": "赵兴峰"}
+    r = av._relay_marker_rules(s)
+    assert "不要自己找 relay 凭据" in r
+    assert "RELAY_*" in r                        # 讲清为什么翻不到
+    assert "禁止" in r and "grep relay 源码" in r
+    assert "不要换写法重试绕过" in r              # 门禁被拒后的处置
+
+
+def test_relay_marker_rules_plan_example_is_parseable(av, cfg, shared):
+    """描述里给的 plan 示例必须能被 PLAN_BLOCK_RE + json.loads 真解析出来。
+    文档里的样例写错一个引号，agent 照抄即失败——故直接跑一遍消费链。"""
+    s = sess_of(av)
+    s["reply"] = {"is_group": True, "conversation_id": "cg", "sender": "赵兴峰"}
+    r = av._relay_marker_rules(s)
+    blocks = PLAN_BLOCK_RE.findall(r)
+    assert blocks, "描述里的 ```plan``` 示例未被 PLAN_BLOCK_RE 匹配到"
+    specs = [json.loads(b) for b in blocks]      # 全部示例必须是合法 JSON
+    assert any(sp.get("op") == "create" for sp in specs)
+    assert any(sp.get("op") == "list" for sp in specs)
+    for sp in specs:
+        if sp.get("op") == "create":
+            assert sp.get("on_calendar") and sp.get("description")
+
+
+def test_relay_submit_carries_plan_marker_rules(av, cfg, shared):
+    """端到端：提交 relay 时描述末尾确实带上了 plan 段（不只是函数返回值对）。"""
+    s = sess_of(av)
+    s["reply"] = {"is_group": True, "conversation_id": "cg", "sender": "赵兴峰"}
+    av._flush(s, uid="40714")
+    sent = av.exec_relay.submitted
+    assert len(sent) == 1, "未提交 relay 任务"
+    desc = sent[-1]["desc"]
+    assert "```plan" in desc and "CronList" in desc
+    assert "定时计划铁律" in desc
 
 
 def test_send_result_delivers_artifact_from_other_task_dir(av, cfg, shared):

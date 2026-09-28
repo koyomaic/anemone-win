@@ -25,6 +25,24 @@ DEFAULT_BLOCKED_PATTERNS = [
     r"\bsystemctl\s+(?:--?\S+\s+)*?(start|stop|restart|try-restart|reload|kill|enable|disable|mask|unmask|edit|daemon-reload|daemon-reexec|isolate|preset)\b",
     r"\bservice\s+[\w.@-]+\s+(start|stop|restart|reload)\b",
     r"\b(pkill|killall)\s+.*\b(relay|app\.serve|uvicorn|claude-proxy)\b",
+    # ---- 凭据枚举拦截（2026-09-28 加固）----
+    # 任务环境本就没有 relay 凭据（executor._ENV_DROP_PREFIXES 剔除 RELAY_*），但
+    # agent 不知道，会花几分钟刨 env / /opt/team / relay 源码找 token：#278 为
+    # 「现在有几个定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash，CronList 只调 1 次。
+    # 拦下来让它快速失败并走审批，好过白烧 1800s 时限。正规入口见 workspace/AGENTS.md
+    # 「定时任务／计划」节与分身注入的 ```plan``` 标记口径。
+    # 用 [^;\n] 而非 [^|]：目标命令形如 `env | grep -iE "relay|ta_|token"`，引号内
+    # 含 `|`，用 [^|] 会在第一个竖线处截断而漏判；排除 `;` 与换行则避免跨命令误伤
+    # （如 `env | grep PATH; grep token notes.txt` 不应命中）。
+    r"\b(?:env|printenv)\b[^;\n]{0,60}?\|\s*(?:grep|egrep|fgrep|rg)\b[^;\n]{0,120}?"
+    r"\b(?:token|secret|passw|api[_-]?key|auth|credential|device)\b",
+    r"/proc/(?:\d+|self)/environ",                   # 读进程环境（AGENTS.md 已明禁）
+    # 分身目录与 avatar-cli（持 dws 凭据、policy.toml、run/ 状态）。
+    # **不含 relay-boot**：`cat /opt/team/relay-boot/boot.sh` 是既有放行项
+    # （tests/test_hardening.py），boot.sh 是可读脚本而非凭据，拦它会回归。
+    r"/opt/team/relay-avatar\b|\bavatar-cli\b",
+    # 具体凭据标识符（非泛词，误伤面极小）：出现即说明在找 relay 设备/管理员凭据
+    r"\brelay_(?:device|admin)[a-z_]*\b|\bdevice_secret\b|\bx-device-id\b",
 ]
 DEFAULT_RM_SAFE_PREFIXES = ["/tmp", "/var/tmp"]
 
