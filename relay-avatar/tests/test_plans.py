@@ -323,3 +323,66 @@ def test_exec_relay_plan_audit_real(cfg):
     ex.delete_plan(1, uid="18434")
     lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
     assert "plan_create" in lines and "plan_update" in lines and "plan_delete" in lines
+
+
+# ── 标记路径的权限门禁（2026-09-25 补）──
+# 此前只有 _handle_plan（用户直接下计划命令）有门禁，而 ```plan``` 标记路径
+# （_consume_plan_markers → _exec_plan_op → _plan_create_note）**完全不看 uid**，
+# 只校验 on_calendar/description 非空与重名。ecc3650 又把触发条件放宽到「无前缀但
+# 句首节奏词+完整钟点」，于是任何能让 agent 吐出标记的输入都能建每日自动执行的
+# 任务——计划的 description 会成为后续每天的任务提示词，是持久化注入的落点。
+
+def _spec(name="x", desc="y"):
+    return {"op": "create", "name": name, "on_calendar": "*-*-* 08:00:00",
+            "description": desc}
+
+
+def test_marker_plan_gate_denies_l3(avatar):
+    """L3（文件投递用户，任何能发文件的人都落这档）不得经标记建计划。"""
+    note = avatar._exec_plan_op(_spec(), "300")
+    assert not avatar.exec_relay.created
+    assert "权限" in note
+
+
+def test_marker_plan_gate_denies_guest_and_blocked(avatar):
+    for uid in ("555", "999"):                 # NONE / BLOCKED
+        avatar.exec_relay.created.clear()
+        note = avatar._exec_plan_op(_spec(), uid)
+        assert not avatar.exec_relay.created, uid
+        assert "权限" in note, uid
+
+
+def test_marker_plan_gate_allows_team_tiers(avatar):
+    """super/L1/L2 照常放行——不能把既有能力一起关掉（现有 3 个每日计划即 L2 所建）。"""
+    for uid in ("18434", "100", "200"):        # super / L1 / L2
+        avatar.exec_relay.created.clear()
+        avatar.exec_relay.plans.clear()
+        note = avatar._exec_plan_op(_spec(name=f"p{uid}"), uid)
+        assert avatar.exec_relay.created, f"{uid} 应放行"
+        assert "已创建定时计划" in note
+
+
+def test_marker_plan_gate_covers_mutating_ops_only(avatar):
+    """delete/disable/enable 同样受门禁；list 只读且按 uid 限定，不设门禁。"""
+    for op in ("delete", "disable", "enable"):
+        note = avatar._exec_plan_op({"op": op, "name": "x"}, "300")
+        assert "权限" in note, op
+    assert avatar._exec_plan_op({"op": "list"}, "300") is not None
+
+
+def test_plan_create_capped(avatar, cfg):
+    """数量上限：每个计划到点都用分身凭据起真实任务，无上限即无限刷配额。"""
+    cfg._p.setdefault("security", {}).update(plan_max_per_user=2)
+    avatar.exec_relay.plans.extend([{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
+    note = avatar._exec_plan_op(_spec(name="c"), "200")
+    assert not avatar.exec_relay.created
+    assert "上限" in note
+
+
+def test_plan_ops_are_audited(avatar, cfg):
+    """plan 操作此前**完全无审计**：建了/删了谁都不知道，出问题无从追溯。"""
+    avatar._exec_plan_op(_spec(name="audited"), "200")
+    avatar._exec_plan_op(_spec(), "300")                 # 被拒的也要留痕
+    lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "plan_op" in lines and "audited" in lines
+    assert "plan_denied" in lines

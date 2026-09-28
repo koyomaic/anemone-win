@@ -135,21 +135,44 @@ l2_add_dirs = []               # local 后端额外只读目录：subagent 要�
 # （fail-closed）。开启后 policy.py 自动从 local_orchestrate_disallowed 摘除
 # Write/Edit，**Bash 始终禁用**——故 pptx/docx/xlsx 等需跑 python 的件由
 # needs_bash_backend 前置判定直接送 relay 门禁，不进 local 空转。
-# **刻意不给** knowledge/Agents/G-Skills/Z-Skills/memory/data/templates/secrets/mcp：
-# memory 会自动并入每个任务的 CLAUDE.md（改它＝向所有后续任务注入提示词）、
-# data 是经营数据入站真源（可写＝能伪造后续报告引用的"真实数据"）、
-# Agents/*-Skills 是机队行为定义。这些一律只读，要改走 relay 门禁。
+# 三层作用域，别混（2026-09-25 解耦后）：
+#   local_write_dirs = claude 的 Edit/Write **工具**作用域（生成 Edit(//abs/**) 规则）
+#   local_send_dirs  = ```send_file``` 代投作用域（main.py 的 _send_roots 读这一项）
+#   local_sandbox_rw = 内核可写白名单（Bash 落盘由它管辖，才是真正的边界）
+# 三者应当满足 local_send_dirs ⊆ local_write_dirs ≈ local_sandbox_rw（去掉 /tmp 与
+# .cchome）。**local_send_dirs 必须刻意更窄**：此前代投直接读 local_write_dirs，
+# 于是「放宽 Edit 可写」与「放宽代投取件」被绑死——把 data/ 开放给写之后，代投就能
+# 从 shared/data/<任意 sender>/ 取别人的上传件发给当前会话，破坏 L3 发件人隔离
+# （data/ 按 sender 分目录，而 local 任务本来就能读到别人的）。故代投只给正式交付区
+# report/ 与草稿区 work/：能发的仅限「它为用户产出的件」。
+# 未配置 local_send_dirs 时代码回落 local_write_dirs（向后兼容），所以**必须显式配置**。
 #
-# ⚠ 本项与下面的 local_sandbox_rw 是**两层不同的作用域**，别混：
-#   local_write_dirs = claude 的 Edit/Write 工具作用域 **且** ```send_file``` 代投
-#                      作用域（main.py 的 _consume_send_markers 直接读这一项）。
-#   local_sandbox_rw = 内核可写白名单（Bash 放开后由它管辖）。
-# 两者耦合决定了 local_write_dirs **不能随意放宽**：放宽到 shared/data 会让
-# send_file 能取任意 sender 目录的件外发，破坏 L3 发件人隔离。要放宽内核可写范围
-# 请改 local_sandbox_rw，不要改这一项。
-# 实际可写范围 = 两者交集：Bash 禁用时（阶段一）等于 local_write_dirs；
-# Bash 放开后（阶段二）等于 local_sandbox_rw。
-local_write_dirs = []
+# local_write_dirs 可与 local_sandbox_rw 对齐：Bash 已在内核沙箱内可用，内核白名单
+# 才是真边界，本项只是让 Edit/Write 与之一致——否则会出现「Bash 能写、Edit 被拒」的
+# 割裂，agent 无从理解也容易被诱导去绕。
+# **仍刻意不给**（两层一致）：avatar/（policy.toml 与 state.json，agent 不能改自己的
+# 策略）、index/（台账与 store-task.env）、tools/ venv*/（可执行代码与环境，可写＝
+# 持久化任意代码执行）、_sync/ tmp/ secrets/。
+local_write_dirs = [
+  "/mnt/vol-eltaah12/workspace/shared/work",
+  "/mnt/vol-eltaah12/workspace/shared/report",
+  "/mnt/vol-eltaah12/workspace/shared/skills",
+  "/mnt/vol-eltaah12/workspace/shared/skills-proposed",
+  "/mnt/vol-eltaah12/workspace/shared/G-Skills",
+  "/mnt/vol-eltaah12/workspace/shared/Z-Skills",
+  "/mnt/vol-eltaah12/workspace/shared/Agents",
+  "/mnt/vol-eltaah12/workspace/shared/knowledge",
+  "/mnt/vol-eltaah12/workspace/shared/templates",
+  "/mnt/vol-eltaah12/workspace/shared/models",
+  "/mnt/vol-eltaah12/workspace/shared/mcp",
+  "/mnt/vol-eltaah12/workspace/shared/memory",
+  "/mnt/vol-eltaah12/workspace/shared/data",
+]
+# 代投作用域：**必须比 local_write_dirs 窄**，只给正式交付区与草稿区。
+local_send_dirs = [
+  "/mnt/vol-eltaah12/workspace/shared/report",
+  "/mnt/vol-eltaah12/workspace/shared/work",
+]
 # local 通路**可删**目录（```delete_file``` 标记的作用域）。刻意比 local_write_dirs
 # 更窄：只给草稿区 shared/work。shared/report 是正式交付区、local 又不做 baseline
 # 快照，删了不可追溯，故不开放——要删交付件走 relay 门禁（那边有 baseline +
@@ -236,6 +259,8 @@ local_sandbox_net_allow = [
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）
+plan_max_per_user = 20         # 每用户定时计划上限（每个计划到点都用分身凭据起真实
+                               # 任务，无上限即无限刷配额）；0＝不限
 reprompt_cooldown_sec = 60     # 门禁无关消息重提示冷却
 bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt",   # 「AI助理」（曾与分身互刷死循环）
                  "D8YACgStfKBdniisB5xLrLu2EyEI8kX7NU",   # 「原油AI研究院」bot（2026-09-23 互刷事故）

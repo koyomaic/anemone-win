@@ -1288,3 +1288,55 @@ def test_send_result_refuses_escape_via_task_dir(av, cfg, shared):
         av._send_result(s, {"id": 281, "workdir": str(w),
                             "result": '```send_file\n{"path": "%s"}\n```' % bad})
         assert not any("[file]" in c for _, c in av.dws.sent), bad
+
+
+# ── I. 代投作用域与可写作用域解耦（2026-09-25）──
+# 此前 _consume_send_markers 直接读 local_write_dirs，于是「放宽 Edit 可写」与
+# 「放宽代投取件」被绑死：阶段二把 data/ 开放给写之后，代投就能从
+# shared/data/<任意 sender>/ 取别人的上传件发给当前会话，破坏 L3 发件人隔离。
+# 故独立出 security.local_send_dirs（窄），local_write_dirs 可随内核 rw 放宽。
+
+def test_send_roots_prefers_local_send_dirs(av, cfg, shared):
+    write_ready(cfg, shared, dirs=("report", "work", "data"))
+    send_only = str(shared / "report")
+    setcfg(cfg, "security", local_send_dirs=[send_only])
+    roots = av._send_roots()
+    assert roots == [os.path.realpath(send_only)]
+    assert os.path.realpath(str(shared / "data")) not in roots
+
+
+def test_send_roots_falls_back_to_write_dirs(av, cfg, shared):
+    """未配置 local_send_dirs 时回落 local_write_dirs——否则既有部署升级后
+    代投作用域突然变空、文件全发不出去（向后兼容）。"""
+    _, wd = write_ready(cfg, shared)
+    setcfg(cfg, "security", local_send_dirs=[])
+    assert sorted(av._send_roots()) == sorted(os.path.realpath(x) for x in wd)
+
+
+def test_send_refuses_data_dir_even_though_writable(av, cfg, shared):
+    """**核心**：data/ 在 local_write_dirs 里（阶段二起 Edit 与 Bash 都能写），
+    但不在 local_send_dirs 里 → 代投必须拒。否则 agent 能把别人的上传件外发。"""
+    write_ready(cfg, shared, dirs=("report", "work", "data"))
+    setcfg(cfg, "security", local_send_dirs=[str(shared / "report"),
+                                             str(shared / "work")])
+    victim = _mk(str(shared / "data" / "2026" / "2026-09" / "2026-09-25"
+                     / "别的sender" / "内部件.md"), "别人的数据")
+    s = sess_of(av)
+    clean, notes = av._consume_send_markers(_send_block(victim), s, 31, "200")
+    assert any("拒绝代投" in n for n in notes)
+    assert not any("[file]" in c for _, c in av.dws.sent)
+
+
+def test_send_still_delivers_from_send_dirs(av, cfg, shared):
+    """解耦后正常交付不受影响：report/ 与 work/ 里的件照常代投。"""
+    write_ready(cfg, shared, dirs=("report", "work", "data"))
+    setcfg(cfg, "security", local_send_dirs=[str(shared / "report"),
+                                             str(shared / "work")])
+    s = sess_of(av)
+    for d in ("report", "work"):
+        p = _mk(str(shared / d / "2026-09" / f"件_{d}.html"), "<html>x</html>")
+        av.dws.sent.clear()
+        av._consume_send_markers(_send_block(p), dict(s, send_applied=None),
+                                 32, "200")
+        assert any("[file]" in c and f"件_{d}.html" in c
+                   for _, c in av.dws.sent), d
