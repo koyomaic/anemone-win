@@ -231,3 +231,74 @@ def test_dashboard_page_has_timers_section(relay_dash):
         assert 'id="timers"' in html and "系统定时器" in html
     finally:
         c.close()
+
+
+# ---- P1 运营视角：days 档位 / 用户 last_active / 任务详情端点 ----
+
+def _dash_login(base: str) -> httpx.Client:
+    c = httpx.Client(base_url=base, timeout=10)
+    c.post("/login", data={"password": "dash-test-pw"}, follow_redirects=False)
+    return c
+
+
+def test_dashboard_data_days_param(relay_dash):
+    c = _dash_login(relay_dash["base"])
+    try:
+        assert c.get("/dashboard/data").json()["report"]["days"] == 7
+        assert c.get("/dashboard/data?days=30").json()["report"]["days"] == 30
+        # 任意值收敛到两档：<30 → 7，>=30 → 30（防任意区间扫库）
+        assert c.get("/dashboard/data?days=999").json()["report"]["days"] == 30
+        assert c.get("/dashboard/data?days=3").json()["report"]["days"] == 7
+    finally:
+        c.close()
+
+
+def test_report_by_user_last_active_and_failed(tmp_path):
+    from app.db import DB
+    db = DB(str(tmp_path / "relay.db"))
+    t1 = db.create_task(user="甲", description="x")
+    db.set(t1, status="failed")
+    t2 = db.create_task(user="甲", description="y")
+    db.set(t2, status="done", tokens=3)
+    u = db.report(7)["by_user"][0]
+    assert u["tasks"] == 2 and u["done"] == 1 and u["failed"] == 1
+    assert u["last_active"] > 0 and u["tokens"] == 3
+    db.close()
+
+
+def test_dashboard_task_detail(relay_dash):
+    from app.db import DB
+    db = DB(str(relay_dash["ws"] / "relay.db"))
+    tid = db.create_task(user="tester", description="详情测试")
+    db.set(tid, status="done", tokens=5, result="ok", finished_at=time.time())
+    db.close()
+    base = relay_dash["base"]
+    anon = httpx.Client(base_url=base, timeout=10)
+    try:
+        assert anon.get(f"/dashboard/tasks/{tid}").status_code == 401  # 未登录
+    finally:
+        anon.close()
+    c = _dash_login(base)
+    try:
+        r = c.get(f"/dashboard/tasks/{tid}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["description"] == "详情测试"
+        assert body["status"] == "done" and body["tokens"] == 5
+        assert body["result"] == "ok"
+        # 内部实现字段不回显
+        assert "workdir" not in body and "session_id" not in body
+        assert c.get("/dashboard/tasks/999999").status_code == 404
+    finally:
+        c.close()
+
+
+def test_dashboard_page_has_ops_elements(relay_dash):
+    c = _dash_login(relay_dash["base"])
+    try:
+        html = c.get("/").text
+        for marker in ("任务趋势", 'id="trend"', 'id="fstatus"', 'id="fuser"',
+                       'id="modal"', "用户运营", "rng30", "openDetail"):
+            assert marker in html, marker
+    finally:
+        c.close()

@@ -556,11 +556,16 @@ class DB:
             if r["status"] in d:
                 d[r["status"]] += 1
             u = by_user.setdefault(r["user"],
-                                   {"user": r["user"], "tasks": 0, "done": 0, "tokens": 0})
+                                   {"user": r["user"], "tasks": 0, "done": 0,
+                                    "failed": 0, "tokens": 0, "last_active": 0.0})
             u["tasks"] += 1
             u["tokens"] += r["tokens"] or 0
             if r["status"] == "done":
                 u["done"] += 1
+            elif r["status"] == "failed":
+                u["failed"] += 1
+            if r["created_at"] > u["last_active"]:
+                u["last_active"] = r["created_at"]
             if r["status"] == "conflict":
                 conflicts += 1
             if r["blocked_cmd"]:

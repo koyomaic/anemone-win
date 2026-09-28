@@ -90,15 +90,35 @@ td.desc{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 .cancelled{background:#334155;color:#94a3b8}.pending_approval{background:#713f12;color:#fde047}
 .local{background:#3b0764;color:#d8b4fe}
 .num{text-align:right;font-variant-numeric:tabular-nums}
+h2.sec{display:flex;align-items:baseline}
+.rngs{margin-left:auto;display:flex;gap:6px}
+.rng{padding:2px 10px;border-radius:8px;border:1px solid #334155;background:#1e293b;color:#94a3b8;font-size:12px;cursor:pointer}
+.rng.on{background:#2563eb;border-color:#2563eb;color:#fff}
+.sub2{font-size:12px;color:#64748b;font-weight:400;margin-left:10px}
+select{padding:6px 10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-size:13px}
+#modal{position:fixed;inset:0;background:rgba(2,6,23,.72);align-items:center;justify-content:center;z-index:50}
+#modal-box{background:#1e293b;border:1px solid #334155;border-radius:12px;max-width:880px;width:92%;max-height:84vh;display:flex;flex-direction:column}
+#modal-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #293548;font-size:14px}
+#modal-body{padding:14px 16px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:12px;margin:0;color:#cbd5e1}
+tr.trow{cursor:pointer}
+tr.trow:hover td{background:#22304a}
 </style></head><body><div class="wrap">
 <header><h1>团队中转服务 <sub id="upd"></sub></h1>
 <nav><a href="#" id="tab-metrics" class="on">调用情况</a><a href="#" id="tab-tokens">凭证管理</a><a href="#" id="tab-shared">共享知识</a><a href="#" id="tab-plans">计划</a></nav>
 <a href="/logout">退出</a></header>
 <div id="view-metrics">
 <div class="cards" id="cards"></div>
+<h2 class="sec">任务趋势<span class="rngs"><button id="rng7" class="rng on">7 天</button><button id="rng30" class="rng">30 天</button></span></h2>
+<div id="trend"></div>
 <h2>各状态任务</h2><div id="dist" style="font-size:13px"></div>
-<h2>按用户（近 7 天）</h2><div id="users"></div>
-<h2>最近任务</h2><div id="tasks"></div>
+<h2 class="sec">用户运营<span id="urange" class="sub2"></span></h2><div id="users"></div>
+<h2>最近任务</h2>
+<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+<select id="fstatus"><option value="">全部状态</option></select>
+<select id="fuser"><option value="">全部用户</option></select>
+<span style="font-size:12px;color:#64748b;align-self:center">点击行查看详情</span>
+</div>
+<div id="tasks"></div>
 </div>
 <div id="view-tokens" style="display:none">
 <h2>新建凭证</h2>
@@ -155,6 +175,9 @@ td.desc{max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowra
 <div id="timers"></div>
 </div>
 </div>
+<div id="modal" style="display:none"><div id="modal-box">
+<div id="modal-head"><b id="modal-title"></b><a href="#" id="modal-close">关闭</a></div>
+<pre id="modal-body"></pre></div></div>
 <script>
 const ST={done:"已完成",review:"待检查",running:"执行中",queued:"排队中",failed:"失败",
 conflict:"冲突",cancelled:"已取消",pending_approval:"待审批"};
@@ -162,40 +185,161 @@ function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt
 function badge(s){return `<span class="b ${esc(s)}">${ST[s]||esc(s)}</span>`}
 function fmtT(t){if(!t)return"-";const d=new Date(t*1000);
 return d.toLocaleDateString("zh",{month:"2-digit",day:"2-digit"})+" "+d.toLocaleTimeString("zh",{hour12:false})}
+let DAYS=7,LAST=null,TOKU=[];
+const C_TREND={done:"#4ade80",failed:"#f87171",conflict:"#fcd34d",pending_approval:"#fde047",cancelled:"#64748b",other:"#60a5fa"};
+const LIVE_ST=["queued","running","pending_approval","review"];
+function fmtDur(t){
+ const s=t.started_at||t.created_at;
+ const live=LIVE_ST.includes(t.status);
+ const e=t.finished_at||(live?Date.now()/1000:0);
+ if(!s||!e)return"-";
+ const d=Math.max(0,e-s);
+ const str=d<60?Math.round(d)+"秒":d<3600?Math.floor(d/60)+"分"+Math.round(d%60)+"秒":Math.floor(d/3600)+"时"+Math.floor(d%3600/60)+"分";
+ return live?str+"…":str;
+}
+function sparkSVG(days){
+ if(!days.length)return"";
+ const mx=Math.max(1,...days.map(d=>d.submitted||0)),w=days.length*7;
+ return `<svg width="${w}" height="24" style="display:block;margin-top:6px">${days.map((d,i)=>{
+  const h=Math.round((d.submitted||0)/mx*20);
+  return `<rect x="${i*7}" y="${22-h}" width="5" height="${Math.max(h,(d.submitted||0)?2:0)}" rx="1" fill="${(d.failed||0)+(d.conflict||0)?"#f87171":"#4ade80"}" opacity=".85"><title>${d.day} 提交${d.submitted||0} 完成${d.done||0}</title></rect>`;}).join("")}</svg>`;
+}
+function trendSVG(days){
+ if(!days.length)return'<p style="font-size:13px;color:#64748b">暂无数据</p>';
+ const mx=Math.max(1,...days.map(d=>d.submitted||0));
+ const bw=Math.max(12,Math.min(34,Math.floor(820/days.length))),gap=Math.max(3,Math.round(bw*0.25));
+ const H=150,w=days.length*(bw+gap)+36;
+ const keys=["done","failed","conflict","pending_approval","cancelled"];
+ let bars="",labels="";
+ const step=days.length>16?Math.ceil(days.length/8):1;
+ days.forEach((d,i)=>{
+  const x=30+i*(bw+gap);let y=H;
+  const segs=[];let rest=d.submitted||0;
+  keys.forEach(k=>{const v=d[k]||0;if(v>0){segs.push([k,v]);rest-=v;}});
+  if(rest>0)segs.push(["other",rest]);
+  segs.forEach(([k,v])=>{const h=Math.max(2,v/mx*H);y-=h;
+   bars+=`<rect x="${x}" y="${y.toFixed(1)}" width="${bw}" height="${h.toFixed(1)}" fill="${C_TREND[k]||C_TREND.other}"><title>${d.day} ${ST[k]||"进行中/排队"}: ${v}（当日提交 ${d.submitted}）</title></rect>`;});
+  if(i%step===0)labels+=`<text x="${x+bw/2}" y="${H+16}" fill="#64748b" font-size="10" text-anchor="middle">${d.day.slice(5)}</text>`;
+ });
+ const legend=[["done","完成"],["failed","失败"],["conflict","冲突"],["pending_approval","待审批"],["cancelled","取消"],["other","进行中/排队"]]
+  .map(([k,t])=>`<span style="margin-right:14px"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${C_TREND[k]};margin-right:4px"></i>${t}</span>`).join("");
+ return `<div style="font-size:12px;color:#94a3b8;margin-bottom:6px">${legend}</div>`+
+  `<svg width="100%" viewBox="0 0 ${w} ${H+24}" style="max-width:${w}px"><line x1="26" y1="${H}" x2="${w-4}" y2="${H}" stroke="#334155"/>${bars}${labels}</svg>`;
+}
+function renderCards(m,rep){
+ const days=rep.by_day||[];
+ const sub=days.reduce((a,d)=>a+(d.submitted||0),0);
+ const dn=days.reduce((a,d)=>a+(d.done||0),0);
+ const rate=sub?Math.round(dn/sub*100):0,td=m.today;
+ document.getElementById("cards").innerHTML=[
+  ["运行/排队",`${m.active} / ${m.queued}`,"上限 "+m.max_concurrent,""],
+  ["今日任务",td.submitted,"完成率 "+Math.round((td.done_rate||0)*100)+"%",""],
+  [`近 ${rep.days||DAYS} 天`,sub,`完成率 ${rate}%`,sparkSVG(days.slice(-14))],
+  ["已运行",Math.floor(m.uptime_seconds/3600)+"h "+Math.floor(m.uptime_seconds%3600/60)+"m",
+   esc(m.engine)+" · "+esc(String(m.version||"").slice(0,12)),""],
+ ].map(([k,v,s,sp])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div>${sp}</div>`).join("");
+}
+function renderUsers(rep){
+ const byName={};(rep.by_user||[]).forEach(u=>byName[u.user]=u);
+ const names=[...new Set([...Object.keys(byName),...TOKU.map(u=>u.name)])];
+ const now=Date.now()/1000;
+ const rows=names.map(n=>{
+  const s=byName[n]||{user:n,tasks:0,done:0,failed:0,tokens:0,done_rate:0,last_active:0};
+  const t=TOKU.find(x=>x.name===n);
+  let st,stc,ord;
+  if(!t){st="—";stc="#64748b";ord=s.tasks>0?0:1}
+  else if(!t.consumed_at){st="⏳ 未激活";stc="#fbbf24";ord=2}
+  else if(s.tasks>0&&(now-(s.last_active||0))<7*86400){st="🔥 活跃";stc="#4ade80";ord=0}
+  else{st="💤 沉默";stc="#94a3b8";ord=1}
+  return{...s,st,stc,ord};
+ });
+ rows.sort((a,b)=>a.ord-b.ord||(b.last_active||0)-(a.last_active||0));
+ document.getElementById("users").innerHTML=`<table><tr><th>用户</th><th>状态</th><th class="num">任务</th>
+  <th class="num">完成</th><th class="num">完成率</th><th class="num">tokens</th><th>最近活跃</th></tr>`+
+  (rows.map(u=>`<tr><td>${esc(u.user)}</td><td style="color:${u.stc};font-size:12px">${u.st}</td>
+   <td class="num">${u.tasks}</td><td class="num">${u.done}</td>
+   <td class="num">${Math.round((u.done_rate||0)*100)}%</td><td class="num">${u.tokens||0}</td>
+   <td style="font-size:12px;color:#94a3b8">${u.last_active?fmtT(u.last_active):"-"}</td></tr>`).join("")||
+   '<tr><td colspan="7" style="color:#64748b">暂无用户</td></tr>')+"</table>";
+ const cnt=o=>rows.filter(r=>r.ord===o).length;
+ document.getElementById("urange").textContent=
+  `近 ${rep.days||DAYS} 天 · 🔥活跃 ${cnt(0)} · 💤沉默 ${cnt(1)} · ⏳未激活 ${cnt(2)}`;
+}
+function populateFilters(ts){
+ const fs=document.getElementById("fstatus"),fu=document.getElementById("fuser");
+ const curS=fs.value,curU=fu.value;
+ const sts=[...new Set(ts.map(t=>t.status))];
+ const usrs=[...new Set(ts.map(t=>t.user))].sort();
+ fs.innerHTML='<option value="">全部状态</option>'+sts.map(s=>`<option value="${esc(s)}">${ST[s]||esc(s)}</option>`).join("");
+ fu.innerHTML='<option value="">全部用户</option>'+usrs.map(u=>`<option value="${esc(u)}">${esc(u)}</option>`).join("");
+ if(sts.includes(curS))fs.value=curS;
+ if(usrs.includes(curU))fu.value=curU;
+}
+function renderTasks(){
+ if(!LAST)return;
+ const fs=document.getElementById("fstatus").value,fu=document.getElementById("fuser").value;
+ let ts=LAST.tasks||[];
+ if(fs)ts=ts.filter(t=>t.status===fs);
+ if(fu)ts=ts.filter(t=>t.user===fu);
+ document.getElementById("tasks").innerHTML=`<table><tr><th>#</th><th>用户</th><th>状态</th><th>备注</th>
+   <th>任务</th><th>提交</th><th>耗时</th><th class="num">tokens</th><th>操作</th></tr>`+
+  (ts.map(t=>{
+    const blocked=t.status==="pending_approval";
+    const bc=t.blocked_cmd||t.error||"";
+    const act=blocked?`<a href="#" class="act" data-k="appr" data-n="${t.id}" title="${esc(bc)}" style="color:#4ade80">批准</a>
+     <a href="#" class="act" data-k="deny" data-n="${t.id}" style="color:#f87171">拒绝</a>`
+     :`<a href="#" class="act" data-k="det" data-n="${t.id}">详情</a>`;
+    return `<tr class="trow" data-id="${t.id}"><td>${t.id}</td><td>${esc(t.user)}</td><td>${badge(t.status)}${t.engine==="local"?` <span class="b local" title="本机 local 通路：作用域写（仅 report/work 文本件）、无 Bash、不过门禁审批、无 baseline 快照；changed_files 为 agent 自报、未经核验">local</span>`:""}</td>
+   <td style="font-size:12px;color:#94a3b8" title="${esc(t.error||'')}">${esc((t.error||'').slice(0,24))}</td>
+   <td class="desc" title="${esc(t.description)}">${esc(t.description)}</td>
+   <td>${fmtT(t.created_at)}</td><td style="font-size:12px">${fmtDur(t)}</td><td class="num">${t.tokens||0}</td>
+   <td>${act}</td></tr>`;
+  }).join("")||'<tr><td colspan="9" style="color:#64748b">无匹配任务</td></tr>')+"</table>";
+}
+async function openDetail(id){
+ const r=await fetch("/dashboard/tasks/"+encodeURIComponent(id));
+ if(!r.ok){alert("读取失败: "+r.status);return;}
+ const t=await r.json();
+ document.getElementById("modal-title").textContent=`任务 #${t.id} · ${t.user} · ${ST[t.status]||t.status}`;
+ const L=["描述：",t.description||"（空）",""];
+ if(t.result)L.push("结果（节选）：",t.result,"");
+ if(t.error)L.push("错误：",t.error,"");
+ if(t.blocked_cmd)L.push("拦截命令：",t.blocked_cmd,"");
+ L.push(`状态: ${t.status}　引擎: ${t.engine||"-"}　只读: ${t.read_only?"是":"否"}　优先级: ${t.priority||"normal"}`);
+ L.push(`提交: ${fmtT(t.created_at)}　开始: ${fmtT(t.started_at)}　结束: ${fmtT(t.finished_at)}　耗时: ${fmtDur(t)}`);
+ L.push(`tokens: ${t.tokens||0}${t.resume_from?`　续跑自: #${t.resume_from}`:""}`);
+ if((t.changed_files||[]).length)L.push("","改动文件：",t.changed_files.join("\\n"));
+ if((t.conflicts||[]).length)L.push("","冲突：",JSON.stringify(t.conflicts,null,1));
+ document.getElementById("modal-body").textContent=L.join("\\n");
+ document.getElementById("modal").style.display="flex";
+}
 async function refresh(){
  try{
-  const r=await fetch("/dashboard/data");if(!r.ok)throw 0;const d=await r.json();
-  const m=d.metrics,t7=m.last_7d,td=m.today;
-  document.getElementById("cards").innerHTML=[
-   ["运行/排队",`${m.active} / ${m.queued}`,"上限 "+m.max_concurrent],
-   ["今日任务",td.submitted,"完成率 "+Math.round((td.done_rate||0)*100)+"%"],
-   ["近 7 天",t7.submitted,"完成率 "+Math.round((t7.done_rate||0)*100)+"%"],
-   ["已运行",Math.floor(m.uptime_seconds/3600)+"h "+Math.floor(m.uptime_seconds%3600/60)+"m",m.engine],
-  ].map(([k,v,s])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`).join("");
-  document.getElementById("dist").innerHTML=Object.entries(m.tasks)
+  const [r,tr]=await Promise.all([fetch("/dashboard/data?days="+DAYS),fetch("/dashboard/tokens")]);
+  if(!r.ok)throw 0;
+  const d=await r.json();
+  LAST=d;
+  if(tr.ok){try{TOKU=(await tr.json()).users||[]}catch(e){}}
+  renderCards(d.metrics,d.report);
+  document.getElementById("trend").innerHTML=trendSVG(d.report.by_day||[]);
+  document.getElementById("dist").innerHTML=Object.entries(d.metrics.tasks)
    .map(([s,n])=>`${badge(s)} ${n}`).join("　")||"无任务";
-  document.getElementById("users").innerHTML=`<table><tr><th>用户</th><th class="num">任务</th>
-   <th class="num">完成</th><th class="num">完成率</th><th class="num">tokens</th></tr>`+
-   (d.report.by_user||[]).map(u=>`<tr><td>${esc(u.user)}</td><td class="num">${u.tasks}</td>
-   <td class="num">${u.done}</td><td class="num">${Math.round((u.done_rate||0)*100)}%</td>
-   <td class="num">${u.tokens||0}</td></tr>`).join("")+"</table>";
-  document.getElementById("tasks").innerHTML=`<table><tr><th>#</th><th>用户</th><th>状态</th><th>备注</th>
-    <th>任务</th><th>提交</th><th>结束</th><th class="num">tokens</th><th>操作</th></tr>`+
-   (d.tasks||[]).map(t=>{
-     const blocked=t.status==="pending_approval";
-     const bc=t.blocked_cmd||t.error||"";
-     const act=blocked?`<a href="#" class="act" data-k="appr" data-n="${t.id}" title="${esc(bc)}" style="color:#4ade80">批准</a>
-      <a href="#" class="act" data-k="deny" data-n="${t.id}" style="color:#f87171">拒绝</a>`:"";
-     return `<tr><td>${t.id}</td><td>${esc(t.user)}</td><td>${badge(t.status)}${t.engine==="local"?` <span class="b local" title="本机 local 通路：作用域写（仅 report/work 文本件）、无 Bash、不过门禁审批、无 baseline 快照；changed_files 为 agent 自报、未经核验">local</span>`:""}</td>
-    <td style="font-size:12px;color:#94a3b8" title="${esc(t.error||'')}">${esc((t.error||'').slice(0,24))}</td>
-    <td class="desc" title="${esc(t.description)}">${esc(t.description)}</td>
-    <td>${fmtT(t.created_at)}</td><td>${fmtT(t.finished_at)}</td><td class="num">${t.tokens||0}</td>
-    <td>${act}</td></tr>`;
-   }).join("")
-    +"</table>";
+  renderUsers(d.report);
+  populateFilters(d.tasks||[]);
+  renderTasks();
   document.getElementById("upd").textContent="更新于 "+new Date().toLocaleTimeString("zh",{hour12:false});
  }catch(e){}
 }
+function setDays(n){DAYS=n;
+ document.getElementById("rng7").className="rng"+(n===7?" on":"");
+ document.getElementById("rng30").className="rng"+(n===30?" on":"");
+ refresh();}
+document.getElementById("rng7").addEventListener("click",()=>setDays(7));
+document.getElementById("rng30").addEventListener("click",()=>setDays(30));
+document.getElementById("fstatus").addEventListener("change",renderTasks);
+document.getElementById("fuser").addEventListener("change",renderTasks);
+document.getElementById("modal-close").addEventListener("click",e=>{e.preventDefault();document.getElementById("modal").style.display="none";});
+document.getElementById("modal").addEventListener("click",e=>{if(e.target.id==="modal")document.getElementById("modal").style.display="none";});
 function showTab(v){
   document.getElementById("view-metrics").style.display=v==="m"?"":"none";
   document.getElementById("view-tokens").style.display=v==="t"?"":"none";
@@ -214,18 +358,25 @@ document.getElementById("tab-tokens").addEventListener("click",e=>{e.preventDefa
 document.getElementById("tab-shared").addEventListener("click",e=>{e.preventDefault();showTab("s")});
 document.getElementById("tab-plans").addEventListener("click",e=>{e.preventDefault();showTab("p")});
 document.getElementById("tasks").addEventListener("click",async e=>{
- const a=e.target.closest("a.act");if(!a)return;e.preventDefault();
- const k=a.dataset.k,n=a.dataset.n;
- if(k!=="appr"&&k!=="deny")return;
- const dec=k==="appr"?"approve":"deny";
- const msg=(dec==="approve"
-   ?`批准放行任务 ${n} 的拦截命令并续跑？\n\n`
-   :`拒绝任务 ${n}？将被置为 failed（不续跑）。\n\n`)+(a.title||"");
- if(!confirm(msg))return;
- const r=await fetch(`/dashboard/tasks/${encodeURIComponent(n)}/approve`,
-   {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({decision:dec})});
- if(!r.ok){alert("操作失败: "+r.status);return;}
- refresh();
+ const a=e.target.closest("a.act");
+ if(a){
+  e.preventDefault();
+  const k=a.dataset.k,n=a.dataset.n;
+  if(k==="det"){return openDetail(n);}
+  if(k!=="appr"&&k!=="deny")return;
+  const dec=k==="appr"?"approve":"deny";
+  const msg=(dec==="approve"
+    ?`批准放行任务 ${n} 的拦截命令并续跑？\n\n`
+    :`拒绝任务 ${n}？将被置为 failed（不续跑）。\n\n`)+(a.title||"");
+  if(!confirm(msg))return;
+  const r=await fetch(`/dashboard/tasks/${encodeURIComponent(n)}/approve`,
+    {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({decision:dec})});
+  if(!r.ok){alert("操作失败: "+r.status);return;}
+  refresh();
+  return;
+ }
+ const tr=e.target.closest("tr.trow");
+ if(tr&&tr.dataset.id)openDetail(tr.dataset.id);
 });
 async function refreshShared(){
  try{
@@ -1750,19 +1901,38 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         return resp
 
     @app.get("/dashboard/data")
-    async def dashboard_data(request: Request):
+    async def dashboard_data(request: Request, days: int = 7):
         if not cfg.dashboard_password:
             raise HTTPException(status_code=404, detail="not found")
         if not _dash_ok(request):
             raise HTTPException(status_code=401, detail="login required")
+        days = 30 if days >= 30 else 7  # 只开 7/30 两档，防任意区间扫库
         tasks = db.list_tasks(limit=50)
         for t in tasks:
             t["description"] = (t.get("description") or "")[:120]
             t.pop("result", None)
             t.pop("workdir", None)
-        rep = db.report(7)
+        rep = db.report(days)
         rep.pop("audit_tail", None)
         return {"metrics": _metrics_body(), "tasks": tasks, "report": rep}
+
+    @app.get("/dashboard/tasks/{task_id}")
+    async def dashboard_task_detail(task_id: int, request: Request):
+        """任务详情（看板口令会话专用）：/tasks/{id} 走设备签名认证，
+        浏览器 cookie 过不了，这里补一个 dashboard 认证的同源视图。
+        长文本截断防撑爆页面；workdir/session_id 属内部实现，不回显。"""
+        _dash_auth(request)
+        row = db.task(task_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="task not found")
+        row = dict(row)
+        for k in ("description", "result", "error"):
+            v = row.get(k)
+            if isinstance(v, str) and len(v) > 4000:
+                row[k] = v[:4000] + "…（截断）"
+        row.pop("workdir", None)
+        row.pop("session_id", None)
+        return row
 
     # ---- 凭证管理（dashboard 口令会话内，代理 admin 的 users 管理） ----
 
