@@ -21,6 +21,13 @@ DEFAULTS: dict[str, Any] = {
     "ingress": {"event_keys": ["user_im_message_receive_o2o_all"],
                 "idle_watchdog_sec": 270, "debounce_sec": 20,
                 "followup_debounce_sec": 30, "session_ttl_sec": 1800,
+                # resume 上下文预算：链深/累计 tokens 任一触顶即断链另起新会话，
+                # 并注入上一轮结果摘要（resume_digest_chars 截断）保持话题连续。
+                # 为什么必须有：此前 resume 只看 TTL，链可无限续——claude 每轮重放
+                # 整段历史。2026-09-28 实测 #278→#281 单轮往返 7.3s→32.6s（4.5 倍），
+                # 模型往返占执行时间 75%。0/负值＝该项不设限。
+                "resume_max_depth": 3, "resume_max_tokens": 60000,
+                "resume_digest_chars": 2000,
                 "poll_sec": 3, "result_max_chars": 3000,
                 "ack_emoji": "奋斗", "submit_emoji": "",
                 "noise_emoji": "打招呼", "followup_emoji": "OK",

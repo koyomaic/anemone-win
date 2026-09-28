@@ -681,6 +681,7 @@ class Avatar:
         if not force_relay and self._try_local_task(s, uid, desc, followup):
             return
         resume = self.sess.resume_candidate(s)
+        desc = self._with_chain_digest(s, desc, resume)
         r = self.exec_relay.submit(desc + self._relay_marker_rules(s),
                                    resume_from=resume, uid=uid)
         if "_error" in r:
@@ -1065,6 +1066,45 @@ class Avatar:
                     "回复「确认」放行，「拒绝」终止。")
         return ("🚧 任务里有高危操作待审批。\n\n"
                 "回复「确认」放行，「拒绝」终止。")
+
+    def _chain_digest(self, row: dict) -> str:
+        """上一任务 result → 接续摘要：剥掉所有围栏标记后截断。
+
+        **必须剥标记**：`row["result"]` 是原始结果——`_consume_plan_markers` /
+        `_consume_send_markers` 只在 `_send_result` 的局部变量上剔除，不改 row。
+        若把含 ```plan``` / ```send_file``` 的原文当摘要注入下一轮 desc，agent
+        一旦回显，消费侧会**重复建计划 / 重复代投**——与 _plan_create_note 的
+        占位符防护同类事故，只不过这次来源是我们自己。
+        """
+        txt = str(row.get("result") or "")
+        for rx in (PLAN_BLOCK_RE, SEND_BLOCK_RE, DELETE_BLOCK_RE):
+            txt = rx.sub("", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+        cap = int(self.cfg.get("ingress", "resume_digest_chars", 2000))
+        if cap > 0 and len(txt) > cap:
+            txt = txt[:cap].rstrip() + "…（已截断）"
+        return txt
+
+    def _with_chain_digest(self, s: dict, desc: str, resume) -> str:
+        """断链时把上一轮结果摘要前置进 desc，并清零链计数。
+
+        只在 **budget 断链**时注入：用户还在同一话题上，只是整段历史重放太贵
+        （见 session.py 的 resume 上下文预算注释）。ttl 断链说明话题已断，
+        塞旧上下文只会干扰新请求，故不注入。
+        """
+        if resume:
+            return desc                       # 正常 resume，claude 自己带历史
+        reason = self.sess.resume_break_reason(s)
+        digest = ((s.get("chain_digest") or "").strip()
+                  if reason and reason.startswith("budget") else "")
+        self.sess.reset_chain(s)
+        if not digest:
+            return desc
+        return ("【上下文接续｜上一轮结果摘要，**不是**本次请求】\n"
+                "会话历史过长已另起新链。下面是你上一轮给出的结论，仅供理解本次"
+                "追问里的指代；**不要**把它当新任务重做一遍，也不要重复投递其中"
+                "提到的文件。\n"
+                f"{digest}\n\n---\n\n{desc}")
 
     def _relay_marker_rules(self, s: dict) -> str:
         """附在 relay 任务描述末尾的标记铁律：发起人身份 + 代投/代建通道。
@@ -1647,11 +1687,13 @@ class Avatar:
             self._send_result(s, row)
             self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
+            self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row))
         elif status == "conflict":
             self._send_result(s, row, prefix="✅ 办好了，但检测到文件冲突，"
                                              "请人工复核。")
             self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
+            self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row))
         elif status == "failed":
             err = (row.get("error") or "未知错误")[:300]
             if not self._card_final(

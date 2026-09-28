@@ -246,7 +246,8 @@ class FakeExec:
 
     def submit(self, desc, resume_from=None, uid="", ingress="dingtalk"):
         tid = len(self.submitted) + 1
-        self.submitted.append({"tid": tid, "desc": desc, "uid": uid})
+        self.submitted.append({"tid": tid, "desc": desc, "uid": uid,
+                               "resume_from": resume_from})
         return {"task_id": tid, "status": "queued"}
 
     def create_local_record(self, desc, uid=""):
@@ -1403,3 +1404,166 @@ def test_send_still_delivers_from_send_dirs(av, cfg, shared):
                                  32, "200")
         assert any("[file]" in c and f"件_{d}.html" in c
                    for _, c in av.dws.sent), d
+
+
+# ── K. resume 上下文预算 + 接续摘要（2026-09-28 P0-1）──
+#
+# 慢的主因：resume 链无体量上限，claude 每轮重放整段历史。实测 #278→#281 单轮
+# 模型往返 7.3s→32.6s（4.5 倍），模型往返占执行时间 75%。修法＝链深/累计 tokens
+# 任一触顶即断链，并注入上一轮结果摘要保持话题连续（不能裸断，否则「用赵老师工艺
+# 深色底」这类依赖上文的追问会失指代）。
+
+
+def test_chain_digest_strips_all_markers(av, cfg, shared):
+    """摘要**必须**剥标记：row["result"] 是原文（_consume_* 只改局部变量），
+    带标记注入下一轮 desc 后 agent 一旦回显，会重复建计划／重复代投。"""
+    row = {"id": 1, "result":
+           "结论如下。\n"
+           '```plan\n{"op":"create","name":"每日报告","on_calendar":"*-*-* 07:35:00",'
+           '"description":"出日报"}\n```\n'
+           '```send_file\n{"path":"/tmp/a.pptx"}\n```\n'
+           '```delete_file\n{"path":"/tmp/b"}\n```\n'
+           "以上。"}
+    d = av._chain_digest(row)
+    assert "```plan" not in d and "```send_file" not in d and "```delete_file" not in d
+    assert "on_calendar" not in d and "/tmp/a.pptx" not in d
+    assert "结论如下。" in d and "以上。" in d      # 正文保留
+
+
+def test_chain_digest_truncates(av, cfg, shared):
+    cfg._p.setdefault("ingress", {}).update(resume_digest_chars=80)
+    d = av._chain_digest({"id": 1, "result": "甲" * 500})
+    assert len(d) < 120 and d.endswith("…（已截断）")
+
+
+def test_chain_digest_zero_cap_keeps_full(av, cfg, shared):
+    cfg._p.setdefault("ingress", {}).update(resume_digest_chars=0)
+    assert len(av._chain_digest({"id": 1, "result": "乙" * 500})) == 500
+
+
+def test_finish_accumulates_chain_budget(av, cfg, shared):
+    s = sess_of(av)
+    av._finish(s, {"id": 11, "status": "done", "result": "第一轮结论",
+                   "tokens": 25295})
+    assert s["last_task_id"] == 11
+    assert s["chain_depth"] == 1 and s["chain_tokens"] == 25295
+    assert s["chain_digest"] == "第一轮结论"
+    av._finish(s, {"id": 12, "status": "done", "result": "第二轮",
+                   "tokens": 9887})
+    assert s["chain_depth"] == 2 and s["chain_tokens"] == 35182
+
+
+def test_finish_conflict_also_accumulates(av, cfg, shared):
+    """conflict 也是成功终态、也会被 resume，故同样计入预算。"""
+    s = sess_of(av)
+    av._finish(s, {"id": 13, "status": "conflict", "result": "有冲突",
+                   "tokens": 100})
+    assert s["chain_depth"] == 1 and s["chain_tokens"] == 100
+
+
+def test_finish_failed_does_not_accumulate(av, cfg, shared):
+    """失败任务不设 last_task_id，也就不该进链（否则摘要会注入一条错误信息）。"""
+    s = sess_of(av)
+    av._finish(s, {"id": 14, "status": "failed", "error": "炸了",
+                   "result": "半成品", "tokens": 999})
+    assert s.get("chain_depth", 0) == 0 and s.get("chain_tokens", 0) == 0
+    assert not s.get("chain_digest")
+
+
+def test_flush_injects_digest_on_budget_break(av, cfg, shared):
+    """触顶断链 → 新任务 desc 前置摘要，且 resume_from 为空（真断链）。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=1)
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    av._finish(s, {"id": 1, "status": "done", "result": "原油预测已出，深底工艺。",
+                   "tokens": 100})
+    s["buffer"] = ["那成品油呢"]
+    s["state"] = "BUFFERING"
+    av._flush(s, uid="200")
+    sub = av.exec_relay.submitted[-1]
+    assert sub["resume_from"] is None                 # 断链
+    assert "上下文接续" in sub["desc"]
+    assert "原油预测已出，深底工艺。" in sub["desc"]      # 指代得以保留
+    assert "那成品油呢" in sub["desc"]                   # 新请求仍在
+    assert "**不是**本次请求" in sub["desc"]           # 明确定性，防当成新任务重做
+
+
+def test_flush_no_digest_when_resuming(av, cfg, shared):
+    """未触顶 → 照常 resume，不注入摘要（claude 自己带历史，注入纯属重复）。"""
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    av._finish(s, {"id": 1, "status": "done", "result": "上一轮结论",
+                   "tokens": 100})
+    s["buffer"] = ["继续"]
+    s["state"] = "BUFFERING"
+    av._flush(s, uid="200")
+    sub = av.exec_relay.submitted[-1]
+    assert sub["resume_from"] == 1
+    assert "上下文接续" not in sub["desc"]
+
+
+def test_flush_no_digest_on_ttl_break(av, cfg, shared):
+    """TTL 过期断链 → **不**注入：话题已断，塞旧上下文只会干扰新请求。"""
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    av._finish(s, {"id": 1, "status": "done", "result": "三天前的结论",
+                   "tokens": 100})
+    s["last_activity"] = time.time() - 99999
+    s["buffer"] = ["换个话题"]
+    s["state"] = "BUFFERING"
+    av._flush(s, uid="200")
+    sub = av.exec_relay.submitted[-1]
+    assert sub["resume_from"] is None
+    assert "上下文接续" not in sub["desc"]
+    assert "三天前的结论" not in sub["desc"]
+
+
+def test_flush_chain_restarts_after_break(av, cfg, shared):
+    """断链后计数归零、新链重新计——否则断一次就永远不能再 resume。
+
+    depth 上限取 2：#1→#2 正常 resume（depth 1<2），#2 完成后 depth=2 触顶，
+    #3 断链并归零，#3 完成后 depth=1，故 #4 又能 resume #3。
+    （取 1 测不出这条：那等于"每个任务都独立成链"，永远不 resume。）
+    """
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=2)
+    av.policy.rate_limit = 0        # 本用例要连提 4 轮；conftest 默认 3 会先撞限流
+    s = sess_of(av)
+
+    def q(text):
+        s["buffer"] = [text]
+        s["state"] = "BUFFERING"
+        av._flush(s, uid="200")
+        return av.exec_relay.submitted[-1]
+
+    def done(tid, result):
+        av._finish(s, {"id": tid, "status": "done", "result": result,
+                       "tokens": 100})
+
+    q("q1"); done(1, "r1")
+    assert q("q2")["resume_from"] == 1               # 未触顶，正常 resume
+    done(2, "r2")
+    assert s["chain_depth"] == 2
+    sub3 = q("q3")
+    assert sub3["resume_from"] is None               # 触顶断链
+    assert "上下文接续" in sub3["desc"] and "r2" in sub3["desc"]
+    assert s["chain_depth"] == 0 and s["chain_tokens"] == 0   # 已归零
+    done(3, "r3")
+    assert s["chain_depth"] == 1
+    assert q("q4")["resume_from"] == 3               # 新链可再 resume
+
+
+def test_digest_cannot_smuggle_markers_into_next_result(av, cfg, shared):
+    """闭环校验：注入的摘要里不含任何围栏标记，故 agent 即便整段回显，
+    消费侧也无从重复建计划／重复代投。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=1)
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    av._finish(s, {"id": 1, "status": "done", "tokens": 10, "result":
+                   '好。\n```plan\n{"op":"create","name":"x",'
+                   '"on_calendar":"*-*-* 07:35:00","description":"y"}\n```'})
+    s["buffer"] = ["再来一轮"]; s["state"] = "BUFFERING"
+    av._flush(s, uid="200")
+    desc = av.exec_relay.submitted[-1]["desc"]
+    head = desc.split("【投递铁律")[0]               # 只看摘要+新请求部分
+    assert not PLAN_BLOCK_RE.findall(head)
+    assert "```send_file" not in head and "```delete_file" not in head

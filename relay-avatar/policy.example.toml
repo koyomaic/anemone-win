@@ -21,6 +21,17 @@ idle_watchdog_sec = 270        # 事件流空闲多久强制重连（钉钉长�
 debounce_sec = 20              # 聚合窗口
 followup_debounce_sec = 30     # 任务结束后追问聚合窗口
 session_ttl_sec = 1800         # 会话上下文（resume_from）有效期
+# ── resume 上下文预算（2026-09-28 P0-1）──
+# session_ttl_sec 只管"话题有没有断"，不管"历史有多贵"。链无限续时 claude 每轮
+# 都要重放整段历史：实测赵兴峰 #278→#281 四任务共用一个会话（transcript 1004KB、
+# CLAUDE.md 42KB 每任务重注入），单轮模型往返 7.3s→32.6s（4.5 倍），#281 轮次(22)
+# 比 #278(46)少一半、耗时却 2.1 倍，13 分钟里 12 分钟纯花在模型往返（占执行 75%）。
+# 链深 / 累计 tokens 任一触顶即断链另起新会话，并注入上一轮结果摘要保持指代连续
+# （摘要已剥 ```plan```/```send_file```/```delete_file``` 标记，防回显致重复执行）。
+# 0 或负值＝该项不设限。
+resume_max_depth = 3           # 一条链最多续几轮
+resume_max_tokens = 60000      # 一条链累计 tokens 上限（约 2 轮 #280 量级）
+resume_digest_chars = 2000     # 断链时注入的上一轮摘要长度上限
 poll_sec = 3                   # relay 任务状态轮询间隔
 result_max_chars = 3000        # 结果超长截断，全文走附件
 ack_emoji = "奋斗"              # 收到回执兜底表情（文字表情未配置/失败时用）

@@ -106,9 +106,63 @@ class SessionManager:
             self.cfg.get("ingress", "followup_debounce_sec", 30))
 
     def resume_candidate(self, s: dict):
-        """会话上下文有效期内的上一任务号（resume_from 追问）。"""
-        last = s.get("last_task_id")
-        ttl = int(self.cfg.get("ingress", "session_ttl_sec", 1800))
-        if last and time.time() - s.get("last_activity", 0) < ttl:
-            return last
+        """会话上下文有效期内、且未超上下文预算的上一任务号（resume_from 追问）。"""
+        if self.resume_break_reason(s) is not None:
+            return None
+        return s.get("last_task_id")
+
+    # ── resume 上下文预算 ──
+    #
+    # 为什么需要：resume_candidate 此前**只有 TTL 判定**，没有任何体量上限。只要
+    # 用户在 session_ttl_sec 窗口内持续追问，链就无限续下去——claude 每轮都要重放
+    # 整段历史。2026-09-28 实测赵兴峰 #278→#281 四任务共用一个会话（transcript
+    # 1004KB、CLAUDE.md 42KB 每任务重注入），单轮模型往返从 7.3s 涨到 32.6s
+    # （4.5 倍）：#281 轮次(22)比 #278(46)少一半，耗时却是 2.1 倍，13 分钟里
+    # 12 分钟纯花在模型往返上，占执行时间 75%。
+    #
+    # 触顶后**不是裸开新会话**——那会丢掉「用赵老师工艺深色底」这类依赖上文的追问。
+    # 而是断链 + 由 main._flush 注入接续摘要（上一任务 result，已剥标记、已截断）。
+
+    def chain_over_budget(self, s: dict) -> str | None:
+        """链上预算是否触顶。返回原因字符串，None＝未触顶。0/负值＝该项不设限。"""
+        depth = int(s.get("chain_depth") or 0)
+        max_depth = int(self.cfg.get("ingress", "resume_max_depth", 3))
+        if max_depth > 0 and depth >= max_depth:
+            return f"depth {depth}>={max_depth}"
+        toks = int(s.get("chain_tokens") or 0)
+        max_toks = int(self.cfg.get("ingress", "resume_max_tokens", 60000))
+        if max_toks > 0 and toks >= max_toks:
+            return f"tokens {toks}>={max_toks}"
         return None
+
+    def resume_break_reason(self, s: dict) -> str | None:
+        """不能 resume 的原因：None＝可以 resume；ttl＝话题已断；budget＝超上下文预算。
+
+        区分两者是因为处置不同：budget 断链要注入接续摘要（用户还在同一话题上，
+        只是历史太贵）；ttl 断链不注入（话题已断，塞旧上下文只会干扰新请求）。
+        """
+        if not s.get("last_task_id"):
+            return "none"
+        ttl = int(self.cfg.get("ingress", "session_ttl_sec", 1800))
+        if time.time() - s.get("last_activity", 0) >= ttl:
+            return "ttl"
+        over = self.chain_over_budget(s)
+        return f"budget:{over}" if over else None
+
+    def note_chain(self, s: dict, tokens, digest: str = ""):
+        """任务完成时累加链上预算，并记下接续摘要（供断链后注入）。"""
+        s["chain_depth"] = int(s.get("chain_depth") or 0) + 1
+        try:
+            s["chain_tokens"] = int(s.get("chain_tokens") or 0) + max(int(tokens or 0), 0)
+        except (TypeError, ValueError):
+            pass
+        if digest:
+            s["chain_digest"] = digest
+
+    def reset_chain(self, s: dict):
+        """开新链（本轮未 resume）时清零计数。
+
+        摘要**保留**：它正是断链后要注入的东西，且会被新任务完成时覆盖。
+        """
+        s["chain_depth"] = 0
+        s["chain_tokens"] = 0
