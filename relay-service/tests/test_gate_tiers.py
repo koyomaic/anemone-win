@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 import httpx
@@ -249,3 +250,52 @@ sleep 10
     lines = audit_lines(r["cfg"].log_path)
     assert any(f"task={tid}\tuser=faker\tblock\t" in ln for ln in lines)
     assert not any(f"task={tid}\tuser=faker\tauto_deny" in ln for ln in lines)
+
+
+# ── 配置卫生：dataclass 默认值 vs from_env 兜底字符串不得漂移 ──
+#
+# 2026-09-29 实测踩到：approval_timeout_minutes 的 dataclass 默认改成 60.0，但
+# from_env 里的 os.environ.get(..., "30") 兜底字符串忘了同步。生产走 from_env()，
+# 于是实际生效的是 30 而不是 60——单测全绿（单测直接构造 Settings，走 dataclass
+# 默认），只有核验生产配置时才发现。这类重复字面量在 config.py 里有十几处，
+# 靠人眼同步必然再犯，故加此测试自动兜住。
+
+# from_env 里由 RELAY_WORKSPACE 派生的路径类字段：干净环境下必然与 dataclass
+# 默认不同（后者无默认、必须显式传），不参与比对。
+_PATH_DERIVED = {"db_path", "workspace_root", "shared_dir", "task_root",
+                 "users_root", "log_path"}
+
+
+def test_from_env_fallbacks_match_dataclass_defaults(monkeypatch):
+    """清空所有 RELAY_* 后，from_env() 必须与 dataclass 默认值逐字段一致。"""
+    import dataclasses
+    from app.config import Settings
+
+    for k in [k for k in os.environ if k.startswith("RELAY_")]:
+        monkeypatch.delenv(k, raising=False)
+
+    via_env = Settings.from_env()
+    via_ctor = Settings(
+        db_path=via_env.db_path, workspace_root=via_env.workspace_root,
+        shared_dir=via_env.shared_dir, task_root=via_env.task_root,
+        users_root=via_env.users_root, log_path=via_env.log_path)
+
+    drift = {}
+    for f in dataclasses.fields(Settings):
+        if f.name in _PATH_DERIVED:
+            continue
+        a, b = getattr(via_env, f.name), getattr(via_ctor, f.name)
+        if a != b:
+            drift[f.name] = (a, b)
+    assert not drift, (
+        "from_env 兜底字符串与 dataclass 默认值漂移（左=from_env，右=dataclass）："
+        f"{drift}")
+
+
+def test_approval_timeout_default_is_60(monkeypatch):
+    """显式锁死本次改动涉及的阈值，防再次被兜底字符串悄悄改掉。"""
+    for k in [k for k in os.environ if k.startswith("RELAY_")]:
+        monkeypatch.delenv(k, raising=False)
+    from app.config import Settings
+    assert Settings.from_env().approval_timeout_minutes == 60.0
+    assert Settings.from_env().auto_deny_max == 2

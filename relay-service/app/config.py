@@ -201,7 +201,7 @@ class Settings:
             dashboard_password=os.environ.get("RELAY_DASHBOARD_PASSWORD", ""),
             stale_timeout_hours=float(os.environ.get("RELAY_STALE_TIMEOUT_HOURS", "24")),
             approval_timeout_minutes=float(
-                os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "30")),
+                os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "60")),
             auto_deny_max=int(os.environ.get("RELAY_AUTO_DENY_MAX", "2")),
             local_stale_minutes=float(os.environ.get("RELAY_LOCAL_STALE_MINUTES", "15")),
             sweep_interval_sec=float(os.environ.get("RELAY_SWEEP_INTERVAL_SEC", "300")),
@@ -215,7 +215,7 @@ class Settings:
             min_client_version=os.environ.get("RELAY_MIN_CLIENT_VERSION", "").strip(),
             auth_legacy=os.environ.get("RELAY_AUTH_LEGACY", "0").strip().lower()
             in ("1", "true", "on", "yes"),
-            sign_window=int(os.environ.get("RELAY_SIGN_WINDOW", "60")),
+            sign_window=int(os.environ.get("RELAY_SIGN_WINDOW", "900")),
             cleanup_runtime=os.environ.get("RELAY_CLEANUP_RUNTIME", "1").strip().lower()
             in ("1", "true", "on", "yes"),
             shared_venv=os.environ.get("RELAY_SHARED_VENV", "").strip(),
