@@ -232,7 +232,23 @@ class Avatar:
             if ev.get("_self_poll"):
                 uid = self.cfg.owner_userid
             else:
-                uid = self.dws.resolve_userid(sid, sender, self.contacts)
+                # 通讯录反查不到 userId 时**回落用 openDingTalkId 当 uid**。
+                #
+                # 为什么必须回落：外部/跨组织联系人的 userId 根本拿不到——赵兴峰实测
+                # 三条途径全失败（contact +search-user 只回 openDingTalkId、
+                # aisearch person 返回空、chat +chat-members-get 只回 nick+openId），
+                # 且 resolve_userid 每 6h 负缓存过期后重试、永远同样失败。uid 为空
+                # 会造成三处静默故障：① _plan_gate 用 get_level("")→NONE，他明明在
+                # 白名单里却建不了计划，拒绝文案还叫他"找超管加白名单"（他已在）；
+                # ② rate_hit 按 str(uid) 计桶，所有解析失败的人**共用一个配额桶**
+                # （实测 rate.json 里 '' 桶当天已计 4 次）；③ 审计 actor="" 无归属。
+                #
+                # 为什么回落 openId 是安全的：openId 是钉钉真实、稳定、全局唯一的
+                # 标识符，不是凭空造的；白名单里本来就可以登记 openId
+                # （_static_level 认它），故 get_level(openId) 直接命中 L2；且真实
+                # userId 是纯数字串、openId 是 34 位 base64 串，**永不撞号**。
+                # 发送侧由 Dws._norm_target 按形态归位，不会拼出 --user <openId>。
+                uid = self.dws.resolve_userid(sid, sender, self.contacts) or sid
         ev["_uid"] = uid
         # self 模式（轮询本人单聊）：审批指令 / 「学 N」升格 / 「/」前缀任务 / 无前缀速记
         if ev.get("_self_poll"):
@@ -258,10 +274,12 @@ class Avatar:
         self.sess.touch(s, ev)
 
         # 超管审批指令（单聊，先于会话流拦截）
-        if uid and self.policy.is_superadmin(uid) and not is_group:
+        # 复用上面已算出的 lvl（level_of 结果），不再单独调 is_superadmin(uid)：
+        # 后者只查 uid，按 openId 入 superadmin 名单的人会被漏判。
+        if lvl == "super" and not is_group:
             ap = self.policy.parse_approval(str(content))
             if ap:
-                self._dm(uid, self._do_approval(ap, uid))
+                self._dm(uid or sid, self._do_approval(ap, uid))
                 return
         # L3：文件投递/问答（不进通用会话流）
         if lvl == "L3" and not is_group:
@@ -479,8 +497,9 @@ class Avatar:
             return
         # 审批指令：superadmin 经自聊审批（分身用本人账号，审批入口即自聊）
         ap = self.policy.parse_approval(t)
-        if ap and self.policy.is_superadmin(uid):
-            self._dm(uid, self._do_approval(ap, uid))
+        sid, sender = self._ident(s)
+        if ap and self.policy.level_of(uid, sid, sender) == "super":
+            self._dm(uid or sid, self._do_approval(ap, uid))
             return
         # 会话进行中 → 交会话流（提交/取消/门禁关键词与聚合）
         if s["state"] != "IDLE":
@@ -1063,7 +1082,7 @@ class Avatar:
                 if s.get("card_biz"):
                     # 卡片是发给**发起人**的，同样不贴 shell 原文
                     summ = self._gate_summary(s["gate_cmd"], s["gate_cat"])
-                    is_sup = bool(uid) and self.policy.is_superadmin(uid)
+                    is_sup = self.policy.level_of(uid, *self._ident(s)) == "super"
                     try:
                         # 不销卡：放行后任务继续，卡片随后续状态刷新
                         self.dws.card_update(
@@ -1155,8 +1174,14 @@ class Avatar:
 
     def _notify_gate(self, s: dict, uid: str):
         """审批通知路由：发起人若是超管→直接问他；否则→只给他一句人话，
-        详情 DM 给每位超管。目标是客户侧**零 shell 审批弹窗**。"""
-        if uid and self.policy.is_superadmin(uid):
+        详情 DM 给每位超管。目标是客户侧**零 shell 审批弹窗**。
+
+        超管判定走 level_of（与 _plan_gate 同源），否则按 openId 入 superadmin
+        名单的人会被漏判、白白多绕一圈 DM。超管标识本身也可能是 openId，
+        _dm 的发送目标由 Dws._norm_target 按形态归位，不会拼错参数。
+        """
+        sid, sender = self._ident(s)
+        if self.policy.level_of(uid, sid, sender) == "super":
             self._notify_session(s, self._approval_text(s, for_super=True))
             return
         sups = sorted(getattr(self.policy, "superadmin", set()) or set())
@@ -1167,7 +1192,7 @@ class Avatar:
         self._notify_session(s, self._approval_text(s))
         txt = self._approval_text(s, for_super=True)
         for su in sups:
-            if su != uid:
+            if su not in (uid, sid):
                 self._dm(su, txt)
 
     def _chain_digest(self, row: dict) -> str:
@@ -1351,10 +1376,11 @@ class Avatar:
             return clean, []               # 已执行过（review→done 二次回流）不再重复
         s["plan_applied"] = tid
         uid = s.get("uid") or ""
+        sid, sender = self._ident(s)
         notes = []
         for spec in specs:
             try:
-                note = self._exec_plan_op(spec, uid)
+                note = self._exec_plan_op(spec, uid, sid, sender)
             except Exception as e:
                 note = f"⚠️ 计划操作异常：{e!r}"
             if note:
@@ -1622,7 +1648,14 @@ class Avatar:
     # L3（文件投递用户：任何能给我发文件的人都落这档）与名单外一律拒。
     _PLAN_ALLOWED_TIERS = ("super", "L1", "L2")
 
-    def _plan_gate(self, uid: str, op: str) -> str | None:
+    @staticmethod
+    def _ident(s: dict) -> tuple:
+        """从会话取 (openId, 显示名)，供 level_of 做与 on_event 同源的定级。"""
+        r = (s or {}).get("reply") or {}
+        return str(r.get("open_dingtalk_id") or ""), str(r.get("sender") or "")
+
+    def _plan_gate(self, uid: str, op: str, sid: str = "",
+                   sender: str = "") -> str | None:
         """计划操作权限门禁。返回拒绝文案（None＝放行）。
 
         为什么必须加：`_plan_create_note` 此前只校验 on_calendar/description 非空
@@ -1632,33 +1665,47 @@ class Avatar:
         description 会成为后续每天的任务提示词，是**持久化注入**的落点。叠加
         「上传件读取不过清洗」（data/ 在 l2_add_dirs、阶段二后还可写），风险放大。
 
+        **必须用 level_of 而非 get_level**（2026-09-29 修）：on_event 定级用的是
+        `level_of(uid, sid, sender)`，它会额外查 `_static_level(open_id)` 与
+        `_static_level(sender)`；而本函数此前只调 `get_level(uid)`，其第一行就是
+        `if not uid: return "NONE"`。于是**按 openId 或显示名入白名单**的用户能正常
+        聊天、跑任务，却唯独建不了计划——赵兴峰即此例（白名单里就是他的 openId）。
+        更糟的是拒绝文案叫他"找超管加白名单"，而他已经在名单里，两边都查不出原因。
+        两处口径必须同源，否则名单语义分裂。
+
         注意 local 通路此前不消费 plan 标记（_drain_local 只调 send/delete），门禁
         实际只守 relay 通路；2026-09-29 已补上 local 侧消费，两条通路同守。
         """
-        lvl = self.policy.get_level(uid)
+        lvl = self.policy.level_of(uid, sid, sender)
         if lvl in self._PLAN_ALLOWED_TIERS:
             return None
-        self.audit.log("plan_denied", uid, f"op={op} tier={lvl}", backend="relay")
+        self.audit.log("plan_denied", uid or sid,
+                       f"op={op} tier={lvl} who={sender or '?'}", backend="relay")
         return (f"⚠️ 定时计划仅限团队成员创建/管理（当前身份 `{lvl}` 无权限），"
                 "未执行。需要的话请找超管加白名单。")
 
-    def _exec_plan_op(self, spec: dict, uid: str) -> str | None:
+    def _exec_plan_op(self, spec: dict, uid: str, sid: str = "",
+                      sender: str = "") -> str | None:
         op = str(spec.get("op") or "create").lower()
         if op == "list":
             return self._plan_list_note(uid)      # 只读且按 uid 限定，不设门禁
         if op not in ("create", "delete", "disable", "enable"):
             return None
-        deny = self._plan_gate(uid, op)
+        deny = self._plan_gate(uid, op, sid, sender)
         if deny:
             return deny
         # plan 操作此前**完全无审计**：建了/删了谁都不知道，出问题无从追溯。
-        self.audit.log("plan_op", uid,
-                       f"op={op} name={str(spec.get('name') or '')[:40]} "
+        # actor 记 uid（通讯录反查不到时已是 openId 回落值），detail 带显示名，
+        # 便于人对账——openId 是一串 base64，光看它认不出是谁。
+        self.audit.log("plan_op", uid or sid,
+                       f"op={op} who={sender or '?'} "
+                       f"name={str(spec.get('name') or '')[:40]} "
                        f"on_calendar={str(spec.get('on_calendar') or '')[:32]}",
                        backend="relay")
         if op == "create":
             return self._plan_create_note(spec, uid)
-        return self._plan_by_name_note(op, str(spec.get("name") or ""), uid)
+        return self._plan_by_name_note(op, str(spec.get("name") or ""), uid,
+                                       sid, sender)
 
     def _plan_create_note(self, spec: dict, uid: str) -> str:
         on_cal = str(spec.get("on_calendar") or "").strip()
@@ -1732,7 +1779,8 @@ class Avatar:
         return {str(x).strip() for x in
                 (self.cfg.get("security", "plan_protected", []) or []) if str(x).strip()}
 
-    def _plan_by_name_note(self, op: str, name: str, uid: str) -> str:
+    def _plan_by_name_note(self, op: str, name: str, uid: str,
+                           sid: str = "", sender: str = "") -> str:
         name = (name or "").strip()
         if not name:
             return "⚠️ 请说明要操作哪个计划（用计划名）。"
@@ -1761,11 +1809,13 @@ class Avatar:
         # 虚设，任何 L2 都能删核心业务计划。用户已定不动 relay schema，故在分身侧拦。
         # `enable` 放行：启用是**恢复**日报，不是破坏；挡住它只会让停摆的核心计划
         # 没人能顺手打开。
-        if is_prot and op in ("delete", "disable") \
-                and not self.policy.is_superadmin(uid):
-            self.audit.log("plan_denied", uid,
-                           f"op={op} name={p['name']} 受保护计划（仅超管可动）",
-                           backend="relay")
+        # 超管判定用 level_of 而非 is_superadmin(uid)：后者只查 uid，按 openId 入
+        # 名单的超管会被漏判（与 _plan_gate 同源，避免名单语义分裂）。
+        is_super = self.policy.level_of(uid, sid, sender) == "super"
+        if is_prot and op in ("delete", "disable") and not is_super:
+            self.audit.log("plan_denied", uid or sid,
+                           f"op={op} who={sender or '?'} name={p['name']} "
+                           "受保护计划（仅超管可动）", backend="relay")
             return (f"⚠️「{p['name']}」是核心业务计划（受保护），仅超管可删除/停用，"
                     "未执行。确需调整请找超管。")
         if op == "delete":
@@ -1781,12 +1831,15 @@ class Avatar:
     # ── 计划命令（relay-avatar 侧确定性解析，进大脑前拦截）──
     def _handle_plan(self, pc: dict, s: dict, uid: str):
         # 与标记路径（_exec_plan_op）共用 _plan_gate，避免两处口径漂移。
-        deny = self._plan_gate(uid, str(pc.get("cmd") or "create"))
+        # sid/sender 一并传入：定级必须走 level_of，否则按 openId/显示名入白名单的
+        # 用户会被 get_level(uid) 判成 NONE（见 _plan_gate 注释）。
+        sid, sender = self._ident(s)
+        deny = self._plan_gate(uid, str(pc.get("cmd") or "create"), sid, sender)
         if deny:
             # 群聊里的拒绝**走私聊**：拒绝文案含「当前身份 `L3` 无权限」，发群里等于
             # 当众宣布该成员没权限。成功回执仍发群（全群可见＝天然审计，他人可异议）。
-            if (s.get("reply") or {}).get("is_group") and uid:
-                self._dm(uid, deny)
+            if (s.get("reply") or {}).get("is_group") and (uid or sid):
+                self._dm(uid or sid, deny)
             else:
                 self._notify_session(s, deny)
             return
@@ -1801,7 +1854,7 @@ class Avatar:
         elif cmd == "list":
             note = self._plan_list_note(uid)
         elif cmd in ("delete", "disable", "enable"):
-            note = self._plan_by_name_note(cmd, pc["name"], uid)
+            note = self._plan_by_name_note(cmd, pc["name"], uid, sid, sender)
         else:
             note = None
         if note:

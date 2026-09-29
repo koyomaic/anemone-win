@@ -635,3 +635,77 @@ def test_gate_summary_falls_back_without_category(avatar):
     assert "删除" in avatar._gate_summary("rm -rf /mnt/ws/shared/report", "")
     assert "发送" in avatar._gate_summary("dws chat +dm --user 1 --content x", "")
     assert "服务" in avatar._gate_summary("systemctl stop relay", "")
+
+
+# ── 发送目标归位：openId 不得被当 userId 用（2026-09-29）──
+#
+# 起因：赵兴峰按 **openId** 入白名单，而他的 userId 三条途径都拿不到（实测
+# contact +search-user 只回 openDingTalkId、aisearch person 返回空、
+# chat +chat-members-get 只回 nick+openId——外部/跨组织联系人）。修法是 uid
+# 解析不出时回落用 openId（见 test_plans.py 的身份回落组），但回落之后
+# `{"user_id": <openId>}` 会拼出 `--user <openId>`，dws 解析不了、消息**静默发不出去**。
+# 故在唯一出口按形态归位：真实 userId 是纯数字串，openId 是 34 位 base64 串，不重叠。
+
+ZHAO_SID = "DJTDWXe5Omkca6fEkz0vxWVZZG4c4SxTc"   # 赵兴峰真实 openId
+
+
+@pytest.fixture
+def real_dws(cfg, audit):
+    from app.ingress_dingtalk import Dws
+    return Dws(cfg, audit, dry=True)
+
+
+def test_norm_target_routes_openid_not_as_user(real_dws):
+    from app.ingress_dingtalk import Dws
+    t = Dws._norm_target({"user_id": ZHAO_SID})
+    assert t["user_id"] == "" and t["open_dingtalk_id"] == ZHAO_SID
+    assert real_dws._target_args({"user_id": ZHAO_SID}) \
+        == ["--open-dingtalk-id", ZHAO_SID]
+
+
+def test_norm_target_keeps_numeric_uid(real_dws):
+    """真实 userId（纯数字）仍走 --user，不得被误判成 openId。"""
+    for uid in ("18434", "20102", "40714", "1"):     # "1"＝马韵升，最短也得认
+        assert real_dws._target_args({"user_id": uid}) == ["--user", uid]
+
+
+def test_norm_target_does_not_touch_target_with_real_openid(real_dws):
+    """已有 open_dingtalk_id 时归位逻辑不介入（那是事件里带来的权威值）。
+
+    注意两个出口的优先级**有意不同**：
+      · _target_args：user_id 先于 open_dingtalk_id —— 有真实 userId 就走 --user，更可靠
+      · card_create ：open_dingtalk_id 先于 user_id —— 其 docstring 说明 --receiver
+        要走通讯录解析，慢且可能歧义，故卡片优先直传 openId
+    两者都能送达同一人，差异是刻意保留的，此处一并锁住防被"统一"掉。
+    """
+    from app.ingress_dingtalk import Dws
+    both = {"user_id": "18434", "open_dingtalk_id": "ODID_REAL"}
+    assert Dws._norm_target(both) == both, "两者都在时不该改写"
+    assert real_dws._target_args(both) == ["--user", "18434"]
+
+
+def test_norm_target_group_untouched(real_dws):
+    """群目标不受影响（is_group 优先，且不该被归位逻辑改动）。"""
+    t = {"is_group": True, "conversation_id": "cidX==", "user_id": ZHAO_SID}
+    assert real_dws._target_args(t) == ["--conversation-id", "cidX=="]
+
+
+def test_card_create_routes_openid(real_dws, monkeypatch):
+    """卡片发送同样要归位：--receiver 要真实 userId，传 openId 会解析失败。"""
+    seen = []
+    monkeypatch.setattr(real_dws, "run",
+                        lambda args, timeout=60: seen.append(args) or {"ok": True})
+    real_dws.card_create({"user_id": ZHAO_SID})
+    assert seen, "card_create 未发起调用"
+    assert "--receiver-open-dingtalk-id" in seen[0]
+    assert "--receiver" not in seen[0]
+    assert ZHAO_SID in seen[0]
+
+
+def test_card_create_keeps_numeric_receiver(real_dws, monkeypatch):
+    seen = []
+    monkeypatch.setattr(real_dws, "run",
+                        lambda args, timeout=60: seen.append(args) or {"ok": True})
+    real_dws.card_create({"user_id": "18434"})
+    assert "--receiver" in seen[0] and "18434" in seen[0]
+    assert "--receiver-open-dingtalk-id" not in seen[0]

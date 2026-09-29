@@ -22,6 +22,10 @@ from pathlib import Path
 
 from .storage import atomic_write_text
 
+# 真实钉钉 userId 的形态：纯数字（本企业实测 18434/20102/40714/1 等全是）。
+# openDingTalkId 是 34 位 base64 串，两者不重叠——故可用形态区分，见 Dws._norm_target。
+_NUMERIC_UID_RE = re.compile(r"^\d+$")
+
 
 def send_accepted(r) -> tuple:
     """判定 dws message send 响应是否「已受理」，返回 (ok, openTaskId, 错误摘要)。
@@ -153,7 +157,27 @@ class Dws:
             return {"raw": (p.stdout or "")[:300]}
 
     # ── 发送 ──
+    @staticmethod
+    def _norm_target(t: dict) -> dict:
+        """把误放进 `user_id` 的 openDingTalkId 归位到 `open_dingtalk_id`。
+
+        为什么需要：本企业真实 userId **全是数字串**（18434/20102/1…），而
+        openDingTalkId 是 34 位 base64 串，两者形态不重叠。main.on_event 在通讯录
+        反查不到 userId 时会**回落用 openId 当 uid**（外部/跨组织联系人如赵兴峰，
+        search/aisearch/chat-members-get 三条途径都只回 openDingTalkId、拿不到
+        userId）。若这种 uid 被塞进 `{"user_id": …}`（_dm、_l3_qa、monitor 都这么
+        干），就会拼出 `--user <openId>`——dws 解析不了，消息**静默发不出去**。
+
+        在唯一的出口处按形态归位，一处修好全部调用点，不必逐个改签名。
+        已有 open_dingtalk_id 的不覆盖（那是事件里带来的权威值）。
+        """
+        uid = str(t.get("user_id") or "")
+        if uid and not _NUMERIC_UID_RE.match(uid) and not t.get("open_dingtalk_id"):
+            return {**t, "user_id": "", "open_dingtalk_id": uid}
+        return t
+
     def _target_args(self, t: dict) -> list:
+        t = self._norm_target(t)
         if t.get("is_group"):
             return ["--conversation-id", t["conversation_id"]]
         if t.get("user_id"):
@@ -227,15 +251,19 @@ class Dws:
         if target.get("is_group"):
             args = ["chat", "+messages-send-card", "--group",
                     target.get("conversation_id", "")]
-        elif target.get("open_dingtalk_id"):
-            args = ["chat", "+messages-send-card",
-                    "--receiver-open-dingtalk-id",
-                    target["open_dingtalk_id"]]
-        elif target.get("user_id"):
-            args = ["chat", "+messages-send-card", "--receiver",
-                    str(target["user_id"])]
         else:
-            return {}
+            # 与 _target_args 同源归位：uid 回落成 openId 时不得走 --receiver
+            # （--receiver 要真实 userId，传 openId 会解析失败）
+            target = self._norm_target(target)
+            if target.get("open_dingtalk_id"):
+                args = ["chat", "+messages-send-card",
+                        "--receiver-open-dingtalk-id",
+                        target["open_dingtalk_id"]]
+            elif target.get("user_id"):
+                args = ["chat", "+messages-send-card", "--receiver",
+                        str(target["user_id"])]
+            else:
+                return {}
         return self.run(args + ["--yes", "--format", "json"], timeout=30)
 
     def card_update(self, biz_id: str, content: str, flow_status: int) -> bool:

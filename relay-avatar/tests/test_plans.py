@@ -1,4 +1,5 @@
 """tests/test_plans.py —— 大脑 ```plan 标记 → relay-avatar 带凭据执行（创建/列表/删除/启停）。"""
+import json
 import time
 
 import pytest
@@ -698,3 +699,140 @@ def test_group_plan_success_goes_to_group(avatar, cfg):
     target, content = avatar.dws.sent[0]
     assert target.get("conversation_id") == "cg", "成功回执没发回群"
     assert "已创建定时计划" in content
+
+
+# ── 身份回落与定级口径统一（2026-09-29）──
+#
+# 起因：赵兴峰按 **openId** 入白名单，而他的 userId 三条途径都拿不到（实测
+# contact +search-user 只回 openDingTalkId、aisearch person 返回空、
+# chat +chat-members-get 只回 nick+openId——外部/跨组织联系人），且
+# resolve_userid 每 6h 负缓存过期后重试、永远同样失败。uid 恒为空造成三处静默故障：
+#   ① _plan_gate 用 get_level("")→NONE，他明明在白名单里却建不了计划，拒绝文案
+#      还叫他"找超管加白名单"（他已在），两边都查不出原因
+#   ② rate_hit 按 str(uid) 计桶 → 所有解析失败的人**共用一个配额桶**
+#      （实测生产 rate.json 里 '' 桶当天已计 4 次）
+#   ③ 审计 actor="" 无归属
+#
+# 修法：uid 解析不出时**回落用 openId**——它是钉钉真实、稳定、全局唯一的标识符，
+# 不是凭空造的；白名单本就认 openId（_static_level）；真实 userId 是纯数字串、
+# openId 是 34 位 base64 串，**永不撞号**。并把所有定级统一到 level_of。
+# 发送侧的归位见 test_main_routing.py 的 _norm_target 组。
+
+ZHAO_SID = "DJTDWXe5Omkca6fEkz0vxWVZZG4c4SxTc"   # 赵兴峰真实 openId
+
+
+def _zhao(avatar):
+    """把赵兴峰的 openId 加进白名单（模拟生产 policy.toml 的登记方式）。"""
+    avatar.policy.whitelist.add(ZHAO_SID)
+    return avatar
+
+
+def test_uid_falls_back_to_openid(avatar):
+    """通讯录反查不到 userId → uid 回落为 openId（不再是空串）。"""
+    _zhao(avatar)
+    assert avatar.dws.resolve_userid(ZHAO_SID, "赵兴峰", avatar.contacts) == ""
+    avatar.on_event(ev("你好", sid=ZHAO_SID, sender="赵兴峰", n="70"))
+    s = avatar.sess.sessions[f"o:{ZHAO_SID}"]
+    assert s["uid"] == ZHAO_SID, "uid 未回落到 openId"
+
+
+def test_openid_whitelisted_user_passes_plan_gate(avatar):
+    """核心修复：按 openId 入白名单的人能过计划门禁。
+
+    两种入参都要放行：uid 为空但 sid 命中名单（回落前的形态），以及 uid 已是
+    openId（回落后的形态）——后者说明回落与 level_of 两条修法各自独立生效。
+    """
+    _zhao(avatar)
+    assert avatar.policy.get_level("") == "NONE"            # 旧口径：必拒
+    assert avatar.policy.level_of("", ZHAO_SID, "赵兴峰") == "L2"
+    assert avatar._plan_gate("", "create", ZHAO_SID, "赵兴峰") is None
+    assert avatar._plan_gate(ZHAO_SID, "create") is None
+
+
+def test_openid_user_end_to_end_plan_create(avatar):
+    """端到端：他在单聊里说「定时 每天8点 跑经营日报」→ 计划真建出来。"""
+    _zhao(avatar)
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("定时 每天8点 跑经营日报", sid=ZHAO_SID,
+                       sender="赵兴峰", n="71"))
+    assert len(avatar.exec_relay.created) == 1, "计划未创建"
+    _, on_cal, _ = avatar.exec_relay.created[0]
+    assert on_cal == "*-*-* 08:00:00"
+    assert any("已创建定时计划" in c for _, c in avatar.dws.sent)
+
+
+def test_openid_user_marker_path_also_works(avatar):
+    """标记路径（agent 出 ```plan``` 块）同样要认 openId 身份。"""
+    _zhao(avatar)
+    s = {"reply": {"is_group": True, "conversation_id": "cg",
+                   "sender": "赵兴峰", "open_dingtalk_id": ZHAO_SID},
+         "uid": ZHAO_SID, "state": "IDLE"}
+    note = avatar._exec_plan_op(
+        {"op": "create", "name": "群里的日报", "on_calendar": "*-*-* 09:00:00",
+         "description": "生成当日经营日报并落盘 shared/report/"},
+        ZHAO_SID, ZHAO_SID, "赵兴峰")
+    assert len(avatar.exec_relay.created) == 1, note
+    assert "已创建定时计划" in note
+
+
+def test_openid_user_rate_limit_own_bucket(avatar, cfg):
+    """限流独立计桶：此前所有 uid 解析失败的人共用 '' 一个桶。
+
+    rate_hit 在 _flush 里触发（不在 on_event），且 `uid = uid or s.get("uid")`，
+    故不显式传 uid 时会话里回落后的 openId 会自然生效。
+    """
+    _zhao(avatar)
+    avatar.on_event(ev("跑个任务", sid=ZHAO_SID, sender="赵兴峰", n="72"))
+    s = avatar.sess.sessions[f"o:{ZHAO_SID}"]
+    assert s["uid"] == ZHAO_SID
+    avatar._flush(s)
+    d = json.loads((cfg.state / "run" / "rate.json").read_text("utf-8"))
+    counts = d.get("counts") or {}
+    assert ZHAO_SID in counts, f"未按 openId 独立计桶：{counts}"
+    assert "" not in counts, f"仍有空 uid 桶：{counts}"
+
+
+def test_openid_user_plan_ops_are_attributed(avatar, cfg):
+    """审计要能认出是谁：actor 记 openId，detail 带显示名（光看 base64 认不出人）。"""
+    _zhao(avatar)
+    avatar._exec_plan_op({"op": "create", "name": "赵的日报",
+                          "on_calendar": "*-*-* 08:00:00",
+                          "description": "生成当日经营日报并落盘 shared/report/"},
+                         ZHAO_SID, ZHAO_SID, "赵兴峰")
+    lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert ZHAO_SID in lines, "审计未记 openId"
+    assert "赵兴峰" in lines, "审计未带显示名，无法人对账"
+
+
+def test_openid_superadmin_can_touch_protected_plan(avatar, cfg):
+    """按 openId 入 superadmin 名单的人也要被认出来。
+
+    受保护计划判定此前用 is_superadmin(uid)，uid 为空即漏判成非超管；改用
+    level_of(uid, sid, sender) 后与 _plan_gate 同源。
+    """
+    avatar.policy.superadmin.add(ZHAO_SID)
+    assert avatar.policy.level_of("", ZHAO_SID, "赵兴峰") == "super"
+    cfg._p.setdefault("security", {})["plan_protected"] = ["每日原油价格预测调取"]
+    avatar.exec_relay.plans.append(
+        {"id": 1, "name": "每日原油价格预测调取", "on_calendar": "*-*-* 07:50:00",
+         "enabled": True, "next_run": time.time() + 3600})
+    note = avatar._plan_by_name_note("delete", "每日原油价格预测调取",
+                                     "", ZHAO_SID, "赵兴峰")
+    assert avatar.exec_relay.deleted == [1], note
+
+
+def test_guest_still_denied_after_fallback(avatar):
+    """回落不得放宽边界：名单外的人 uid 变成 openId 后仍是 NONE，照样拒。"""
+    stranger = "DxxxxSTRANGERxxxx"
+    assert avatar.policy.level_of(stranger, stranger, "路人") == "NONE"
+    assert avatar._plan_gate(stranger, "create", stranger, "路人") is not None
+    avatar.on_event(ev("定时 每天8点 跑日报", sid=stranger, sender="路人", n="73"))
+    assert not avatar.exec_relay.created
+
+
+def test_blocked_openid_still_blocked_after_fallback(avatar):
+    """拉黑优先级最高：openId 在黑名单里，回落后不得因为形态变化而漏判。"""
+    bad = "DblockedOpenId0000000000000000000"
+    avatar.policy.blacklist.add(bad)
+    assert avatar.policy.level_of(bad, bad, "坏人") == "BLOCKED"
+    assert avatar._plan_gate(bad, "create", bad, "坏人") is not None
