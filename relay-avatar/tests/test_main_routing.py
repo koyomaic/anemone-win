@@ -197,20 +197,55 @@ def test_authorized_buffer_submit_done(avatar):
 
 
 def test_gate_passthrough(avatar):
+    """Tier 3a/3b：发起人（非超管）只看业务语言，详情 DM 给超管。
+
+    此前把 `rm -rf /` 原文甩给业务用户裁决——他没有判断依据，理性反应只有
+    「点确认让它闭嘴」（门禁形同虚设）或「点拒绝」（#299 整个任务作废，而它的
+    正事早已办完）。目标是客户侧**零 shell 审批弹窗**。
+    """
     avatar.on_event(ev("删库跑路", n="13"))
     avatar._flush(avatar.sess.sessions["o:sid200"], uid="200")
     tid = avatar.sess.sessions["o:sid200"]["task_id"]
     avatar.exec_relay.tasks[tid] = {"id": tid, "status": "pending_approval",
-                                    "blocked_cmd": "rm -rf /"}
+                                    "blocked_cmd": "rm -rf /",
+                                    "error": "blocked:rm: rm -rf /"}
     avatar._poll_sessions()
     s = avatar.sess.sessions["o:sid200"]
     assert s["state"] == "WAIT_APPROVAL"
-    assert any("门禁拦截" in t and "rm -rf" in t for t in texts(avatar))
-    assert not any("任务 #" in t for t in texts(avatar))   # 不展示任务编号
+    assert s["gate_cat"] == "rm", "类别应从 relay 的 error 里解析出来"
+    # 发起人侧：业务语言、不含 shell 原文、不含任务编号
+    to_user = [c for t, c in avatar.dws.sent
+               if (t or {}).get("open_dingtalk_id") or (t or {}).get("conversation_id")]
+    assert to_user, "没给发起人任何通知"
+    assert any("需要管理员确认" in c and "删除" in c for c in to_user)
+    assert not any("rm -rf" in c for c in to_user), "shell 原文泄给了业务用户"
+    assert not any("任务 #" in c for c in to_user), "发起人不需要任务编号"
+    # 超管侧（18434）：DM 详情，含编号与命令首行
+    to_sup = [c for t, c in avatar.dws.sent if (t or {}).get("user_id") == "18434"]
+    assert to_sup, "没转给超管"
+    assert any(f"#{tid}" in c and "rm -rf" in c and "待你拍板" in c for c in to_sup)
+    # 发起人仍可自己回「确认」（向后兼容，不因为他不是超管就失效）
     avatar.dws.sent.clear()
     avatar.on_event(ev("确认", n="14"))
     assert s["state"] == "RUNNING"
     assert any("已放行" in t for t in texts(avatar))
+
+
+def test_gate_superuser_is_asked_directly(avatar):
+    """发起人自己就是超管 → 直接问他（他能判断），不再多绕一圈 DM。"""
+    avatar.on_event(ev("删库跑路", n="60", sid="sid18434"))
+    s = avatar.sess.sessions["o:sid18434"]
+    avatar._flush(s, uid="18434")
+    tid = s["task_id"]
+    avatar.exec_relay.tasks[tid] = {"id": tid, "status": "pending_approval",
+                                    "blocked_cmd": "rm -rf /",
+                                    "error": "blocked:rm: rm -rf /"}
+    avatar.dws.sent.clear()
+    avatar._poll_sessions()
+    assert s["state"] == "WAIT_APPROVAL"
+    sent = [c for _, c in avatar.dws.sent]
+    assert any("待你拍板" in c and "rm -rf" in c for c in sent), sent
+    assert not any("已转给超管" in c for c in sent), "超管本人不该收到'已转超管'"
 
 
 def test_cancel_running(avatar):
@@ -344,11 +379,18 @@ def test_card_gate_keeps_card(cfg):
     s = av.sess.sessions["o:sid200"]
     tid = s["task_id"]
     av.exec_relay.tasks[tid] = {"id": tid, "status": "pending_approval",
-                                "blocked_cmd": "rm -rf /"}
+                                "blocked_cmd": "rm -rf /",
+                                "error": "blocked:rm: rm -rf /"}
     av._poll_sessions()
     assert s.get("card_biz") == "BIZ1"   # 门禁不销卡，放行后继续刷新
-    assert any(f[2] == 4 and "等你拍板" in f[1] and "rm -rf" in f[1]
-               for f in av.dws.card_frames)
+    # 卡片是发给**发起人**（uid 200，非超管）的：业务语言 + 告知已转超管，
+    # 不贴 shell 原文、不要求他回复。
+    frames = [f for f in av.dws.card_frames if f[2] == 4]
+    assert frames, "门禁未刷新卡片"
+    body = frames[-1][1]
+    assert "等拍板" in body and "删除" in body
+    assert "已转超管确认" in body and "你无需操作" in body
+    assert "rm -rf" not in body, "shell 原文泄进了发给业务用户的卡片"
 
 
 def test_card_fail_fallback_text(cfg):
@@ -544,3 +586,52 @@ def test_self_note_no_echo_loop(avatar):
     # 模拟回执被当新消息轮询回来（无 SELF_MARK、指纹闸失效的最坏情况）
     avatar.on_event(self_ev(receipt, "91"))
     assert len(avatar.know.list_notes()) == n1   # 未新增笔记
+
+
+# ── Tier 3b：被拦命令 → 业务语言（不贴 shell 给业务用户）──
+
+def test_parse_block_error_new_and_legacy_format(avatar):
+    """新格式 `blocked:<cat>: <cmd>` 与旧格式 `blocked: <cmd>` 都要能解析。
+
+    机队里有 6 台尚未同步，混跑期间分身可能收到旧格式，不能解析失败就丢类别。
+    """
+    assert avatar._parse_block_error("blocked:rm: rm -rf /x") == ("rm", "rm -rf /x")
+    assert avatar._parse_block_error("blocked:recon: cat /proc/self/environ") \
+        == ("recon", "cat /proc/self/environ")
+    assert avatar._parse_block_error("blocked:dws: dws chat message send --group x") \
+        == ("dws", "dws chat message send --group x")
+    # 旧格式：无类别
+    assert avatar._parse_block_error("blocked: rm -rf /x") == ("", "rm -rf /x")
+    # 非拦截错误
+    assert avatar._parse_block_error("agent exited with code 1") == ("", "")
+    assert avatar._parse_block_error("") == ("", "")
+
+
+def test_gate_summary_covers_every_category(avatar):
+    """每个类别都要有人话，且**不得**把 shell 原文当摘要返回。"""
+    cases = [
+        ("rm -rf /mnt/vol-eltaah12/workspace/shared/report", "rm", "删除"),
+        ("dws chat message send --conversation-id cidXX== --file a.html", "dws", "发送"),
+        ("cat /proc/self/environ", "recon", "凭据"),
+        ("systemctl restart relay", "system", "服务"),
+        ("git push origin main", "system", "git"),
+        ("mkfs.ext4 /dev/vdb", "other", "不可逆"),
+    ]
+    for cmd, cat, kw in cases:
+        s = avatar._gate_summary(cmd, cat)
+        assert kw in s, f"{cat}/{cmd} → {s!r} 缺关键词 {kw}"
+        assert "rm -rf" not in s and "/proc/" not in s, f"摘要里泄了 shell 原文：{s}"
+
+
+def test_gate_summary_extracts_delete_target(avatar):
+    """删除类要摘出**被删目标**——只说"要删文件"超管没法判断。"""
+    s = avatar._gate_summary(
+        'cd /mnt/vol-eltaah12/workspace/shared && rm -rf report/2026-09', "rm")
+    assert "report/2026-09" in s, s
+
+
+def test_gate_summary_falls_back_without_category(avatar):
+    """类别缺失（旧格式 relay）时按命令文本粗判，不得退化成"执行高风险命令"。"""
+    assert "删除" in avatar._gate_summary("rm -rf /mnt/ws/shared/report", "")
+    assert "发送" in avatar._gate_summary("dws chat +dm --user 1 --content x", "")
+    assert "服务" in avatar._gate_summary("systemctl stop relay", "")

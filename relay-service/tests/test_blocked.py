@@ -104,8 +104,53 @@ def test_rm_task_home_still_guarded(ex):
     assert ex._is_blocked("rm -rf /root", WORKDIR) is not None  # 系统路径照拦
     assert ex._is_blocked("rm -rf $HOME/x") is not None  # 无 workdir 上下文时保持旧行为
     assert ex._is_blocked('rm -rf "$DIR/x"', WORKDIR) is not None  # 其它变量无法展开
-    assert ex._is_blocked("rm -rf ./cache", WORKDIR) is not None  # 相对路径照拦
     assert ex._is_blocked("rm -rf /tmp/a $HOME/../../shared/knowledge", WORKDIR) is not None  # 混有逃逸目标
+
+
+# ---- Tier 1：rm 精度修复（2026-09-29）----
+#
+# 此前只放行 <workdir>/home，且相对路径一律不解析，于是两类**正常收尾**也要去问人：
+#   · #259 `rm -rf <workdir>/work/shared <workdir>/data`（把产物 mv 到共享区后清自己的中间件）
+#   · #121 `cd /tmp && rm -rf syncpkg`（/tmp 本属安全前缀，只因目标是相对路径没解析）
+# 13 条历史被拦命令里 3 条属此类误报。放宽的同时必须堵住逃逸与变量绕过——下面逐条锁死。
+
+def test_rm_own_workdir_tree_allowed(ex):
+    """任务自身 workdir 树内删除放行：只伤本任务，触不到 shared/ 与系统目录。"""
+    assert ex._is_blocked(f"rm -rf {WORKDIR}/work/shared {WORKDIR}/data", WORKDIR) is None
+    assert ex._is_blocked(f"rm -rf {WORKDIR}/output/tmp", WORKDIR) is None
+    assert ex._is_blocked("rm -rf ./cache", WORKDIR) is None       # 相对→解析进自身 workdir
+    assert ex._is_blocked(f"cd {WORKDIR} && rm -rf work data", WORKDIR) is None
+
+
+def test_rm_relative_resolved_against_cd(ex):
+    """`cd` 后的相对路径要按 cd 目标解析（#121：/tmp 内相对路径曾被误拦）。"""
+    assert ex._is_blocked("cd /tmp && rm -rf syncpkg", WORKDIR) is None
+    assert ex._is_blocked("cd /var/tmp && rm -rf x/y", WORKDIR) is None
+    assert ex._is_blocked(f"cd {WORKDIR} && rm -rf work", WORKDIR) is None
+
+
+def test_rm_cd_escape_still_blocked(ex):
+    """cd 到别处再删共享区/系统目录：照拦。"""
+    assert ex._is_blocked("cd /mnt/ws/shared && rm -rf report", WORKDIR) is not None
+    assert ex._is_blocked(f"cd {WORKDIR} && rm -rf ../../shared/report", WORKDIR) is not None
+    assert ex._is_blocked(f"cd {WORKDIR}/work && rm -rf ../../../shared", WORKDIR) is not None
+    assert ex._is_blocked(f"cd {WORKDIR} && rm -rf ../43/output", WORKDIR) is not None  # 横向到别的任务
+
+
+def test_rm_unresolvable_cd_target_blocked(ex):
+    """cd 目标含变量/命令替换 → cwd 不可知 → 必须拦。
+
+    这是改 Tier 1 时实测踩到的洞：`KEY=/…/shared; cd "$KEY"; rm -rf reports` 里
+    $KEY 静态展开不了，若把字面量 "$KEY" 拼进 workdir 会得到 `<workdir>/$KEY/reports`
+    ——它以 workdir 开头，被"自身树安全"规则放行，而真实目标是 shared/reports
+    （历史 #217/#222 正是这个形态）。
+    """
+    assert ex._is_blocked('KEY=/mnt/ws/shared; cd "$KEY"; rm -rf reports', WORKDIR) is not None
+    assert ex._is_blocked("KEY=/x; cd $KEY; rm -rf y", WORKDIR) is not None
+    assert ex._is_blocked("cd $(echo /mnt/ws/shared); rm -rf report", WORKDIR) is not None
+    assert ex._is_blocked("cd `echo /mnt/ws/shared`; rm -rf report", WORKDIR) is not None
+    assert ex._is_blocked(f'cd {WORKDIR}; rm -rf "$HOME"/x', WORKDIR) is not None
+    assert ex._is_blocked(f'cd {WORKDIR}; rm -rf $D', WORKDIR) is not None
 
 
 # ---- 凭据枚举拦截（2026-09-28 加固）----

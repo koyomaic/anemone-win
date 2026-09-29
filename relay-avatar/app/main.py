@@ -1055,17 +1055,23 @@ class Avatar:
             if status == "pending_approval" and s["state"] != "WAIT_APPROVAL":
                 s["state"] = "WAIT_APPROVAL"
                 s["gate_cmd"] = row.get("blocked_cmd") or ""
-                self._notify_session(s, self._approval_text(s))
+                # 类别由 relay 编码在 error 里（blocked:<cat>: <cmd>），拿来即可，
+                # 分身侧不再自己跑正则猜命令类型。
+                s["gate_cat"], _ = self._parse_block_error(row.get("error") or "")
+                uid = str(s.get("uid") or "")
+                self._notify_gate(s, uid)
                 if s.get("card_biz"):
-                    cmd = (s.get("gate_cmd") or "").splitlines()
-                    cmd = (cmd[0] if cmd else "")[:60]
+                    # 卡片是发给**发起人**的，同样不贴 shell 原文
+                    summ = self._gate_summary(s["gate_cmd"], s["gate_cat"])
+                    is_sup = bool(uid) and self.policy.is_superadmin(uid)
                     try:
                         # 不销卡：放行后任务继续，卡片随后续状态刷新
                         self.dws.card_update(
                             s["card_biz"],
-                            f"🍂 **{self.cfg.avatar_name}等你拍板…**\n\n"
-                            f"> 🚧 门禁拦截：`{cmd}…`\n"
-                            "> 回复「确认」放行 /「拒绝」终止", 4)
+                            f"🍂 **{self.cfg.avatar_name}等拍板…**\n\n"
+                            f"> 🚧 {summ}\n"
+                            + ("> 回复「确认」放行 /「拒绝」终止" if is_sup else
+                               "> 已转超管确认，你无需操作"), 4)
                     except Exception:
                         pass
                 self.st.archive_round(tid, "pending_approval",
@@ -1081,14 +1087,88 @@ class Avatar:
             if status in ("done", "conflict", "failed", "cancelled"):
                 self._finish(s, row)
 
-    def _approval_text(self, s: dict) -> str:
-        cmd = (s.get("gate_cmd") or "").splitlines()
-        cmd = (cmd[0] if cmd else "")[:60]
-        if cmd:
-            return (f"🚧 门禁拦截了任务里的高危命令：`{cmd}…`\n\n"
-                    "回复「确认」放行，「拒绝」终止。")
-        return ("🚧 任务里有高危操作待审批。\n\n"
-                "回复「确认」放行，「拒绝」终止。")
+    @staticmethod
+    def _gate_summary(cmd: str, cat: str = "") -> str:
+        """被拦命令 → **业务语言**。
+
+        为什么不再贴 shell 原文：让业务用户裁决 `ls -laR /opt/team/relay-avatar/ |
+        head -40` 是安全剧场——他没有判断依据，理性反应只有「点确认让它闭嘴」
+        （门禁形同虚设）或「点拒绝」（#299 整个任务作废，而它的正事早已办完）。
+        原文只在超管面前保留（他们能判断）。
+
+        `cat` 来自 relay 的 `error` 字段（`blocked:<cat>: <cmd>`），是 relay 侧
+        已算好的类别，故这里**不跑任何正则**；cat 缺失时退回按命令文本粗判。
+        仅在实际拦截时调用，不在热路径。
+        """
+        c = cmd or ""
+        low = c.lower()
+        if cat == "rm" or (not cat and "rm -" in low):
+            # 从命令里摘出被删目标，比只说"要删文件"有用得多
+            m = re.search(r"rm\s+(?:-[A-Za-z]+\s+)*([^\s;&|]+)", c)
+            p = (m.group(1) if m else "").strip('"\'')[:80]
+            return (f"删除任务工作区以外的文件/目录：`{p}`" if p
+                    else "删除任务工作区以外的文件/目录")
+        if cat == "dws" or (not cat and "dws " in low):
+            if "群" in c or "--group" in low or "chat-id" in low \
+                    or "conversation-id" in low:
+                return "向群聊/会话发送钉钉消息或文件"
+            return "对外发送钉钉消息或文件"
+        if cat == "recon":
+            return "读取中转/分身自身的凭据或安装目录（超出任务范围）"
+        if cat == "system" or any(k in low for k in (
+                "systemctl", "service ", "pkill", "killall", "git ")):
+            return "启停系统服务、杀进程或执行 git 写操作"
+        if any(k in low for k in ("mkfs", "of=/dev/", ">/dev/", "shutdown",
+                                  "reboot", "poweroff", "halt")):
+            return "执行不可逆的系统级操作（格式化/写裸盘/关机）"
+        return "执行高风险命令"
+
+    @staticmethod
+    def _parse_block_error(err: str) -> tuple:
+        """`blocked:<cat>: <cmd>` → (cat, cmd)。兼容旧格式 `blocked: <cmd>`。"""
+        e = (err or "").strip()
+        if not e.startswith("blocked"):
+            return "", ""
+        body = e.split(":", 1)[1].lstrip() if ":" in e else ""
+        # 新格式：body 形如 "<cat>: <cmd>"；cat 是短标识，不含空格与冒号
+        m = re.match(r"^([a-z]+):\s*(.*)$", body, re.S)
+        if m:
+            return m.group(1), m.group(2)
+        return "", body
+
+    def _approval_text(self, s: dict, for_super: bool = False) -> str:
+        cmd = s.get("gate_cmd") or ""
+        summary = self._gate_summary(cmd, s.get("gate_cat") or "")
+        tid = s.get("task_id")
+        if for_super:
+            first = (cmd.splitlines() or [""])[0][:160]
+            mins = self.cfg.get("execution", "approval_timeout_minutes", 60)
+            return (f"🚧 **待你拍板**：任务 #{tid} 需要一步高风险操作\n\n"
+                    f"· 操作：{summary}\n"
+                    f"· 发起人：{(s.get('reply') or {}).get('sender') or '?'}\n"
+                    f"· 命令首行：`{first}…`\n\n"
+                    f"到 dashboard「任务」页点批准/拒绝。{mins:g} 分钟内无人处理"
+                    "将自动终止（不会像以前那样被静默标成已完成）。")
+        return (f"🚧 你这个任务里有一步需要管理员确认：{summary}。\n\n"
+                "已转给超管拍板，你不用管、也不用回什么；批下来会自动继续，"
+                "被拒或超时会告诉你原因。")
+
+    def _notify_gate(self, s: dict, uid: str):
+        """审批通知路由：发起人若是超管→直接问他；否则→只给他一句人话，
+        详情 DM 给每位超管。目标是客户侧**零 shell 审批弹窗**。"""
+        if uid and self.policy.is_superadmin(uid):
+            self._notify_session(s, self._approval_text(s, for_super=True))
+            return
+        sups = sorted(getattr(self.policy, "superadmin", set()) or set())
+        if not sups:
+            # 没配超管就退回问发起人，否则任务无人可批、只能干等到超时
+            self._notify_session(s, self._approval_text(s, for_super=True))
+            return
+        self._notify_session(s, self._approval_text(s))
+        txt = self._approval_text(s, for_super=True)
+        for su in sups:
+            if su != uid:
+                self._dm(su, txt)
 
     def _chain_digest(self, row: dict) -> str:
         """上一任务 result → 接续摘要：剥掉所有围栏标记后截断。

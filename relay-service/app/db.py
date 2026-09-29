@@ -480,6 +480,20 @@ class DB:
             (marker, now, task_id))
         return rowcount > 0
 
+    def mark_approval_timeout(self, task_id: int, marker: str) -> bool:
+        """原子地把仍处于 pending_approval 的任务置为 **failed**。返回是否更新。
+
+        与 mark_stale_done 分开：待审批＝活干到一半被门禁拦住，超时置 done 等于把
+        没办完的任务标成办完了（#299 若无人手工拒批，24h 后就会被标 done）。
+        WHERE 带 status 守卫，避免与并发的人工 approve/deny 竞态双写。
+        """
+        now = time.time()
+        _, rowcount = self._run(
+            "UPDATE tasks SET status='failed', error=?, finished_at=COALESCE(finished_at, ?)"
+            " WHERE id=? AND status='pending_approval'",
+            (marker, now, task_id))
+        return rowcount > 0
+
     # ---- plans（定时计划：声明存库，root 侧 relay-plan.timer 扫库触发） ----
 
     def create_plan(self, *, name: str, owner_name: str, on_calendar: str,

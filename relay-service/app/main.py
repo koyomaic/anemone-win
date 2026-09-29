@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from .audit import AuditLog
 from . import shared_knowledge
 from . import plans as plan_util
-from .config import Settings
+from .config import AUTO_DENY_REASONS, Settings
 from .db import DB
 from .events import TERMINAL, EventBus
 
@@ -808,7 +808,14 @@ def _list_system_timers() -> list[dict]:
 
 
 def sweep_stale(db, bus, audit, cfg, ws) -> list[int]:
-    """把停留超时（created_at 早于阈值）的 review/待审批 任务自动置为 done 并标记。
+    """超时清扫：review 停留过久 → 自动 done；待审批停留过久 → 自动 **failed**。
+
+    两者必须分开：review 是"活已干完、等人过目"，超时置 done 无损；pending_approval
+    是"活干到一半被门禁拦住"，此前与 review 共用一条 UPDATE 被置成 done，等于把
+    **没办完的任务标成办完了**（#299 若无人手工拒批，24h 后就会静默变成 done）。
+
+    性能：用两个 cutoff 里**较短的那个查一次**，再在 Python 里按 status 与各自的
+    阈值分流——不增加查询次数（sweep 每 sweep_interval_sec 才跑一次）。
 
     另兜 local 影子记录的孤儿：avatar 崩溃/被 kill 时来不及回报终态，记录会永远
     停在 running，超 local_stale_minutes 即判 failed（否则任务列表里挂一条僵尸行，
@@ -816,9 +823,27 @@ def sweep_stale(db, bus, audit, cfg, ws) -> list[int]:
 
     返回被清扫的 task_id 列表。
     """
-    cutoff = time.time() - cfg.stale_timeout_hours * 3600
+    now = time.time()
+    rcut = now - cfg.stale_timeout_hours * 3600            # review 阈值
+    acut = now - cfg.approval_timeout_minutes * 60         # 待审批阈值
     swept: list[int] = []
-    for t in db.stale_tasks(["review", "pending_approval"], cutoff):
+    # stale_tasks 的条件是 `created_at < cutoff`，故要同时覆盖两个阈值必须取
+    # **较大**（较近）的 cutoff——它捞出的集合是两者的超集，再在 Python 里按
+    # status 与各自阈值分流。取 min 会漏掉全部待审批任务（实测踩到）。
+    for t in db.stale_tasks(["review", "pending_approval"], max(rcut, acut)):
+        if t["status"] == "pending_approval":
+            if (t.get("created_at") or 0) >= acut:
+                continue                                   # 未到待审批阈值
+            err = (f"待审批超过 {cfg.approval_timeout_minutes:g} 分钟无人处理，"
+                   f"自动终止（被拦命令：{(t.get('blocked_cmd') or '')[:120]}）")
+            if db.mark_approval_timeout(t["id"], err):
+                bus.publish(t["id"], t="status", s="failed", error=err)
+                audit.line(t["id"], t["user"], "approval_timeout", err[:200])
+                ws.cleanup_terminal(t)
+                swept.append(t["id"])
+            continue
+        if (t.get("created_at") or 0) >= rcut:
+            continue                                       # 未到 review 阈值
         if db.mark_stale_done(t["id"], "超时自动done"):
             bus.publish(t["id"], t="status", s="done", error="超时自动done")
             audit.line(t["id"], t["user"], "auto_done_timeout",
@@ -853,6 +878,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     ex = Executor(cfg)
     audit = AuditLog(cfg.log_path)
     cancel_events: dict[int, asyncio.Event] = {}
+    # 侦察类命令的**自动拒绝**续跑计数（Tier 2）。进程内即可：重启丢计数最坏只是
+    # 多给两次机会，且任务总时限（1800s）本身就是硬上界。用 dict 而非 DB 列是为了
+    # 零迁移、零额外查询——热路径上不碰数据库。
+    auto_deny_counts: dict[int, int] = {}
     sched: Scheduler | None = None  # set in lifespan
     started_at = time.monotonic()
 
@@ -900,6 +929,38 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                cost=res.cost,
                resume_hint="")
         if res.error and res.error.startswith("blocked:"):
+            # ── Tier 2：侦察类自动拒绝 + 回注提示续跑（不打扰用户）──
+            # 分类靠比对 executor 已算出的原因字符串（frozenset O(1)），不新增正则。
+            # 为什么不给用户看：业务用户无法判断 `ls -laR /opt/team/relay-avatar/`
+            # 安不安全，只会「点确认让它闭嘴」或「点拒绝」——#299 就是被困惑的拒绝
+            # 杀掉整个任务（卡 76 分钟，而它的正事其实早已办完）。
+            #
+            # 复用既有 self_resume 机制：写 resume_hint 即自动续跑同一 workdir/session。
+            # **必须同时清空 blocked_cmd**——self_resume 分支会把它当 exempt_cmd，
+            # 不清空等于给这条命令发通行证，下次直接放行。
+            n = auto_deny_counts.get(task_id, 0)
+            if res.block_reason in AUTO_DENY_REASONS and n < cfg.auto_deny_max:
+                auto_deny_counts[task_id] = n + 1
+                hint = (
+                    "上一条命令被系统**自动拒绝**（非人工审批，无需等待任何人）：它属于"
+                    "对中转/分身自身（凭据、安装目录、进程环境）的侦察，超出本任务范围；"
+                    "任务环境里本来就没有这些凭据，继续找只会白烧时限。\n"
+                    f"被拒命令：{(res.blocked_cmd or '')[:200]}\n"
+                    f"（本任务已自动拒绝 {n + 1}/{cfg.auto_deny_max} 次，"
+                    "超限后转人工审批）\n\n"
+                    "请**不要重试该命令、也不要换写法绕过**，直接继续完成原任务。"
+                    "若你原本想查/建/改定时计划，正规入口是在结果正文出 ```plan``` "
+                    "围栏块（见 AGENTS.md「定时任务／计划」节），由分身带凭据代办。"
+                    "若原任务确实无法在不访问该路径的前提下完成，请如实说明「做不到"
+                    "及原因」，不要静默降级糊弄。")
+                db.set(task_id, status="queued", error="", resume_hint=hint,
+                       blocked_cmd="")
+                bus.publish(task_id, t="status", s="queued")
+                audit.line(task_id, row["user"], "auto_deny",
+                           f"{n + 1}/{cfg.auto_deny_max} "
+                           f"{(res.blocked_cmd or '')[:160]}")
+                await sched.submit(task_id, row["priority"])
+                return
             db.set(task_id, status="pending_approval", error=res.error,
                    blocked_cmd=res.blocked_cmd)
             bus.publish(task_id, t="status", s="pending_approval",
@@ -941,6 +1002,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                     changed=scan["all"][:200], conflicts=conflicts)
         audit.line(task_id, row["user"], "stop", status)
         cancel_events.pop(task_id, None)
+        auto_deny_counts.pop(task_id, None)   # 终态即清，防计数表随任务数无界增长
         if status in TERMINAL:
             ws.cleanup_terminal(row)
 

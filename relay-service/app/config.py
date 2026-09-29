@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 # 注意：本清单是审计+审批层（可被 python -c 等绕过、可人工批准豁免）；对"中转自身"
 # 的硬边界在 relay.service 挂载命名空间（ProtectSystem=strict + InaccessiblePaths），
 # 硬边界内即使批准也写不动（EROFS），例外只能由人在宿主机操作。
-DEFAULT_BLOCKED_PATTERNS = [
+# 系统／中转自身保护类：不可逆或影响服务存续的操作。命中走**人工审批**——运维任务
+# 可能合法需要它们（如超管让 agent 重启服务），不能自动拒。
+_SYSTEM_PROTECT_PATTERNS = [
     r"\bmkfs",                                      # 格式化文件系统（不可逆）
     r"\bof=/dev/(sd|vd|nvme|hd|xvd|dm-|md)\w*",     # dd 写裸盘
     r">\s*/dev/(sd|vd|nvme|hd|xvd|dm-|md)\w*",      # 重定向写裸盘
@@ -25,17 +27,23 @@ DEFAULT_BLOCKED_PATTERNS = [
     r"\bsystemctl\s+(?:--?\S+\s+)*?(start|stop|restart|try-restart|reload|kill|enable|disable|mask|unmask|edit|daemon-reload|daemon-reexec|isolate|preset)\b",
     r"\bservice\s+[\w.@-]+\s+(start|stop|restart|reload)\b",
     r"\b(pkill|killall)\s+.*\b(relay|app\.serve|uvicorn|claude-proxy)\b",
-    # ---- 凭据枚举拦截（2026-09-28 加固）----
-    # 任务环境本就没有 relay 凭据（executor._ENV_DROP_PREFIXES 剔除 RELAY_*），但
-    # agent 不知道，会花几分钟刨 env / /opt/team / relay 源码找 token：#278 为
-    # 「现在有几个定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash。（本机并无
-    # `CronList` 这类工具、也无 local cron 层，定时任务唯一真源是 relay /plans，
-    # 正规入口是 ```plan``` 标记——旧文档写错过，见 relay-avatar main.py 注释。）
-    # 拦下来让它快速失败并走审批，好过白烧 1800s 时限。正规入口见 workspace/AGENTS.md
-    # 「定时任务／计划」节与分身注入的 ```plan``` 标记口径。
-    # 用 [^;\n] 而非 [^|]：目标命令形如 `env | grep -iE "relay|ta_|token"`，引号内
-    # 含 `|`，用 [^|] 会在第一个竖线处截断而漏判；排除 `;` 与换行则避免跨命令误伤
-    # （如 `env | grep PATH; grep token notes.txt` 不应命中）。
+]
+# ---- 凭据枚举／系统侦察（2026-09-28 加固，2026-09-29 归入自动拒绝类）----
+# 任务环境本就没有 relay 凭据（executor._ENV_DROP_PREFIXES 剔除 RELAY_*），但
+# agent 不知道，会花几分钟刨 env / /opt/team / relay 源码找 token：#278 为
+# 「现在有几个定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash。（本机并无
+# local cron 层，定时任务唯一真源是 relay /plans，正规入口是 ```plan``` 标记。）
+#
+# 为什么单列成一组：**这几条没有任何合法业务用途**，拿去问人毫无意义——业务用户
+# 无法判断 `ls -laR /opt/team/relay-avatar/` 安不安全，理性反应只有「点确认让它
+# 闭嘴」（门禁形同虚设）或「点拒绝」（整个任务作废：#299 卡了 76 分钟后被拒，
+# 而它的正事其实早已办完）。故命中即**自动拒绝 + 回注提示**让 agent 改道续跑，
+# 不打扰用户。其余模式（删共享区、对外发送、系统操作）仍走人工审批。
+#
+# 用 [^;\n] 而非 [^|]：目标命令形如 `env | grep -iE "relay|ta_|token"`，引号内
+# 含 `|`，用 [^|] 会在第一个竖线处截断而漏判；排除 `;` 与换行则避免跨命令误伤
+# （如 `env | grep PATH; grep token notes.txt` 不应命中）。
+RECON_BLOCKED_PATTERNS = [
     r"\b(?:env|printenv)\b[^;\n]{0,60}?\|\s*(?:grep|egrep|fgrep|rg)\b[^;\n]{0,120}?"
     r"\b(?:token|secret|passw|api[_-]?key|auth|credential|device)\b",
     r"/proc/(?:\d+|self)/environ",                   # 读进程环境（AGENTS.md 已明禁）
@@ -46,6 +54,33 @@ DEFAULT_BLOCKED_PATTERNS = [
     # 具体凭据标识符（非泛词，误伤面极小）：出现即说明在找 relay 设备/管理员凭据
     r"\brelay_(?:device|admin)[a-z_]*\b|\bdevice_secret\b|\bx-device-id\b",
 ]
+DEFAULT_BLOCKED_PATTERNS = _SYSTEM_PROTECT_PATTERNS + RECON_BLOCKED_PATTERNS
+# 自动拒绝类的原因集合。分类靠**比对已算出的 pattern 字符串**（frozenset O(1)），
+# 不新增任何正则、不在热路径上多跑一次匹配——executor._is_blocked 本就返回命中原因。
+# 运维若用 RELAY_BLOCKED_PATTERNS 覆盖掉某条侦察模式，它自然不再触发自动拒绝；
+# 新增的模式默认落人工审批（保守取向）。
+AUTO_DENY_REASONS = frozenset(RECON_BLOCKED_PATTERNS)
+
+
+def block_category(reason: str) -> str:
+    """拦截原因 → 短类别标识（recon/rm/dws/system/other）。
+
+    供 error 字段编码用（`blocked:<cat>: <cmd>`），让分身侧能用**业务语言**向超管
+    转述，而不必把 shell 原文甩给业务用户。只做字符串前缀/集合比对，**不跑正则**。
+    """
+    if not reason:
+        return "other"
+    if reason in AUTO_DENY_REASONS:
+        return "recon"
+    if reason.startswith("recursive rm outside safe dirs:"):
+        return "rm"
+    if reason.startswith("dws "):
+        return "dws"
+    if reason in _SYSTEM_PROTECT_PATTERNS:
+        return "system"
+    return "other"
+
+
 DEFAULT_RM_SAFE_PREFIXES = ["/tmp", "/var/tmp"]
 
 # dws 消息发送二次确认门控的敏感接收人（executor._confirm_violation 精确字符串匹配）。
@@ -111,7 +146,19 @@ class Settings:
     xdg_config_home: str = ""
     dashboard_password: str = ""
     event_history_max: int = 500
-    stale_timeout_hours: float = 24.0   # review/待审批 停留超时 → 自动 done
+    stale_timeout_hours: float = 24.0   # review 停留超时 → 自动 done
+    # 待审批（pending_approval）停留超时 → 自动 **failed**（不是 done）。
+    # 为什么与 review 分开：review 是"活已干完、等人过目"，超时置 done 无损；
+    # pending_approval 是"活干到一半被门禁拦住"，超时置 done 等于把**没办完的
+    # 任务标成办完了**（#299 若无人手工拒批，24h 后就会被标 done）。
+    # 默认 60min：无 blocked_at 列（不迁移 schema），超时从 created_at 起算，故要
+    # 覆盖「任务本身跑掉的时间 + 留给人决策的时间」。任务时限 1800s(30min)，60min
+    # 意味着最坏情况（跑满 30min 才被拦）仍有 30min 决策窗。#299 从 09:29 卡到
+    # 10:45（76 分钟）无人处理，60min 足以让超管看到，又不至于让发起人干等一上午。
+    approval_timeout_minutes: float = 60.0
+    # 侦察类命令的自动拒绝续跑上限（Tier 2）。超过即转人工审批，防 agent 反复
+    # 试探把续跑变成死循环——每次续跑都是一次完整 claude 调用，代价不低。
+    auto_deny_max: int = 2
     # local 影子记录超期未回报 → 判 failed。默认 15min：avatar 侧 local 硬截止是
     # reply_timeout_sec(600) + 60s 宽限 ≈ 11min，留 4min 余量给回报本身，
     # 既不会抢在 avatar 正常回报前误判，也不会让僵尸行挂太久。
@@ -153,6 +200,9 @@ class Settings:
             xdg_config_home=os.environ.get("RELAY_XDG_CONFIG_HOME", ""),
             dashboard_password=os.environ.get("RELAY_DASHBOARD_PASSWORD", ""),
             stale_timeout_hours=float(os.environ.get("RELAY_STALE_TIMEOUT_HOURS", "24")),
+            approval_timeout_minutes=float(
+                os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "30")),
+            auto_deny_max=int(os.environ.get("RELAY_AUTO_DENY_MAX", "2")),
             local_stale_minutes=float(os.environ.get("RELAY_LOCAL_STALE_MINUTES", "15")),
             sweep_interval_sec=float(os.environ.get("RELAY_SWEEP_INTERVAL_SEC", "300")),
             blocked_patterns=_blocked_patterns_from_env(),

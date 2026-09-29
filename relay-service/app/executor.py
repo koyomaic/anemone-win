@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import shared_knowledge
+from .config import block_category
 
 # 环境继承收敛（2026-09-17 加固）：服务自身机密绝不进任务环境——
 # RELAY_* 前缀整体剔除（ADMIN_TOKEN / DB 连接串 / DASHBOARD_PASSWORD / TLS_DIR 等），
@@ -38,6 +39,11 @@ class AgentResult:
     error: str | None = None
     raw_tail: str = field(default="")
     blocked_cmd: str = ""
+    # 命中的**原因**（pattern 原文 / "recursive rm outside safe dirs: …" / dws 确认原因）。
+    # 此前 _is_blocked 的返回值只当布尔用、原因被丢弃，于是上层无法区分「侦察类」与
+    # 「删共享区/对外发送」——只能一律 pending_approval 去问人。分类靠比对已知字符串
+    # 即可（O(1) 集合查找），**不新增任何正则**，故这里把已经算出来的值带上去。
+    block_reason: str = ""
 
 
 def _parse_opencode(line: str) -> dict | None:
@@ -152,6 +158,9 @@ _CID_INFO_CACHE: dict[str, tuple[bool, str]] = {}
 _CID_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
 # 个别命令里同名 flag 不是发送目标：ding message send-by-message 的 --group 是源会话
 _DWS_NON_TARGET_FLAGS = {("ding", "message", "send-by-message"): {"--group"}}
+# 段内 cd 目标提取。仅供 _cwd_at 惰性回溯相对路径 rm 用（见 _rm_violation 注释），
+# 不在每条命令的热路径上跑。`(?<![\w-])` 防误命中 `--cd`、`pushd` 之类。
+_CD_RE = re.compile(r"(?<![\w-])cd\s+(\"[^\"]*\"|'[^']*'|\S+)")
 
 
 def _state_dirname(user: str) -> str:
@@ -293,11 +302,19 @@ class Executor:
                 if parsed.get("agent_event"):
                     publish(task_id, t="agent", **parsed["agent_event"])
                 cmd = parsed.get("tool_cmd")
-                if cmd and self._is_blocked(cmd, workdir, env) and not self._exempt(cmd, exempt_cmd):
-                    self._kill(proc)
-                    res.blocked_cmd = cmd
-                    res.error = f"blocked: {cmd[:200]}"
-                    return res
+                if cmd:
+                    # 单次调用，原因与判定同源（此前原因被丢弃，见 AgentResult.block_reason）
+                    reason = self._is_blocked(cmd, workdir, env)
+                    if reason and not self._exempt(cmd, exempt_cmd):
+                        self._kill(proc)
+                        res.blocked_cmd = cmd
+                        res.block_reason = reason
+                        # 类别编码进 error：`blocked:<cat>: <cmd>`。**向后兼容**——
+                        # 仍以 "blocked:" 开头，故 run_task 的判定与既有测试都不用改；
+                        # 分身侧按 ":" 切三段即可拿到类别，用业务语言转述给超管，
+                        # 而不必把 shell 原文甩给业务用户。不新增 DB 列（不迁移）。
+                        res.error = f"blocked:{block_category(reason)}: {cmd[:200]}"
+                        return res
         finally:
             if proc.returncode is None:
                 self._kill(proc)
@@ -487,7 +504,7 @@ class Executor:
                 p = home + p[len("${HOME}"):]
         return os.path.normpath(p) if p.startswith("/") else p
 
-    def _rm_path_safe(self, p: str, home: str = "") -> bool:
+    def _rm_path_safe(self, p: str, home: str = "", workdir: str = "") -> bool:
         p = self._resolve_rm_path(p, home)
         if not p.startswith("/"):  # 相对路径/无法展开的变量：无法验证，拦截
             return False
@@ -496,18 +513,64 @@ class Executor:
                 return True
         if home and (p == home or p.startswith(home + "/")):
             return True  # 任务自身 HOME 沙箱（物理隔离），触不到共享区/系统目录
+        # 任务自身 workdir 树（output/ work/ data/ 等）：删自己的中间件只伤本任务，
+        # 触不到 shared/ 与系统目录。此前只放行 <workdir>/home，于是「把产物 mv 到
+        # 共享区后 rm -rf 自己的 work/shared 收尾」这种正常清理也要去问人（#259）。
+        # _resolve_rm_path 已 normpath，`workdir/../../shared` 会先被折叠成 shared/
+        # 从而不匹配本前缀，故 .. 逃逸挡得住。
+        if workdir and (p == workdir or p.startswith(workdir + "/")):
+            return True
         return False
 
     def _rm_violation(self, cmd: str, workdir: str = "") -> str | None:
         home = os.path.join(workdir, "home") if workdir else ""
-        for segment in re.split(r"[;&|\n]+", cmd):
+        segments = re.split(r"[;&|\n]+", cmd)
+        for idx, segment in enumerate(segments):
             recursive, paths = self._rm_targets(segment)
             if not recursive:
                 continue
             for p in paths:
-                if not self._rm_path_safe(p, home):
-                    return f"recursive rm outside safe dirs: {p}"
+                if self._rm_path_safe(p, home, workdir):
+                    continue
+                # 惰性 cd 回溯：**只有**走到这里（按绝对路径判不安全）且目标是相对
+                # 路径时才付费扫描前缀段。绝大多数命令在上一行就 continue 了，
+                # 故热路径零额外开销。修 #121：`cd /tmp && rm -rf syncpkg` 里
+                # /tmp 本属安全前缀，只因相对路径没解析就被拦。
+                #
+                # 但含 `$`／反引号／引号的目标**一律不做 cd 解析、直接拦**：这类值
+                # 静态展开不了，拼进 cwd 会得到 `<workdir>/"$HOME"/x` 这种以
+                # workdir 开头的字面路径，被"自身 workdir 树安全"规则误放行
+                # （2026-09-29 对抗测试实测到的洞）。
+                if not any(c in p for c in "$`\"'") \
+                        and not p.startswith(("/", "~")):
+                    cwd = self._cwd_at(segments, idx, workdir)
+                    if cwd and self._rm_path_safe(
+                            os.path.join(cwd, p), home, workdir):
+                        continue
+                return f"recursive rm outside safe dirs: {p}"
         return None
+
+    @staticmethod
+    def _cwd_at(segments: list[str], idx: int, workdir: str) -> str:
+        """回溯 segments[:idx] 里最后一次 cd 的目标。仅相对路径 rm 时调用（惰性）。
+
+        返回 ""＝cwd 不可知，调用方必须拦截。**含 `$`／反引号的 cd 目标一律视为
+        不可知**：`KEY=/…/shared; cd "$KEY"; rm -rf reports` 里 $KEY 静态展开不了，
+        若把字面量 "$KEY" 拼进 workdir，会得到 `<workdir>/$KEY/reports`——它以
+        workdir 开头，于是被"自身 workdir 树安全"规则放行，而真实目标是
+        `shared/reports`。这是 2026-09-29 改 Tier 1 时实测踩到的洞（#217/#222）。
+        """
+        cwd = workdir or ""
+        for seg in segments[:idx]:
+            m = _CD_RE.search(seg)
+            if not m:
+                continue
+            t = m.group(1).strip("\"'")
+            if not t or "$" in t or "`" in t:
+                return ""          # 不可静态展开 → cwd 不可知
+            cwd = t if t.startswith("/") else os.path.normpath(
+                os.path.join(cwd or ".", t))
+        return cwd
 
     @staticmethod
     def _send_signatures(cmd: str) -> set[str]:
