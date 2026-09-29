@@ -160,12 +160,33 @@ def test_create_marker_executed_and_stripped(avatar):
 
 
 def test_list_marker(avatar):
+    """标记路径：agent 在结果正文出 {"op":"list"} → 分身回传清单、标记块剔除。
+
+    用户消息刻意**不含**计划/定时字样：2026-09-29 起「我有哪些计划」这类口语查询
+    已被 planning._is_list_query 在进大脑前确定性拦截（见 test_planning.py），不再
+    走到这里。本用例守的是 agent 主动出标记那条路。
+    """
     avatar.exec_relay.plans.append({"id": 1, "name": "日报", "on_calendar": "*-*-* 08:00:00",
                                     "enabled": True, "next_run": time.time() + 3600})
-    _run_with_result(avatar, "我有哪些计划", '查一下～\n```plan\n{"op":"list"}\n```')
+    _run_with_result(avatar, "帮我看看", '查一下～\n```plan\n{"op":"list"}\n```')
     joined = "\n".join(texts(avatar))
     assert "定时计划" in joined and "日报" in joined
     assert "```plan" not in joined
+
+
+def test_colloquial_list_query_intercepted_before_brain(avatar):
+    """口语查询「我有哪些计划」必须**在进大脑前**就地答复。
+
+    这是本次优化的核心：#278 为「现在有几个定时任务？」烧掉 5.5 分钟 / 32 次 Bash
+    去刨 relay 路由与凭据。确定性拦截后 0 次 LLM 往返、0 次 Bash。
+    """
+    avatar.exec_relay.plans.append({"id": 1, "name": "日报", "on_calendar": "*-*-* 08:00:00",
+                                    "enabled": True, "next_run": time.time() + 3600})
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("我有哪些计划", n="7"))
+    joined = "\n".join(texts(avatar))
+    assert "定时计划" in joined and "日报" in joined
+    assert not avatar.exec_relay.submitted, "查询句竟被提交成了任务（白烧一次大脑往返）"
 
 
 def test_delete_marker_by_name(avatar):
@@ -388,12 +409,18 @@ def test_plan_ops_are_audited(avatar, cfg):
     assert "plan_denied" in lines
 
 
-# ── 占位符防护（2026-09-28 补，随 ```plan``` 示例写进任务描述/AGENTS.md 而来）──
+# ── 占位符防护（2026-09-28 补，2026-09-29 收窄判据）──
 #
-# _relay_marker_rules 与 workspace/AGENTS.md 现在都含字面示例
+# _relay_marker_rules 与 workspace/AGENTS.md 曾含字面示例
 # {"name": "<计划名>", "description": "<到点要执行的任务描述>"}。agent 若把示例
 # 原样回显进结果，消费侧会照单建出一个每天到点跑占位符描述的垃圾计划——而它
-# **真会起任务、真会烧配额**。故含 <...> 的 name/description 一律拒建。
+# **真会起任务、真会烧配额**。
+#
+# 但原判据 `<[^<>\n]{0,40}>`（含任意尖括号即拒）**误杀合法模板变量**：拿生产在跑的
+# 4 条计划描述回测，`<YYYY-MM>`／`<YYYYMMDD>`／`<当日期次>` 全部命中 → 4 条计划
+# 今天重建会被全部拒建；#288（毕倩 09-28 17:47 的 D-17 防 missing 计划）两个合法
+# create 已因此被误杀。故判据收窄为「整段就是占位符」或「命中已知示例词」，
+# 文档示例本身也改成实义值（见 test_marker_rules_examples_use_real_values）。
 
 
 def test_plan_create_rejects_placeholder_description(avatar, cfg):
@@ -426,19 +453,248 @@ def test_plan_create_real_values_still_pass(avatar, cfg):
     assert "已创建定时计划「每日成品油预测」" in note
 
 
-def test_marker_rules_examples_are_placeholder_guarded(avatar):
-    """自证一致：_relay_marker_rules 里给 agent 照抄的 create 示例，本身必须被
-    占位符防护拦住——否则文档就在教 agent 造垃圾计划。"""
+def test_marker_rules_examples_use_real_values(avatar):
+    """自证一致：_relay_marker_rules 里给 agent 照抄的 create 示例必须**已填实义值**。
+
+    2026-09-29 反转了原断言。原来示例写的是 {"name": "<计划名>", "description":
+    "<到点要执行的任务描述>"}，靠占位符防护兜底；但那条防护的正则
+    `<[^<>\\n]{0,40}>` 同时误杀了合法模板变量（见下方生产计划回归用例）。既然防护
+    收窄了，文档示例就不该再依赖它——直接给实义值，agent 照抄也不会造出垃圾计划。
+    """
     import json as _json
-    from app.main import PLAN_BLOCK_RE, _PLACEHOLDER_RE
+    from app.main import PLAN_BLOCK_RE, _PLACEHOLDER_WHOLE_RE, _PLACEHOLDER_KNOWN_RE
     s = {"reply": {"is_group": True, "conversation_id": "cg", "sender": "赵兴峰"}}
+    seen = 0
     for blk in PLAN_BLOCK_RE.findall(avatar._relay_marker_rules(s)):
         sp = _json.loads(blk)
         if sp.get("op") != "create":
             continue
-        assert _PLACEHOLDER_RE.search(str(sp.get("description") or "")) \
-            or _PLACEHOLDER_RE.search(str(sp.get("name") or "")), \
-            "文档 create 示例未含占位符：要么已填实值（更好），要么防护失配"
-        assert avatar._exec_plan_op(sp, "200") is not None
-        assert not avatar.exec_relay.created, "示例被当真建出来了"
+        seen += 1
+        nm, ds = str(sp.get("name") or ""), str(sp.get("description") or "")
+        assert nm and ds, "示例字段为空"
+        for v in (nm, ds):
+            assert not _PLACEHOLDER_WHOLE_RE.match(v), f"示例整段仍是占位符：{v!r}"
+            assert not _PLACEHOLDER_KNOWN_RE.search(v), f"示例含已知占位符词：{v!r}"
+    assert seen >= 1, "文案里没有 create 示例，agent 无从照抄"
 
+
+
+# ── 占位符判据收窄的回归（2026-09-29）──────────────────────────────────
+#
+# 原判据「含任意尖括号即拒」误杀合法模板变量。下面用**生产在跑的 4 条计划的真实
+# 描述**做「必须放行」用例——这条测试缺失正是当初漏掉回归的原因。
+
+_PROD_PLAN_DESCS = [
+    ("每日原油价格预测调取",
+     "由 CA0 舒小瀚智能体编排执行：经 crude-ai-research-institute 技能（G-30，"
+     "R-GV-16 唯一入口）调取 AI 原油研究院当日原油价格预测报告（D-16 预测价）；"
+     "输出 HTML 单文件自包含报告，落 shared/report/市场分析/<YYYY-MM>/，命名 "
+     "<YYYYMMDD>_T0_原油价格预测_v1.html；落盘后 store add 登记。"),
+    ("每日成品油价格预测调取",
+     "经 b0 只读通道取 D-17 预测，落 shared/report/市场分析/<YYYY-MM>/，命名 "
+     "<YYYYMMDD>_T1_成品油价格预测_v1.html。"),
+    ("每日市场行情研究报告",
+     "生成当日市场行情研究报告（第 <当日期次> 期），落 shared/report/市场分析/"
+     "<YYYY-MM>/<YYYYMMDD>_市场行情研究报告.md。"),
+    ("b0-refined-forecast-0735",
+     "运行 b0 产品端价格预测智能体：落盘 data/Daily/product-price-forcasting/"
+     "（命名 D-17-成品油价格预测表-<YYYYMMDD>.json / D-17-成品油价格预测数据报告-"
+     "<YYYYMMDD>.md），data_status 三态逐条标注。"),
+]
+
+
+@pytest.mark.parametrize("name,desc", _PROD_PLAN_DESCS)
+def test_plan_create_allows_production_template_vars(avatar, cfg, name, desc):
+    """生产在跑的 4 条计划描述必须能重建。原正则会把它们全部拒建。"""
+    note = avatar._exec_plan_op(_spec(name=name, desc=desc), "200")
+    assert len(avatar.exec_relay.created) == 1, f"被误杀：{note}"
+    assert "已创建定时计划" in note
+
+
+def test_plan_create_allows_the_two_wrongly_denied_from_288(avatar, cfg):
+    """#288（毕倩 09-28 17:47）被误杀的两个 D-17 计划，判据收窄后必须放行。"""
+    for nm, ds in [
+        ("b0-refined-forecast-0700",
+         "工作日 07:00 只读取当日 D-17 落 shared/data/Daily/product-price-forcasting/，"
+         "DT-B0-01 json ＋ DT-B0-02 md，data_status 三态逐条标注。"),
+        ("d17-readiness-gate",
+         "07:15 校验 as-of=当日，缺失则按 Z-AA-09 出《数据未就绪单》催 P-01，"
+         "不顶替不估算。"),
+    ]:
+        note = avatar._exec_plan_op(_spec(name=nm, desc=ds), "200")
+        assert "已创建定时计划" in note, f"{nm} 仍被误杀：{note}"
+    assert len(avatar.exec_relay.created) == 2
+
+
+@pytest.mark.parametrize("name,desc", [
+    ("<计划名>", "<到点要执行的任务描述>"),   # 整段回显文档示例
+    ("<计划名>", "每天8点跑日报"),             # 仅 name 是占位符
+    ("我的计划", "<到点要执行的任务描述>"),      # 仅 desc 是占位符
+    ("<名称>", "<描述>"),
+    ("x", "<...>"),
+    ("x", "<…>"),
+    ("", "<计划名>"),
+    ("每日报告", "生成 <任务描述> 并落盘"),      # 已知示例词嵌在实义文本里也拦
+])
+def test_plan_create_still_rejects_true_placeholder_echo(avatar, cfg, name, desc):
+    """收窄不等于放开：真回显文档示例仍必须拒建（它会真起任务、真烧配额）。"""
+    note = avatar._exec_plan_op(_spec(name=name, desc=desc), "200")
+    assert not avatar.exec_relay.created
+    assert "占位符" in note and "未创建" in note
+
+
+# ── 归属止血：受保护计划 + 破坏性操作须精确命中完整名（2026-09-29）────────
+#
+# relay 侧 `_plan_owner_ok` 比 principal["name"] == plan["owner_name"]，而经分身建的
+# 计划 owner_name **全是分身 token 主体名（鲁大师）**，该检查形同虚设；`_plan_gate`
+# 又只校验 tier 不校验归属。于是任何 L2 说一句「删掉计划 原油」就会唯一子串命中
+# 「每日原油价格预测调取」并直接删掉，07:50 的日报从此静默消失。
+# 用户已定**不动 relay schema**（不加 owner_uid），故在分身侧用名单 + 精确名止血。
+
+_PROT = ["每日原油价格预测调取", "每日成品油价格预测调取", "每日市场行情研究报告"]
+
+
+def _seed_protected(avatar, cfg):
+    cfg._p.setdefault("security", {}).update(plan_protected=list(_PROT))
+    avatar.exec_relay.plans.extend(
+        [{"id": i + 1, "name": n, "on_calendar": "*-*-* 07:50:00",
+          "enabled": True, "next_run": time.time() + 3600}
+         for i, n in enumerate(_PROT)])
+
+
+def test_protected_plan_delete_denied_for_l2(avatar, cfg):
+    """L2（whitelist=200）不得删核心业务计划。"""
+    _seed_protected(avatar, cfg)
+    note = avatar._exec_plan_op(
+        {"op": "delete", "name": "每日原油价格预测调取"}, "200")
+    assert not avatar.exec_relay.deleted
+    assert "受保护" in note and "超管" in note
+
+
+def test_protected_plan_disable_denied_for_l1(avatar, cfg):
+    """L1（admins=100）同样不得停用——停用等于让日报静默消失。"""
+    _seed_protected(avatar, cfg)
+    note = avatar._exec_plan_op(
+        {"op": "disable", "name": "每日市场行情研究报告"}, "100")
+    assert not avatar.exec_relay.patched
+    assert "受保护" in note
+
+
+def test_protected_plan_denial_is_audited(avatar, cfg):
+    _seed_protected(avatar, cfg)
+    avatar._exec_plan_op({"op": "delete", "name": "每日原油价格预测调取"}, "200")
+    lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "plan_denied" in lines and "受保护计划" in lines
+
+
+def test_protected_plan_superadmin_can_delete(avatar, cfg):
+    """超管（18434）不受名单限制——否则名单变成谁都动不了的死配置。"""
+    _seed_protected(avatar, cfg)
+    note = avatar._exec_plan_op(
+        {"op": "delete", "name": "每日原油价格预测调取"}, "18434")
+    assert avatar.exec_relay.deleted == [1]
+    assert "已删除" in note
+
+
+def test_protected_plan_enable_allowed_for_l2(avatar, cfg):
+    """启用是无害的（恢复日报），不该被名单挡住。"""
+    _seed_protected(avatar, cfg)
+    avatar.exec_relay.plans[0]["enabled"] = False
+    note = avatar._exec_plan_op(
+        {"op": "enable", "name": "每日原油价格预测调取"}, "200")
+    assert avatar.exec_relay.patched and "已启用" in note
+
+
+def test_unprotected_plan_still_deletable_by_l2(avatar, cfg):
+    """名单外的计划（用户自建的）照旧可删，不能把止血做成全面锁死。"""
+    _seed_protected(avatar, cfg)
+    avatar.exec_relay.plans.append(
+        {"id": 99, "name": "我的临时提醒", "on_calendar": "*-*-* 09:00:00",
+         "enabled": True, "next_run": time.time() + 3600})
+    note = avatar._exec_plan_op({"op": "delete", "name": "我的临时提醒"}, "200")
+    assert 99 in avatar.exec_relay.deleted and "已删除" in note
+
+
+@pytest.mark.parametrize("op", ["delete", "disable"])
+def test_destructive_op_on_protected_requires_exact_name(avatar, cfg, op):
+    """受保护计划的破坏性操作必须精确命中完整名——**超管也不例外**。此前子串
+    fallback 对删改同样生效：「删掉计划 原油」会唯一子串命中核心业务计划并直接执行。"""
+    _seed_protected(avatar, cfg)
+    note = avatar._exec_plan_op({"op": op, "name": "原油"}, "18434")   # 超管
+    assert not avatar.exec_relay.deleted and not avatar.exec_relay.patched
+    assert "不是完整计划名" in note and "每日原油价格预测调取" in note
+
+
+def test_destructive_op_on_protected_exact_name_by_super(avatar, cfg):
+    """超管给全名 → 放行（否则名单变成谁都动不了的死配置）。"""
+    _seed_protected(avatar, cfg)
+    note = avatar._exec_plan_op(
+        {"op": "delete", "name": "每日原油价格预测调取"}, "18434")
+    assert avatar.exec_relay.deleted == [1] and "已删除" in note
+
+
+@pytest.mark.parametrize("op", ["delete", "disable"])
+def test_unprotected_plan_tolerates_substring(avatar, cfg, op):
+    """普通（非受保护）计划保留子串便利：口语「删掉晨会」→「晨会提醒」。
+    精确名要求只加在受保护计划上，否则日常删改体验被无谓拖慢。"""
+    avatar.exec_relay.plans.append(
+        {"id": 7, "name": "晨会提醒", "on_calendar": "Mon..Fri *-*-* 09:30:00",
+         "enabled": True, "next_run": time.time() + 3600})
+    note = avatar._exec_plan_op({"op": op, "name": "晨会"}, "200")
+    assert "不是完整计划名" not in note
+    if op == "delete":
+        assert avatar.exec_relay.deleted == [7]
+    else:
+        assert avatar.exec_relay.patched
+
+
+def test_enable_tolerates_substring(avatar, cfg):
+    """启用无害，保留子串便利（口语「启用 原油」）。"""
+    _seed_protected(avatar, cfg)
+    avatar.exec_relay.plans[0]["enabled"] = False
+    note = avatar._exec_plan_op({"op": "enable", "name": "原油"}, "200")
+    assert avatar.exec_relay.patched and "已启用" in note
+
+
+def test_list_note_marks_protected(avatar, cfg):
+    """清单要能看出哪些是核心业务计划（🔒），否则用户不知道动不得。"""
+    _seed_protected(avatar, cfg)
+    note = avatar._plan_list_note("200")
+    assert "🔒" in note and "仅超管可删改" in note
+    body = [ln for ln in note.splitlines() if ln.startswith("·")]
+    assert len(body) == len(_PROT)
+    assert sum("🔒" in ln for ln in body) == len(_PROT)
+
+
+def test_group_plan_denial_goes_to_dm_not_group(avatar, cfg):
+    """群聊里的权限拒绝**走私聊**：文案含「当前身份 `L3` 无权限」，发群里等于
+    当众宣布该成员没权限。"""
+    s = {"reply": {"is_group": True, "conversation_id": "cg", "sender": "外人",
+                   "open_dingtalk_id": "sid300"},
+         "uid": "300", "state": "IDLE"}
+    avatar.dws.sent.clear()
+    avatar._handle_plan({"cmd": "create", "name": "x",
+                         "on_calendar": "*-*-* 08:00:00",
+                         "description": "跑日报"}, s, "300")
+    assert not avatar.exec_relay.created
+    assert len(avatar.dws.sent) == 1
+    target, content = avatar.dws.sent[0]
+    assert target.get("user_id") == "300", "拒绝未走私聊"
+    assert "conversation_id" not in target, "拒绝发进了群"
+    assert "权限" in content
+
+
+def test_group_plan_success_goes_to_group(avatar, cfg):
+    """成功回执仍发群：全群可见＝天然审计，他人可当场异议。"""
+    s = {"reply": {"is_group": True, "conversation_id": "cg", "sender": "张三",
+                   "open_dingtalk_id": "sid200"},
+         "uid": "200", "state": "IDLE"}
+    avatar.dws.sent.clear()
+    avatar._handle_plan({"cmd": "create", "name": "群里的日报",
+                         "on_calendar": "*-*-* 08:00:00",
+                         "description": "生成当日经营日报并落盘 shared/report/"},
+                        s, "200")
+    assert len(avatar.exec_relay.created) == 1
+    target, content = avatar.dws.sent[0]
+    assert target.get("conversation_id") == "cg", "成功回执没发回群"
+    assert "已创建定时计划" in content

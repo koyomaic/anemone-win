@@ -101,3 +101,56 @@ def test_parse_plan_cmd_none(text):
 def test_make_name_strips_illegal():
     assert P.make_name("跑经营日报！@#") == "跑经营日报"
     assert P.make_name("") == "plan"
+
+
+# ── 查询（list）触发激进扩充（2026-09-29）──
+#
+# 为什么激进：list 是**只读、零副作用**操作，误判最多多回一句计划清单；而漏判会让
+# 「现在有几个定时任务」落进大脑——#278 为此烧掉 5.5 分钟 / 32 次 Bash 去刨 relay
+# 路由、源码与凭据。原先只认 4 个 fullmatch 句式，口语问法全漏。
+# create 路径的判据（节奏词 + 完整钟点）保持严格不动，且**优先于** list 判定。
+
+@pytest.mark.parametrize("text", [
+    # 原有 4 句式（不得回归）
+    "计划列表", "我的计划", "计划清单", "全部计划",
+    # 口语查询：调度名词 × 枚举疑问
+    "有哪些定时任务", "定时任务有几个", "现在有什么定时任务", "查一下定时任务",
+    "定时任务列表", "定时任务有哪些", "有没有定时任务", "定时计划有多少个",
+    "现有的定时计划", "盘点一下定时任务", "查看调度", "排期有哪些", "cron 列表",
+    # 裸「计划」短句（严格枚举词）
+    "所有计划", "计划有哪些", "有多少个计划", "列出全部计划",
+])
+def test_parse_plan_cmd_list_queries(text):
+    assert (P.parse_plan_cmd(text) or {}).get("cmd") == "list", text
+
+
+@pytest.mark.parametrize("text", [
+    "这个计划有什么问题",        # 裸「计划」+「有什么」→ 严格枚举词刻意排除，不得劫持
+    "帮我看看这份计划书",
+    "写一份营销计划",
+    "分析一下定时任务的执行日志为什么失败",   # 长句 + 无枚举词
+    "查一下今天的日程",          # 日程≠计划
+    "统计每天的销量",
+    "把报告发我",
+])
+def test_parse_plan_cmd_list_does_not_hijack_business_text(text):
+    assert (P.parse_plan_cmd(text) or {}).get("cmd") != "list", text
+
+
+@pytest.mark.parametrize("text", [
+    "定时 每天8点 跑经营日报",
+    "每天9点提醒我开会",
+    "定时 每天8点 列出所有报表",     # 含枚举词，但 create 前缀优先
+    "工作日7点取D-17",
+    "定时 每周一9:30 提醒我开会",
+])
+def test_parse_plan_cmd_create_wins_over_list(text):
+    """create 各路径必须优先于激进的 list 判定，否则排期请求会被降级成查清单。"""
+    assert (P.parse_plan_cmd(text) or {}).get("cmd") == "create", text
+
+
+def test_list_query_maxlen_guards_long_paragraphs():
+    """长段落不劫持，交给大脑（大脑现在有正确的 AGENTS.md 口径）。"""
+    long = "定时任务" + "的" * 60 + "有哪些"
+    assert len(long) > P._LIST_QUERY_MAXLEN
+    assert P._is_list_query(long) is False

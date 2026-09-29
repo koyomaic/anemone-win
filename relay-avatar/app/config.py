@@ -68,6 +68,15 @@ DEFAULTS: dict[str, Any] = {
                  # 只给草稿区（shared/work），正式交付区（shared/report）无 baseline
                  # 快照、删了不可追溯，一律不放进这里。
                  "local_delete_dirs": [],
+                 # 受保护的定时计划名单：非 super 一律不得删除/停用/启用。
+                 # 为什么需要（2026-09-29）：`_plan_gate` 只校验 tier、不校验归属，
+                 # 而 relay 侧 `_plan_owner_ok` 比的是 `principal["name"] ==
+                 # plan["owner_name"]`——经分身建的计划 owner_name **全是分身 token
+                 # 主体名（鲁大师）**，该检查形同虚设。于是任何 L2 成员说一句
+                 # 「删掉计划 每日原油」就能让 07:50 的日报静默消失。用户已明确
+                 # **不动 relay schema**（不加 owner_uid 列），故在分身侧用名单止血。
+                 # 名单按 plan.name 精确匹配；空列表＝不保护任何计划。
+                 "plan_protected": [],
                  "profile_enforce": "strict", "sanitize": "on",
                  "rate_limit_daily_tasks": 100, "reprompt_cooldown_sec": 60,
                  "bot_blocklist": [], "media_max_size_mb": 20,

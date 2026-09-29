@@ -112,7 +112,8 @@ def test_rm_task_home_still_guarded(ex):
 #
 # 任务环境本就没有 relay 凭据（executor._ENV_DROP_PREFIXES 剔除 RELAY_*），但 agent
 # 不知道，会花几分钟刨 env / /opt/team / relay 源码找 token。#278 为「现在有几个
-# 定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash，CronList 只调了 1 次。
+# 定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash。（本机并无 `CronList` 这类工具、
+# 也无 local cron 层；定时任务唯一真源是 relay /plans，正规入口是 ```plan``` 标记。）
 # 下面的"应拦"用例全部取自 #278 会话 transcript 里的**真实命令**，不是构造的。
 
 # #12/#13/#27/#71：env 管道找凭据

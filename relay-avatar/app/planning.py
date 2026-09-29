@@ -50,6 +50,35 @@ _LEADIN = re.compile(
 _CADENCE_ANCHOR = re.compile(
     r"^(?:每\s*[天日]|天天|每隔|每\s*小时|每\s*周|每\s*星期|每\s*礼拜|每\s*月|工作日)")
 
+# ── 查询（list）触发：调度名词 × 枚举疑问 ──
+# 为什么激进（2026-09-29）：list 是**只读、零副作用**操作，误判最多多回一句计划
+# 清单；而漏判会让「现在有几个定时任务」落进大脑——#278 为此烧掉 5.5 分钟 / 32 次
+# Bash 去刨 relay 路由、源码与凭据。故 list 放宽、create 保持上面的严格判据不动。
+# 原先只认 4 个 fullmatch 句式（计划列表/我的计划/清单/全部计划），口语问法全漏。
+_SCHED_NOUN = re.compile(r"定时任务|定时计划|计划任务|定时|调度|排期|cron", re.I)
+# 强枚举疑问：与调度名词搭配即可判 list（含「有什么」这类开放式疑问）
+_ENUM_HINT = re.compile(
+    r"有哪些|有什么|有几个|多少个|有没有|有无|列出|列一下|列个|查一下|查查|查看|"
+    r"清单|列表|全部|所有|现存|现有|盘点|几个|多少")
+# 严格枚举疑问：用于裸「计划／定时」（无"任务"后缀）的短句。**刻意排除「有什么」**，
+# 否则「这个计划有什么问题」会被劫持成 list。
+_ENUM_STRICT = re.compile(
+    r"有哪些|有几个|多少个|有没有|有无|列出|列一下|清单|列表|全部|所有|现存|现有|盘点")
+# 裸「计划」歧义大（可能指业务计划书/方案），故只配短句 + 严格枚举词。
+_PLAN_NOUN_LOOSE = re.compile(r"计划|定时")
+_LIST_QUERY_MAXLEN = 40        # 长段落不劫持，交给大脑
+_LIST_QUERY_LOOSE_MAXLEN = 12  # 裸「计划」路径的句长上限
+
+
+def _is_list_query(t: str) -> bool:
+    """判定「这是在问有哪些定时计划」。见上方注释：list 只读，宁可多判不可漏判。"""
+    if not t or len(t) > _LIST_QUERY_MAXLEN:
+        return False
+    if _SCHED_NOUN.search(t) and _ENUM_HINT.search(t):
+        return True
+    return bool(len(t) <= _LIST_QUERY_LOOSE_MAXLEN
+                and _PLAN_NOUN_LOOSE.search(t) and _ENUM_STRICT.search(t))
+
 
 def cn2int(s: str) -> int | None:
     """中文/阿拉伯数字（0-59）→ int。支持 十/十五/二十/二十五/八/8。"""
@@ -247,12 +276,18 @@ def parse_plan_cmd(text: str) -> dict | None:
             return {"cmd": "create", **sch}
         if _HINT.search(rest):
             return {"cmd": "create_fail", "reason": "unparsed", "raw": rest}
-        return None  # 无定时意图，放行走普通任务
-    # 放宽触发：无前缀，但剥离礼貌前导后以节奏词开头，且能解析出完整计划才拦截；
-    # 解析不出（缺钟点的"每天跑日报"、动词开头的"统计每天的销量"）一律放行走大脑。
-    core = _LEADIN.sub("", t).lstrip()
-    if _CADENCE_ANCHOR.match(core):
-        sch = parse_schedule(core)
-        if sch and not sch.get("error") and sch["description"] != "定时任务":
-            return {"cmd": "create", **sch}
+        # 无定时意图：此前直接 return None 放行走大脑，于是「定时任务有哪些」这类
+        # 以"定时"开头的**查询**句也一并漏给了大脑（#278 那 5.5 分钟 / 32 次 Bash
+        # 就是这么来的）。改为落到下面的 list 判定；判不出仍返回 None 走普通任务。
+    else:
+        # 放宽触发：无前缀，但剥离礼貌前导后以节奏词开头，且能解析出完整计划才拦截；
+        # 解析不出（缺钟点的"每天跑日报"、动词开头的"统计每天的销量"）一律放行走大脑。
+        core = _LEADIN.sub("", t).lstrip()
+        if _CADENCE_ANCHOR.match(core):
+            sch = parse_schedule(core)
+            if sch and not sch.get("error") and sch["description"] != "定时任务":
+                return {"cmd": "create", **sch}
+    # create 各路径都已优先判过，这里才做激进的 list 判定（只读、零副作用）。
+    if _is_list_query(t):
+        return {"cmd": "list"}
     return None

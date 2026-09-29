@@ -240,6 +240,9 @@ class FakeExec:
         self.submitted = []
         self.shadows = []          # local 影子记录
         self.local_status = []     # 影子记录终态回报
+        self.plans = []            # 计划（local 通路消费 ```plan``` 标记用）
+        self.created_plans = []
+        self.deleted_plans = []
 
     def available(self):
         return True
@@ -270,6 +273,29 @@ class FakeExec:
         return {"ok": True}
 
     def cancel(self, *a, **k):
+        return {"ok": True}
+
+    # ── 计划（local 通路消费 ```plan``` 标记用）──
+    def create_plan(self, name, on_calendar, action, uid=""):
+        self.created_plans.append((name, on_calendar, action))
+        pid = len(self.plans) + 1
+        p = {"id": pid, "name": name, "on_calendar": on_calendar,
+             "action": action, "enabled": True, "next_run": time.time() + 3600}
+        self.plans.append(p)
+        return p
+
+    def list_plans(self, uid=""):
+        return {"plans": list(self.plans)}
+
+    def patch_plan(self, pid, fields, uid=""):
+        for p in self.plans:
+            if p["id"] == pid:
+                p.update(fields)
+        return {"ok": True}
+
+    def delete_plan(self, pid, uid=""):
+        self.deleted_plans.append(pid)
+        self.plans = [p for p in self.plans if p["id"] != pid]
         return {"ok": True}
 
 
@@ -1261,7 +1287,13 @@ def test_relay_marker_rules_documents_plan_marker(av, cfg, shared):
     assert "on_calendar" in r and "description" in r
     assert "*-*-* 07:35:00" in r                 # systemd OnCalendar 实例
     assert "delete/disable/enable" in r          # 其余 op 也要知道
-    assert "CronList" in r                       # 「有几个定时任务」的正规入口
+    # 2026-09-29：`CronList` 是**我凭空写的工具名**，全代码库无实现（本机无 local
+    # cron 层，local 允许工具只有 Read/Glob/Grep/LS/Task/Bash）。#288 照着它幻觉
+    # 调用并回报「实据＝无任何定时任务」。故此处断言**反向**：文案不得再提它，
+    # 且必须写死「只有一层、唯一入口是 plan 标记」。
+    assert "CronList" not in r, "文案仍在指向不存在的工具，会诱发幻觉调用"
+    assert "没有 local cron 层" in r
+    assert '"op": "list"' in r                   # 「有几个定时任务」的唯一正规入口
 
 
 def test_relay_marker_rules_forbids_credential_hunting(av, cfg, shared):
@@ -1299,7 +1331,8 @@ def test_relay_submit_carries_plan_marker_rules(av, cfg, shared):
     sent = av.exec_relay.submitted
     assert len(sent) == 1, "未提交 relay 任务"
     desc = sent[-1]["desc"]
-    assert "```plan" in desc and "CronList" in desc
+    assert "```plan" in desc and '"op": "list"' in desc
+    assert "CronList" not in desc, "不得再指向不存在的工具（#288 幻觉调用事故）"
     assert "定时计划铁律" in desc
 
 
@@ -1567,3 +1600,83 @@ def test_digest_cannot_smuggle_markers_into_next_result(av, cfg, shared):
     head = desc.split("【投递铁律")[0]               # 只看摘要+新请求部分
     assert not PLAN_BLOCK_RE.findall(head)
     assert "```send_file" not in head and "```delete_file" not in head
+
+
+# ── L. local 通路消费 ```plan``` 标记（2026-09-29 补缺口）──
+#
+# 缺口：plan 标记此前**只有 relay 通路消费**（_send_result 调 _consume_plan_markers），
+# _drain_local 只调 send/delete。阶段二开 Bash 后 local 是主路径，于是 local 任务
+# 吐出的 ```plan``` 块被当正文原样发给用户、计划根本没建。#288（毕倩 D-17 防
+# missing）之所以成功，纯粹因为它被重投到了 relay。
+
+def _plan_block(op="create", name="每日经营日报", desc="生成当日经营日报并落盘 shared/report/"):
+    obj = {"op": op, "name": name, "on_calendar": "*-*-* 07:35:00",
+           "description": desc}
+    return "结论正文\n\n```plan\n" + _json.dumps(obj, ensure_ascii=False) + "\n```"
+
+
+def test_drain_local_consumes_plan_marker(av, cfg, shared):
+    """local 任务出 plan 标记 → 必须真建计划，且标记块从正文剔除。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": _plan_block(), "escalate": False})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    assert len(av.exec_relay.created_plans) == 1, "local 通路没消费 plan 标记"
+    assert av.exec_relay.created_plans[0][0] == "每日经营日报"
+    rep = av.exec_relay.local_status[0]
+    assert "```plan" not in rep["result"], "标记块未从正文剔除，会原样发给用户"
+    assert "已创建定时计划" in rep["result"], "缺执行回执附注"
+
+
+def test_drain_local_plan_marker_respects_gate(av, cfg, shared):
+    """local 复用 _exec_plan_op，故 _plan_gate 门禁自动继承：L3 不得建计划。
+
+    uid 在会话与 local_result 里都改写为 300（L3）：L3 消息在 on_event 里就被路由到
+    _l3_qa、走不到 local 编排，故不能靠 sess_of(sid300) 构造。注意门禁取的是
+    **s["uid"]**（on_event 解析 ev["_uid"] 落进会话的权威身份），local_result["uid"]
+    只是 worker 携带的副本、用于影子记录回报——两处都改才等价于"L3 发起"。
+    """
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": _plan_block(), "escalate": False})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    s["uid"] = "300"
+    s["local_result"]["uid"] = "300"
+    av._drain_local()
+    assert not av.exec_relay.created_plans
+    assert "权限" in av.exec_relay.local_status[0]["result"]
+
+
+def test_drain_local_plan_marker_audited(av, cfg, shared):
+    """local 侧 plan 操作同样要留痕（此前 relay 侧才有审计）。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": _plan_block(), "escalate": False})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    lines = (cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "plan_op" in lines and "每日经营日报" in lines
+
+
+def test_drain_local_plan_and_send_markers_coexist(av, cfg, shared):
+    """同一条结果里 plan 与 send_file 标记并存时，两者都要消费、互不吞掉。"""
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-09/r.html", "<html>报告</html>")
+    body = (_plan_block() + "\n\n```send_file\n"
+            + _json.dumps({"path": p}, ensure_ascii=False) + "\n```")
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": body, "escalate": False})
+    s = sess_of(av)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "sid200",
+                  "conversation_id": "c1", "sender": "张三"}
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    assert len(av.exec_relay.created_plans) == 1, "plan 标记被 send 处理吞掉"
+    assert any("[file]" in c for _, c in av.dws.sent), "send_file 标记未代投"
+    rep = av.exec_relay.local_status[0]["result"]
+    assert "```plan" not in rep and "```send_file" not in rep

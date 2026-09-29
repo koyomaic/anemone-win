@@ -272,6 +272,14 @@ sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）
 plan_max_per_user = 20         # 每用户定时计划上限（每个计划到点都用分身凭据起真实
                                # 任务，无上限即无限刷配额）；0＝不限
+plan_protected = []            # 受保护计划名单（按 plan.name 精确匹配）：非 super 一律
+                               # 不得删除/停用/启用，清单里显示 🔒。为什么需要：
+                               # _plan_gate 只校验 tier 不校验归属，而 relay 侧
+                               # _plan_owner_ok 比的是 principal["name"] == owner_name，
+                               # 经分身建的计划 owner_name **全是分身 token 主体名**，该
+                               # 检查形同虚设 → 任何 L2 都能删掉核心业务计划。已定不动
+                               # relay schema（不加 owner_uid），故在分身侧用名单止血。
+                               # 例：["每日原油价格预测调取", "每日成品油价格预测调取"]
 reprompt_cooldown_sec = 60     # 门禁无关消息重提示冷却
 bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt",   # 「AI助理」（曾与分身互刷死循环）
                  "D8YACgStfKBdniisB5xLrLu2EyEI8kX7NU",   # 「原油AI研究院」bot（2026-09-23 互刷事故）

@@ -28,7 +28,9 @@ DEFAULT_BLOCKED_PATTERNS = [
     # ---- 凭据枚举拦截（2026-09-28 加固）----
     # 任务环境本就没有 relay 凭据（executor._ENV_DROP_PREFIXES 剔除 RELAY_*），但
     # agent 不知道，会花几分钟刨 env / /opt/team / relay 源码找 token：#278 为
-    # 「现在有几个定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash，CronList 只调 1 次。
+    # 「现在有几个定时任务？」这一句话烧掉 5.5 分钟 / 32 次 Bash。（本机并无
+    # `CronList` 这类工具、也无 local cron 层，定时任务唯一真源是 relay /plans，
+    # 正规入口是 ```plan``` 标记——旧文档写错过，见 relay-avatar main.py 注释。）
     # 拦下来让它快速失败并走审批，好过白烧 1800s 时限。正规入口见 workspace/AGENTS.md
     # 「定时任务／计划」节与分身注入的 ```plan``` 标记口径。
     # 用 [^;\n] 而非 [^|]：目标命令形如 `env | grep -iE "relay|ta_|token"`，引号内
