@@ -84,9 +84,33 @@ def card_biz_id(resp) -> str:
         return ""
 
 
+def strip_ctrl(text: str) -> str:
+    """剔除钉钉拒收的控制字符，保留 \\n 与 \\t。
+
+    为什么必须有：钉钉对 msgContent 做控制字符校验，命中即整条拒收
+    （`msgContent contains invalid control characters`, category=validation）。
+    而**真实 @ 提及在事件载荷里就是用 \\x07(BEL) 做分隔的**——实测 2026-10-01
+    孔德光群内消息原文为 `'@鲁大师\\x07今天净头寸策略是什么？…'`。该字符随
+    desc → card_hint（main.py 取首行前 40 字）→ _card_frame 进入卡片正文，
+    于是 card_update 每轮都被拒；而 card_progress_sec=30 的进度节流让它
+    **每 31 秒重试一次、直到任务终态**（#389 从 17:10:09 刷到 17:23:35，
+    27 次），日志被灌满且用户侧进度卡片始终停在首帧。
+    收敛点选在这里：出站文本只有 send_text 与 card_update 两条路，二者都
+    经过 md_hardbreak，故在此清洗即可全覆盖（card_create 不带正文）。
+    """
+    if not text:
+        return text or ""
+    return "".join(ch for ch in text
+                   if ch in "\n\t" or ord(ch) >= 32 and ord(ch) != 127)
+
+
 def md_hardbreak(text: str) -> str:
-    """钉钉 Markdown 硬换行：非表格/代码块的行尾补两个空格。"""
-    lines = (text or "").split("\n")
+    """钉钉 Markdown 硬换行：非表格/代码块的行尾补两个空格。
+
+    先过 strip_ctrl：钉钉对 msgContent 的控制字符校验是**整条拒收**，
+    留着 \\x07 之类会让整条消息发不出去（详见 strip_ctrl 文档）。
+    """
+    lines = strip_ctrl(text).split("\n")
     out, in_code = [], False
     for i, ln in enumerate(lines):
         if ln.strip().startswith("```"):
