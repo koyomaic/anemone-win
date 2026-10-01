@@ -259,20 +259,25 @@ local_sandbox_hide = [
   "/mnt/vol-eltaah12/workspace/shared/secrets",
   "/root",
 ]
-# 沙箱网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=本列表。
-# 为什么必须收：沙箱只管「能读到什么」，不管「能不能发出去」。Bash 放开后二者叠加
-# 才成外泄通道——实测 python3 urllib 的外发尝试**完全不被权限层拦截**（只因目标端口
-# 无监听才失败）。经 cgroup eBPF 生效，**含 loopback**。实测：代理 8790 可达、
-# PG 5432 可达（store ping ok=true）、relay 本机 8787 可达、公网 1.1.1.1:443 被阻断。
-#   127.0.0.1     claude-proxy（:8790，ANTHROPIC_BASE_URL）+ relay 本机（:8787）
-#   10.189.21.235 PG（:5432，store 台账走每机私有的最小权限角色）
-# 刻意**不给**公网：知识召回由 avatar 侧 knowledge.py 在沙箱外完成后注入 prompt，
-# agent 无需直连；给公网等于把隐藏名单的残余风险变成可外泄。留空＝不施加 IP 规则
-# （**不要**留空，那等于放开全部外发）。
-local_sandbox_net_allow = [
-  "127.0.0.1",
-  "10.189.21.235",
-]
+# 沙箱网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=本列表；
+# **留空＝不施加任何 IP 规则＝出网完全不限制**（exec_local._sandbox_wrap 的 `if net:`
+# 守卫；语义已由 test_sandbox_wrap_no_ip_rules_when_allowlist_empty 锁定）。
+#
+# 2026-10-01 用户指示：沙箱访问外部网络不限制，机队统一置空。
+# 直接动因：原白名单只放行 claude 代理与 PG，导致 oil-research-data 技能
+# （https://10.200.6.87/api/v1/research/query，成品油研究数据接口）在沙箱内完全
+# 打不出网——实测 HTTP 000 连接即失败，而宿主同目标 443 正常、加白后即通。该技能是
+# engine=local 交互任务的主流取数口，逐个加白不可持续：IPAddressAllow **无端口
+# 粒度**，且每接一个新数据源都要改配置 + 重启 avatar。
+#
+# 代价（如实记录，勿删）：Bash 对 L2+ 开放 + 出网不限 ⇒ 沙箱内可读到的数据理论上
+# 可被外发，即构成外泄通道。剩余防线：local_sandbox_hide 仍整体隐藏 relay.env /
+# shared/secrets / /root（凭据在沙箱内**不可见**，不是可见但禁读）、
+# ProtectSystem=strict、NoNewPrivileges=true、CapabilityBoundingSet 清空、
+# local_write_dirs/send_dirs/delete_dirs 三层写域收窄。
+# 如需收紧：把 127.0.0.1、10.189.21.235 及需要的业务主机填回本列表并重启 avatar
+# （claude 代理与 PG 必须在列，否则 claude 起不来、store 连不上库）。
+local_sandbox_net_allow = []
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）

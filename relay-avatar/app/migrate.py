@@ -4,6 +4,7 @@
 迁移内容：
 1. bridge.env → shared/secrets/relay-avatar.env（600；补 AVATAR_DASHBOARD_TOKEN 随机生成）
 2. config.json 白/黑名单与 self_open_id → policy.toml（首装从模板渲染，已有不覆盖）
+2b. 已存在的 policy.toml：local_sandbox_net_allow 置空（沙箱出网不限制，机队统一）
 3. state.json / rounds/ / events.ndjson → $WORKSPACE/avatar/（schema 兼容，直接拷贝）
 4. 写 integrity 基线 manifest
 旧目录只读不删（历史留痕）；重复执行安全。
@@ -21,6 +22,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 WS = Path("/mnt/vol-eltaah12/workspace")
 BASE = Path(__file__).resolve().parent.parent
+
+# 迁移 2b 写入各机 policy.toml 的标准注释（替换原「刻意不给公网」那段）。
+# 与 policy.example.toml 同名键注释保持同一口径，避免机队内文档分叉。
+_NET_OPEN_NOTE = (
+    "# 沙箱网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=本列表；\n"
+    "# **留空＝不施加任何 IP 规则＝出网完全不限制**（exec_local._sandbox_wrap 的 `if net:`\n"
+    "# 守卫；语义由 test_sandbox_wrap_no_ip_rules_when_allowlist_empty 锁定）。\n"
+    "# 2026-10-01 用户指示：沙箱访问外部网络不限制，机队统一置空。原白名单只放行 claude\n"
+    "# 代理与 PG，把 oil-research-data（https://10.200.6.87/api/v1/research/query）等业务\n"
+    "# 数据源堵死在沙箱内（实测 HTTP 000，宿主同目标 443 正常）；且 IPAddressAllow 无端口\n"
+    "# 粒度、每接一个新数据源都要改配置+重启，逐个加白不可持续。\n"
+    "# 代价：Bash 对 L2+ 开放 + 出网不限 ⇒ 沙箱内可读到的数据理论上可被外发。剩余防线为\n"
+    "# local_sandbox_hide（relay.env / shared/secrets / /root 整体不可见）、ProtectSystem=\n"
+    "# strict、NoNewPrivileges、CapabilityBoundingSet 清空、三层写域收窄。\n"
+    "# 如需收紧：填回 127.0.0.1、10.189.21.235 及业务主机后重启 avatar（claude 代理与 PG\n"
+    "# 必须在列，否则 claude 起不来、store 连不上库）。\n"
+)
+
+# 迁移 2b 写入各机 policy.toml 的标准注释（替换原「刻意不给公网／不要留空」块，
+# 否则注释会与置空后的值自相矛盾）。措辞与 policy.example.toml 同名键保持一致。
+_NET_OPEN_NOTE = (
+    "# 沙箱网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=本列表；\n"
+    "# **留空＝不施加任何 IP 规则＝出网完全不限制**（exec_local._sandbox_wrap 的 `if net:`\n"
+    "# 守卫；语义由 test_sandbox_wrap_no_ip_rules_when_allowlist_empty 锁定）。\n"
+    "# 2026-10-01 用户指示：沙箱访问外部网络不限制，机队统一置空（migrate.py 步骤 2b）。\n"
+    "# 动因：原白名单只放行 claude 代理与 PG，把 oil-research-data 等业务数据源堵死在\n"
+    "# 沙箱内（实测 HTTP 000）；且 IPAddressAllow 无端口粒度、每接一个新数据源都要改\n"
+    "# 配置+重启，不可持续。代价与剩余防线见 policy.example.toml 同名键注释。\n"
+    "# 如需收紧：填回 127.0.0.1、10.189.21.235 及业务主机后重启 avatar——claude 代理与\n"
+    "# PG 必须在列，否则 claude 起不来、store 连不上库。\n"
+)
 
 
 def migrate(ws: Path, dry: bool = False) -> dict:
@@ -92,6 +124,46 @@ def migrate(ws: Path, dry: bool = False) -> dict:
             f"policy: 从模板渲染（whitelist={len(wl)} blacklist={len(bl)}）")
     else:
         report["steps"].append("policy: 已存在，跳过")
+
+    # 2b. 沙箱出网白名单置空（2026-10-01 用户指示：沙箱访问外部网络不限制）。
+    # 为什么必须有这一步：provision.sh 只 `cp -f policy.example.toml` 到 avatar
+    # 目录，**从不覆盖各机 live $AVA_STATE/policy.toml**（上面第 2 步对已存在的
+    # 文件也是"已存在，跳过"），故改模板对已装机队完全无效。本步骤是唯一能自动
+    # 传播到全机队的载体——provision 每次都跑 migrate.py；且改 app/ 本身构成代码
+    # 漂移，provision 会随之自动 restart avatar，新配置当场生效。
+    # 幂等：已是 [] 则不写盘、不动 mtime、不覆盖首次备份。
+    if policy.exists():
+        import re
+        ptext = policy.read_text(encoding="utf-8")
+        m = re.search(r"^local_sandbox_net_allow\s*=\s*\[[^\]]*\]", ptext, re.M)
+        if not m:
+            report["steps"].append("policy: 无 local_sandbox_net_allow 键，跳过")
+        else:
+            items = re.findall(r"[\"']([^\"']+)[\"']", m.group(0))
+            if not items:
+                report["steps"].append(
+                    "policy: local_sandbox_net_allow 已为空，跳过")
+            else:
+                # 连同紧邻上方的连续注释行一起替换：各机原注释写着「刻意不给公网」
+                # 「**不要**留空，那等于放开全部外发」，只改值会留下与 [] 自相矛盾
+                # 的说明，误导下一个读配置的人。原件已备份到 .bak-netopen。
+                head = ptext[:m.start()].split("\n")
+                if head and head[-1] == "":
+                    head.pop()          # m 匹配在行首，故 head 以换行结尾
+                i = len(head)
+                while i > 0 and head[i - 1].lstrip().startswith("#"):
+                    i -= 1
+                new_text = ("\n".join(head[:i]) + ("\n" if i else "")
+                            + _NET_OPEN_NOTE + "local_sandbox_net_allow = []"
+                            + ptext[m.end():])
+                if not dry:
+                    bak = Path(str(policy) + ".bak-netopen")
+                    if not bak.exists():
+                        shutil.copy2(str(policy), str(bak))
+                    policy.write_text(new_text, encoding="utf-8")
+                report["steps"].append(
+                    f"policy: local_sandbox_net_allow 置空（原 {len(items)} 项："
+                    f"{','.join(items)}）→ 沙箱出网不再限制")
 
     # 3. 运行态
     if not (state / "state.json").exists() and (old / "state.json").exists():

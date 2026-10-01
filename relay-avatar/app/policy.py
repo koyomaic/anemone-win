@@ -191,11 +191,13 @@ class Policy:
               if str(x).strip()]
         hide = [str(x).strip() for x in (sec.get("local_sandbox_hide") or [])
                 if str(x).strip()]
-        # 网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=列表。
-        # 为什么必须收：沙箱只管「能读到什么」，不管「能不能发出去」。Bash 放开后
-        # 二者叠加才成外泄通道——实测 python3 urllib 的外发尝试**完全不被权限层
-        # 拦截**（只因目标端口无监听才失败）。必须同时放行 claude 代理与 PG，
-        # 否则 claude 起不来、store 连不上库。
+        # 网络白名单（IP/CIDR）。非空即施加 IPAddressDeny=any + IPAddressAllow=列表；
+        # **空列表＝不施加任何 IP 规则＝出网不限制**（见 exec_local._sandbox_wrap 的
+        # `if net:` 守卫）。2026-10-01 起机队默认置空：原白名单只放行 claude 代理与
+        # PG，把 oil-research-data 等业务数据源全堵死在沙箱内（实测 HTTP 000），而
+        # IPAddressAllow 无端口粒度、每接一个新数据源都要改配置+重启，不可持续。
+        # 若重新收紧，务必同时放行 claude 代理与 PG，否则 claude 起不来、store 连不
+        # 上库。收紧的代价与剩余防线记录在 policy.example.toml 的同名键注释里。
         net = [str(x).strip() for x in (sec.get("local_sandbox_net_allow") or [])
                if str(x).strip()]
         on = bool(sec.get("local_sandbox", False)) and bool(rw) and bool(hide)
