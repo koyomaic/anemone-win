@@ -3,6 +3,8 @@
 # 铁律：凭据一律走 env 文件（shared/secrets/relay-avatar.env，600），本文件不出现任何密钥。
 
 [identity]
+# 分身自称名——跟随本机 dws 认证名（机队约定 2026-10-09：provision 每轮自动取
+# dws auth status 的 user_name 同步此行，手工改会被自愈覆盖；模板值仅为占位）
 avatar_name = "智微办"
 owner_name = "王洪彬"
 owner_userid = "18434"

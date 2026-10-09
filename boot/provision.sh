@@ -740,6 +740,27 @@ else
           warn "avatar 代码有漂移但重启失败（journalctl -u $AVA_UNIT）——新代码未生效"
         fi
       fi
+      # avatar_name 跟随本机 dws 认证名（机队约定 2026-10-09）：取 dws auth status 的
+      # user_name（本机默认登录态）；policy.toml 无热加载，值有变化时重启生效
+      AVA_POLICY="$AVA_STATE/policy.toml"
+      if [ -f "$AVA_POLICY" ]; then
+        DWS_UN="$(HOME=/root timeout 30 /usr/bin/dws auth status 2>/dev/null \
+          | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("user_name",""))
+except Exception: pass' 2>/dev/null)"
+        if [ -n "$DWS_UN" ] && [ "${#DWS_UN}" -le 60 ]; then
+          if ! grep -q "^avatar_name = \"$DWS_UN\"$" "$AVA_POLICY"; then
+            if grep -q '^avatar_name = ' "$AVA_POLICY"; then
+              sed -i "s|^avatar_name = .*|avatar_name = \"$DWS_UN\"|" "$AVA_POLICY"
+            else
+              sed -i "/^\[identity\]/a avatar_name = \"$DWS_UN\"" "$AVA_POLICY"
+            fi
+            if [ "$(systemctl is-active "$AVA_UNIT")" = active ]; then
+              systemctl restart "$AVA_UNIT" >/dev/null 2>&1 && AVA_NOTE="（avatar_name 已同步 dws 认证名，重启生效）"
+            fi
+          fi
+        fi
+      fi
     fi
   if [ -f "$AVA_MARKER" ]; then
     if heal; then systemctl enable --now "$AVA_UNIT" 2>/dev/null; fi
