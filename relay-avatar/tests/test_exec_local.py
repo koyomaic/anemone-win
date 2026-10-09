@@ -103,6 +103,11 @@ def test_claude_env_merges_settings(cfg, storage, audit, policy,
         {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8790",
                  "ANTHROPIC_AUTH_TOKEN": "tok"}}), encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    # 机队 shell（/etc/profile.d/claude.sh）会导出 ANTHROPIC_*；_claude_env 用
+    # setdefault（进程环境优先），不清掉就无法确定注入源是 settings.json
+    for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+              "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_CUSTOM_MODEL_OPTION"):
+        monkeypatch.delenv(k, raising=False)
     ex = make(cfg, storage, audit, policy)
     env = ex._claude_env()
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8790"
