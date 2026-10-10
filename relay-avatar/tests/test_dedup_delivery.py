@@ -436,3 +436,125 @@ def test_flush_records_inflight_desc(av):
     """提交后必须留在途原文，否则 RUNNING 态无从比对。"""
     s = submit(av, REQ, "1")
     assert REQ[:20] in s["inflight_desc"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 事故原样重放：2026-10-10 赵兴峰 6 分钟内三条真实消息
+#
+# 逐字取自 events-20261010.ndjson，不做任何美化。用真实原文而非构造样本，是因为
+# 去重阈值必须按**实际语料**校准——构造的"相同文本"会给出过于乐观的结论。
+#
+# 实测归一化后相似度：
+#   单聊(7问, 201字) vs 交互群(6问, 283字) = 0.6446  → 不去重（本就是不同问题集）
+#   交互群 vs 另一群                        = 1.0000  → 去重（字节完全相同）
+# 故三条消息收敛成**两个**任务，不是一个。这是有意的：0.64 的两段问的不是同一件
+# 事（单聊 7 问含"下周工作目标"，群里 6 问含"主题该怎么分类"），合并会导致
+# "问两件事只答一件"。真正兜住这种情况的是产出任务号隔离（relay 侧 build_prompt
+# 注入本任务号 + foreign_task_tag 检测），两个任务各写各的 _T<id>_ 文件，不再撞车。
+# ══════════════════════════════════════════════════════════════════════════
+
+# 2026-10-10 交互群事故：赵兴峰 6 分钟内发出的三条真实原文（逐字取自 events-20261010.ndjson）
+INCIDENT_1 = '鲁大师本周的工作汇报：\n请总结分析这周鲁大师的工作，包含一下内容：\n1、这周有多少人发起了跟鲁大师的对话，对话的次数是什么？\n2、这周鲁大师主要做了哪些分析、统计和汇报相关的工作？\n3、这周针对中鲁的IBP12个环节，分别产生了多少的意见和建议？\n4、到目前为止，鲁大师还需要什么数据？这些数据该谁来负责？\n5、鲁大师整个工作，与上周比较起来，这些数字式怎么变化的？\n6、为了让鲁大师更好地服务中鲁核心经营团队，还需要做什么？\n7、鲁大师智能体建设下周工作目标是什么？'
+INCIDENT_1_CONV = 'cid9js+OFGc693WJwQbEuxAIj1pKbrf7J+apKqoNmCRUYc='   # 2026-10-10 19:30:50
+INCIDENT_2 = '@鲁大师 请鲁大师对自己本周的工作做个汇报：\n请总结分析这周鲁大师的工作，包含一下内容：\n1、这周有多少人发起了跟鲁大师的对话，对话的次数是什么？\n2、对话的主题该怎么分类？都是在对话哪些话题？这些话题该如何分类？\n3、这周鲁大师主要做了哪些分析、统计和汇报相关的报告输出工作？都是在为谁完成这些任务？\n4、这周针对中鲁的IBP12个环节，分别产生了多少的意见和建议？有多少人在关心这些问题（问你了）？\n5、为了完成大家提交的任务或者提问的问题，鲁大师还需要什么数据？这些数据该谁来负责？这些数据的完成情况如何？\n6、鲁大师假期归来是否开始忙起来了？这周的工作量如何？与上周和上上周比较起来，这些数字式怎么变化的？\n7、鲁大师智能体建设下周工作目标是什么？'
+INCIDENT_2_CONV = 'cid774+UxHK+dZvYvz+baX1vg=='   # 2026-10-10 19:35:45
+INCIDENT_3 = '@鲁大师 请鲁大师对自己本周的工作做个汇报：\n请总结分析这周鲁大师的工作，包含一下内容：\n1、这周有多少人发起了跟鲁大师的对话，对话的次数是什么？\n2、对话的主题该怎么分类？都是在对话哪些话题？这些话题该如何分类？\n3、这周鲁大师主要做了哪些分析、统计和汇报相关的报告输出工作？都是在为谁完成这些任务？\n4、这周针对中鲁的IBP12个环节，分别产生了多少的意见和建议？有多少人在关心这些问题（问你了）？\n5、为了完成大家提交的任务或者提问的问题，鲁大师还需要什么数据？这些数据该谁来负责？这些数据的完成情况如何？\n6、鲁大师假期归来是否开始忙起来了？这周的工作量如何？与上周和上上周比较起来，这些数字式怎么变化的？\n7、鲁大师智能体建设下周工作目标是什么？'
+INCIDENT_3_CONV = 'cidbFfJcQgDqMkOoTnV38jDJg=='   # 2026-10-10 19:36:34
+
+ZXF = "DJTDWXe5Omkca6fEkz0vxWVZZG4c4SxTc"      # 赵兴峰 openId（userId 拿不到，回落用）
+
+
+@pytest.fixture
+def zxf_av(cfg):
+    """按真实身份形态构造：openId 解析不出 userId → uid 回落 openId（白名单认它）。"""
+    cfg._p.setdefault("group", {})["enabled"] = True
+    cfg._p.setdefault("permissions", {})["whitelist"] = [ZXF]
+    a = Avatar(cfg, dry=True)
+    a.dws = FakeDws(uids={})                     # 通讯录反查不到，与线上一致
+    a.inbox.dws = a.dws
+    a.exec_relay = FakeExec()
+    return a
+
+
+def zxf_ev(text, conv, n):
+    return {
+        "event_type": ("user_im_message_receive_at" if conv.startswith("cid7")
+                       or conv.startswith("cidb")
+                       else "user_im_message_receive_o2o_all"),
+        "content": text, "sender": "赵兴峰", "sender_open_dingtalk_id": ZXF,
+        "message_id": f"m{n}", "conversation_id": conv, "event_id": f"e{n}",
+    }
+
+
+def test_replay_incident_uid_falls_back_to_openid(zxf_av):
+    """前置：uid 必须回落成 openId，否则限流/定级/去重全部错位。"""
+    zxf_av.on_event(zxf_ev(INCIDENT_1, INCIDENT_1_CONV, "1"))
+    s = zxf_av.sess.sessions[f"o:{ZXF}"]
+    assert s["uid"] == ZXF
+
+
+def test_replay_incident_two_identical_group_msgs_collapse(zxf_av):
+    """交互群与另一群文本字节相同（ratio=1.0）→ 只跑一个任务，另一处被绑定。"""
+    # 交互群先发起并进入在途
+    zxf_av.on_event(zxf_ev(INCIDENT_2, INCIDENT_2_CONV, "2"))
+    s_grp = zxf_av.sess.sessions[f"g:{INCIDENT_2_CONV}:{ZXF}"]
+    zxf_av.on_event(zxf_ev("提交", INCIDENT_2_CONV, "2b"))
+    assert s_grp["state"] == "RUNNING" and s_grp["task_id"] == 1
+    zxf_av.dws.sent.clear()
+
+    # 49 秒后另一群发来逐字相同的文本
+    zxf_av.on_event(zxf_ev(INCIDENT_3, INCIDENT_3_CONV, "3"))
+
+    assert len(zxf_av.exec_relay.submitted) == 1, "字节相同的重复需求不应再起任务"
+    assert any("已经在办" in c for _, c in zxf_av.dws.sent), "必须回执，不能静默吞掉"
+    assert zxf_av._target_sig({"conversation_id": INCIDENT_3_CONV}) in [
+        zxf_av._target_sig(t) for t in s_grp["extra_targets"]]
+
+
+def test_replay_incident_dm_differs_so_runs_separately(zxf_av):
+    """单聊那条是 7 问、措辞不同（ratio=0.64）→ 必须**照常起任务**，不得被吞。
+
+    这条是防过度去重的护栏：把阈值调低到能合并这两段，就会造成"问两件事只答
+    一件"，比重复跑一次更糟。
+    """
+    zxf_av.on_event(zxf_ev(INCIDENT_1, INCIDENT_1_CONV, "1"))
+    zxf_av.on_event(zxf_ev("提交", INCIDENT_1_CONV, "1b"))
+    assert len(zxf_av.exec_relay.submitted) == 1
+
+    zxf_av.on_event(zxf_ev(INCIDENT_2, INCIDENT_2_CONV, "2"))
+    zxf_av.on_event(zxf_ev("提交", INCIDENT_2_CONV, "2b"))
+    assert len(zxf_av.exec_relay.submitted) == 2, \
+        "不同问题集必须各自执行，去重不得误吞"
+
+
+def test_replay_incident_all_conversations_get_result(zxf_av):
+    """终局：绑定的两个群都要收到正文——事故里交互群正是什么都没收到。"""
+    zxf_av.on_event(zxf_ev(INCIDENT_2, INCIDENT_2_CONV, "2"))
+    zxf_av.on_event(zxf_ev("提交", INCIDENT_2_CONV, "2b"))
+    zxf_av.on_event(zxf_ev(INCIDENT_3, INCIDENT_3_CONV, "3"))
+    zxf_av.dws.sent.clear()
+
+    zxf_av.exec_relay.tasks[1] = {"id": 1, "status": "done",
+                                  "result": "周报已生成，七节齐全"}
+    zxf_av._poll_sessions()
+
+    got = {str(t.get("conversation_id") or "") for t, _ in zxf_av.dws.sent}
+    assert INCIDENT_2_CONV in got, "主会话（交互群）应收到"
+    assert INCIDENT_3_CONV in got, "绑定会话（另一群）也应收到"
+
+
+def test_replay_incident_failure_reaches_bound_group(zxf_av):
+    """若仍失败，绑定的群也必须收到真实消息——事故里 #690 超时后群里一片沉默。"""
+    zxf_av.on_event(zxf_ev(INCIDENT_2, INCIDENT_2_CONV, "2"))
+    zxf_av.on_event(zxf_ev("提交", INCIDENT_2_CONV, "2b"))
+    zxf_av.on_event(zxf_ev(INCIDENT_3, INCIDENT_3_CONV, "3"))
+    zxf_av.dws.sent.clear()
+
+    zxf_av.exec_relay.tasks[1] = {"id": 1, "status": "failed",
+                                  "error": "timeout after 1800s"}
+    zxf_av._poll_sessions()
+
+    got = {str(t.get("conversation_id") or "") for t, c in zxf_av.dws.sent
+           if "没办成" in c}
+    assert INCIDENT_2_CONV in got and INCIDENT_3_CONV in got, \
+        f"两个会话都应收到失败回执，实际 {got}"

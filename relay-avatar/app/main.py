@@ -1062,6 +1062,11 @@ class Avatar:
                     done = False
             if not done:
                 self._notify_session(s, out)
+            # 去重绑定进来的其它会话**必须**另发真实消息：卡片是原地更新（钉钉
+            # 不推送、不亮红点）且只属于主会话，_notify_session 也只发主会话。
+            # local 是阶段二后的主路径，漏这里等于绑定会话只收到附件、收不到结论。
+            for t in self._extra_targets(s):
+                self._notify(t, out[:2500])
             log(f"local task done for {uid} ({len(out)} chars)")
             if s.get("followups"):
                 s["state"] = "FOLLOWUP"        # 交 _tick 的 due() 正常 flush
