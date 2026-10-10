@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   blocked_cmd TEXT NOT NULL DEFAULT '',
   resume_hint TEXT NOT NULL DEFAULT '',
   read_only INTEGER NOT NULL DEFAULT 0,
+  requester TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
   started_at REAL,
   finished_at REAL
@@ -101,6 +102,7 @@ PG_SCHEMA = [
       blocked_cmd TEXT NOT NULL DEFAULT '',
       resume_hint TEXT NOT NULL DEFAULT '',
       read_only BOOLEAN NOT NULL DEFAULT FALSE,
+      requester TEXT NOT NULL DEFAULT '',
       created_at DOUBLE PRECISION NOT NULL,
       started_at DOUBLE PRECISION,
       finished_at DOUBLE PRECISION
@@ -190,7 +192,8 @@ class DB:
                 for name, decl in (("blocked_cmd", "TEXT NOT NULL DEFAULT ''"),
                                    ("resume_hint", "TEXT NOT NULL DEFAULT ''"),
                                    ("read_only", "INTEGER NOT NULL DEFAULT 0"),
-                                   ("engine", "TEXT NOT NULL DEFAULT ''")):
+                                   ("engine", "TEXT NOT NULL DEFAULT ''"),
+                                   ("requester", "TEXT NOT NULL DEFAULT ''")):
                     if name not in cols:
                         self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {decl}")
                 ucols = {r[1] for r in self._conn.execute("PRAGMA table_info(users)")}
@@ -218,7 +221,8 @@ class DB:
         for name, decl in (("blocked_cmd", "TEXT NOT NULL DEFAULT ''"),
                            ("resume_hint", "TEXT NOT NULL DEFAULT ''"),
                            ("read_only", "BOOLEAN NOT NULL DEFAULT FALSE"),
-                           ("engine", "TEXT NOT NULL DEFAULT ''")):
+                           ("engine", "TEXT NOT NULL DEFAULT ''"),
+                           ("requester", "TEXT NOT NULL DEFAULT ''")):
             if name not in cols:
                 self._run(f"ALTER TABLE tasks ADD COLUMN {name} {decl}")
         rows, _ = self._run("SELECT column_name FROM information_schema.columns"
@@ -354,7 +358,8 @@ class DB:
                     targets: list[str] | None = None, priority: str = "normal",
                     resume_from: int | None = None, read_only: bool = False,
                     status: str = "queued", engine: str = "",
-                    started_at: float | None = None) -> int:
+                    started_at: float | None = None,
+                    requester: str = "") -> int:
         """建任务行。
 
         status/engine/started_at 供 local 影子记录用：avatar 的 local 通路在本机
@@ -363,13 +368,20 @@ class DB:
         三处对账）。影子记录直接以 status='running'、engine='local' 落库，
         **绝不进调度器**，故不占 max_concurrent 额度（/health 的 active 取
         sched.active，是调度器进程内计数，非 DB 查询）。
+
+        requester＝**真实发起人**（钉钉昵称），与 user 分开存。为什么必须有：
+        avatar 全机队共用一个 relay token，故 user 恒为机器人「鲁大师」，看不出
+        任务是谁提的。2026-10-10 排障时三个任务的冲突提示全写「与鲁大师冲突」，
+        把「同一个人重复提交导致的自我撞车」伪装成了「与机器人冲突」，误导了
+        整整一轮定位。user 仍是鉴权/配额主体，不动；requester 只作展示与归因。
         """
         args = (user, description, project, json.dumps(targets or [], ensure_ascii=False),
                 priority, resume_from, read_only, status, engine, started_at,
-                time.time())
+                requester, time.time())
         sql = ('INSERT INTO tasks("user", description, project, targets, priority,'
-               ' resume_from, read_only, status, engine, started_at, created_at)'
-               " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+               ' resume_from, read_only, status, engine, started_at, requester,'
+               ' created_at)'
+               " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         if self._pg:
             row = self._q(sql + " RETURNING id", args, one=True)
             return row["id"]

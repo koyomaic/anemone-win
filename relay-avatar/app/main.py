@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -689,9 +690,150 @@ class Avatar:
         if pc:
             self._handle_plan(pc, s, uid)
             return
+        # 同一需求已在别的会话在办 → 绑成额外投递目标，不再起一个任务。
+        # 放在计划拦截之后（计划是登记动作，不该被去重吞掉）、缓冲之前
+        # （一旦进 BUFFERING 就会在 debounce 到期后真的提交）。
+        dup = self._find_inflight_duplicate(s, text, uid)
+        if dup is not None:
+            self._bind_duplicate(dup, s)
+            return
         if s.get("ack_mid") != s.get("last_msg_id"):
             self._ack_receive(s)   # 即时回执已贴过则不重复
         self.sess.start_buffering(s, text)
+
+    # ── 重复请求去重 + 多渠道投递绑定 ──
+    @staticmethod
+    def _target_sig(t: dict) -> str:
+        """投递目标的稳定标识（群取会话号，单聊取用户/开放号）。"""
+        t = t or {}
+        return str(t.get("conversation_id") or t.get("user_id")
+                   or t.get("open_dingtalk_id") or "")
+
+    @staticmethod
+    def _norm_for_dedup(text: str) -> str:
+        """去重比对前的归一化：剥 @提及、空白与标点，只留语义字符。
+
+        同一需求经不同会话发来时，前缀（群里有「@鲁大师」、单聊没有）、换行与
+        全半角标点都不一样，直接比原文必然漏判。
+        """
+        t = re.sub(r"@[\w\u4e00-\u9fff\-+._]{1,40}", "", text or "")
+        return re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)
+
+    def _inflight_desc(self, s: dict) -> str:
+        """会话当前在途请求的原文（三种状态各存在不同字段）。"""
+        st = s.get("state")
+        if st in ("BUFFERING", "FOLLOWUP"):
+            return "\n\n".join(s.get("buffer") or s.get("followups") or [])
+        if st == "LOCAL":
+            return str(s.get("local_desc") or "")
+        return str(s.get("inflight_desc") or "")
+
+    def _find_inflight_duplicate(self, s: dict, text: str, uid: str):
+        """找同一发起人在**别的会话**里正在办的同一需求，没有则返回 None。
+
+        2026-10-10 事故：赵兴峰 6 分钟内把同一份周报需求发到单聊 + 两个群，系统
+        起了三个任务，三者收敛出字节完全相同的报告并写同一路径 → 触发冲突守卫；
+        其中交互群那个还因三个重任务并发抢资源撞上 1800s 超时 → failed。用户视角
+        是「发了三遍、只有一处收到、交互群彻底沉默」。
+
+        去重的正确形态不是丢弃重复请求，而是**把新会话绑成额外投递目标**：需求
+        只跑一次，结果送到他发过的每一个地方（见 _bind_duplicate）。
+        """
+        if not uid:
+            return None
+        want = self._norm_for_dedup(text)
+        # 太短（「好的」「继续」「在吗」）不足以判定是同一需求，宁可不去重
+        if len(want) < int(self.cfg.get("ingress", "dedup_min_chars", 12)):
+            return None
+        win = int(self.cfg.get("ingress", "dedup_window_sec", 900))
+        thr = float(self.cfg.get("ingress", "dedup_similarity", 0.82))
+        if win <= 0 or thr <= 0:
+            return None            # 任一置 0 即关闭去重（宁可重复跑，不可误吞需求）
+        now = time.time()
+        best, best_r = None, 0.0
+        for _key, o in list(self.sess.sessions.items()):
+            if o is s or str(o.get("uid") or "") != str(uid):
+                continue
+            if o.get("state") not in ("BUFFERING", "FOLLOWUP", "LOCAL",
+                                      "RUNNING", "WAIT_APPROVAL",
+                                      "WAIT_REVIEW"):
+                continue
+            if now - float(o.get("last_activity") or 0) > win:
+                continue
+            have = self._norm_for_dedup(self._inflight_desc(o))
+            if len(have) < int(self.cfg.get("ingress", "dedup_min_chars", 12)):
+                continue
+            r = SequenceMatcher(None, want, have).ratio()
+            if r >= thr and r > best_r:
+                best, best_r = o, r
+        return best
+
+    def _bind_duplicate(self, owner: dict, s: dict) -> None:
+        """把重复请求所在会话绑成 owner 的额外投递目标，本会话不起新任务。
+
+        安全边界：_find_inflight_duplicate 已限定**同一 uid**，故额外目标永远是
+        发起人自己的其它会话，不会把内部件外发给第三方——与 _consume_send_markers
+        护栏②（收件人恒为发起会话）同源，只是「发起会话」从 1 个扩展成「发起人
+        发过这条需求的所有会话」。
+        """
+        tgt = dict(s.get("reply") or {})
+        sig = self._target_sig(tgt)
+        extras = owner.setdefault("extra_targets", [])
+        if sig and not any(self._target_sig(e) == sig for e in extras):
+            extras.append(tgt)
+        tid = owner.get("task_id")
+        self._notify_session(
+            s, "🔁 这条需求你刚在别处也发过，已经在办了"
+               + (f"（任务 #{tid}）" if tid else "")
+               + "，办完会一并送到这里，不用重发。")
+        s["state"] = "IDLE"
+        s["buffer"] = []
+        s["followups"] = []
+        self._swap_ack(s, "")
+        self.audit.log("dedup_bound", str(s.get("uid") or ""),
+                       f"conv={sig[:48]} owner_task={tid} "
+                       f"owner_state={owner.get('state')}", backend="local")
+        log(f"dedup: bound {sig[:32]} → owner task #{tid}")
+
+    def _extra_targets(self, s: dict) -> list:
+        """去重绑定进来的额外投递目标（已排除主目标、已按签名去重）。"""
+        out, seen = [], {self._target_sig(s.get("reply") or {})}
+        for t in (s.get("extra_targets") or []):
+            sig = self._target_sig(t)
+            if sig and sig not in seen:
+                seen.add(sig)
+                out.append(t)
+        return out
+
+    def _send_file_verified(self, target: dict, path: str):
+        """发文件并核验真实投递态，返回 (good, delivered, err)。
+
+        **受理 ≠ 到达**：dws 文件发送是异步的（outcome=pending、state=processing），
+        data.success=true 只代表请求被受理。必须查 sendStatus 才知道真到没到——
+        2026-09-25 用户连续 6 次反馈「文件发不出来」而审计一路记成功，就是只看
+        受理态 + 判定过松叠加的结果。
+        """
+        try:
+            r = self.dws.send_file(target, path)
+        except Exception as e:
+            r = {"_exc": repr(e)[:120]}
+        ok, otid, err = send_accepted(r)
+        delivered = None
+        if ok and otid:
+            for _ in range(4):
+                time.sleep(2)
+                try:
+                    sr = self.dws.send_status(otid)
+                except Exception:
+                    break
+                res = sr.get("result") if isinstance(sr, dict) else None
+                stt = res.get("sendStatus") if isinstance(res, dict) else None
+                if stt:
+                    delivered = (str(stt).upper() == "SUCCESS")
+                    if not delivered:
+                        err = f"sendStatus={stt}"
+                    break
+        return (ok and delivered is not False), delivered, err
 
     def _flush(self, s: dict, followup: bool = False, uid: str = "",
                force_relay: bool = False):
@@ -716,7 +858,8 @@ class Avatar:
         resume = self.sess.resume_candidate(s)
         desc = self._with_chain_digest(s, desc, resume)
         r = self.exec_relay.submit(desc + self._relay_marker_rules(s),
-                                   resume_from=resume, uid=uid)
+                                   resume_from=resume, uid=uid,
+                                   requester=self._requester_name(s))
         if "_error" in r:
             self._notify_session(s, f"⚠️ 提交失败了：{r['_error']} "
                                     f"{str(r.get('_detail', ''))[:120]}，稍后再试～")
@@ -728,6 +871,8 @@ class Avatar:
         s["uid"] = uid
         s["state"] = "RUNNING"
         s["notified_followup"] = False
+        # 留在途原文，供同一需求从别的会话再发一次时做去重比对
+        s["inflight_desc"] = desc
         if followup:
             s["followups"] = []
         else:
@@ -803,7 +948,8 @@ class Avatar:
         # local 执行——降级回今天的无记录行为，可见性不该成为可用性前提。
         rec = {}
         try:
-            rec = self.exec_relay.create_local_record(desc, uid)
+            rec = self.exec_relay.create_local_record(
+                desc, uid, requester=self._requester_name(s))
         except Exception as e:
             log("local shadow record failed:", repr(e)[:120])
         if "_error" not in rec and rec.get("task_id"):
@@ -1341,21 +1487,24 @@ class Avatar:
         head = prefix or f"🍂 **{self.cfg.avatar_name}办好了 ✅**"
         limit = int(self.cfg.get("ingress", "result_max_chars", 3000))
         long = len(result) > limit
+        body = head + "\n\n" + (
+            result[:1500] + "\n\n…（全文见附件）" if long
+            else (result or "（无文本结果）"))
+        carded = False
         if s.get("card_biz"):
-            body = head + "\n\n" + (
-                result[:1500] + "\n\n…（全文见附件）" if long
-                else (result or "（无文本结果）"))
-            if self._card_final(s, body, 3):
-                if long:
-                    self._send_full_file(s, tid, result)
-                return
-        if long:
-            self._notify_session(
-                s, head + "\n\n" + result[:1500] + "\n\n…（全文见附件）")
-            self._send_full_file(s, tid, result)
-        else:
-            self._notify_session(
-                s, head + ("\n\n" + result if result else "（无文本结果）"))
+            carded = self._card_final(s, body, 3)
+            if carded and long:
+                self._send_full_file(s, tid, result)
+        if not carded:
+            self._notify_session(s, body)
+            if long:
+                self._send_full_file(s, tid, result)
+        # 去重绑定的其它会话没有卡片可更新，一律发真实消息（有推送、亮红点）。
+        # 卡片是原地更新，钉钉不推送——只更新卡片等于没告知（见 _finish 的
+        # failed 分支注释）。附件已由 _send_full_file / _consume_send_markers
+        # 各自覆盖额外目标，这里只补正文。
+        for t in self._extra_targets(s):
+            self._notify(t, body, task_id=tid)
 
     # ── 计划标记消费：大脑产出 ```plan JSON，本进程带凭据执行 ──
     def _consume_plan_markers(self, result: str, s: dict, tid):
@@ -1541,33 +1690,9 @@ class Avatar:
                 notes.append(f"⚠️ 代投失败：`{os.path.basename(raw)}` 超过 "
                              f"{maxb // 1048576}MB 上限")
                 continue
-            try:
-                r = self.dws.send_file(s["reply"], p)
-            except Exception as e:
-                r = {"_exc": repr(e)[:120]}
-            ok, otid, err = send_accepted(r)
-            # **受理 ≠ 到达**：dws 文件发送是异步的（outcome=pending、
-            # state=processing），data.success=true 只代表请求被受理。必须查
-            # sendStatus 才知道真到没到——2026-09-25 用户连续 6 次反馈「文件
-            # 发不出来」而审计一路记成功，就是只看受理态 + 判定过松叠加的结果。
-            delivered = None
-            if ok and otid:
-                for _ in range(4):
-                    time.sleep(2)
-                    try:
-                        sr = self.dws.send_status(otid)
-                    except Exception:
-                        break
-                    res = sr.get("result") if isinstance(sr, dict) else None
-                    stt = res.get("sendStatus") if isinstance(res, dict) else None
-                    if stt:
-                        delivered = (str(stt).upper() == "SUCCESS")
-                        if not delivered:
-                            err = f"sendStatus={stt}"
-                        break
-            good = ok and delivered is not False
+            good, delivered, err = self._send_file_verified(s["reply"], p)
             tail = (f" 投递={delivered}" if delivered is not None
-                    else (" 受理未确认" if ok else f" err={err[:90]}"))
+                    else (" 受理未确认" if good else f" err={err[:90]}"))
             self.audit.log("send_file" if good else "send_failed", uid,
                            f"{p[:120]} ({os.path.getsize(p)}B){tail}",
                            backend="local", task_id=tid)
@@ -1575,6 +1700,18 @@ class Avatar:
             if good:
                 notes.append(f"📎 已发文件：`{os.path.basename(p)}`"
                              + ("" if delivered else "（已受理，投递状态未确认）"))
+                # 去重绑定进来的其它会话同样要收到——需求只跑一次，但发起人
+                # 可能是在单聊和两个群里各发了一遍，只送一处等于另外两处沉默。
+                for t in self._extra_targets(s):
+                    g2, d2, e2 = self._send_file_verified(t, p)
+                    self.audit.log(
+                        "send_file" if g2 else "send_failed", uid,
+                        f"{p[:120]} 额外投递→{self._target_sig(t)[:48]}"
+                        + (f" 投递={d2}" if d2 is not None else f" err={e2[:80]}"),
+                        backend="local", task_id=tid)
+                    if not g2:
+                        notes.append(f"⚠️ 额外会话投递失败：`{os.path.basename(p)}`"
+                                     f" {e2[:60]}")
             else:
                 notes.append(f"⚠️ 文件发送失败：`{os.path.basename(p)}` {err[:80]}")
         return clean, notes
@@ -1653,6 +1790,19 @@ class Avatar:
         """从会话取 (openId, 显示名)，供 level_of 做与 on_event 同源的定级。"""
         r = (s or {}).get("reply") or {}
         return str(r.get("open_dingtalk_id") or ""), str(r.get("sender") or "")
+
+    def _requester_name(self, s: dict) -> str:
+        """真实发起人显示名，随任务提交给 relay 存进 requester 字段。
+
+        为什么需要：relay 侧 user 取自 token 身份，而全机队共用机器人「鲁大师」
+        那一个 token，于是所有任务的 user 都是鲁大师——看不出是谁提的，冲突提示
+        还会把「同一人重复提交导致的自我撞车」写成「与鲁大师冲突」
+        （2026-10-10 排障被这条误导了整整一轮）。
+        只取显示名、不含 openId/userId：requester 会出现在看板与冲突提示里，
+        属对外可见字段，不携带身份标识符。
+        """
+        _sid, sender = self._ident(s)
+        return sanitize_field(sender or "", 40)
 
     def _plan_gate(self, uid: str, op: str, sid: str = "",
                    sender: str = "") -> str | None:
@@ -1881,6 +2031,15 @@ class Avatar:
                           task_id=tid, snippet=fp.name)
         except Exception as e:
             log("send result file failed:", e)
+            return
+        # 全文附件同样要送去去重绑定的其它会话（同一发起人）
+        for t in self._extra_targets(s):
+            g, _d, e = self._send_file_verified(t, str(fp))
+            self.audit.log("send_file" if g else "send_failed",
+                           str(s.get("uid") or ""),
+                           f"{fp.name} 全文附件额外投递→{self._target_sig(t)[:48]}"
+                           + ("" if g else f" err={e[:80]}"),
+                           backend="relay", task_id=tid)
 
     def _finish(self, s: dict, row: dict):
         tid = row.get("id")
@@ -1901,10 +2060,20 @@ class Avatar:
             self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row))
         elif status == "failed":
             err = (row.get("error") or "未知错误")[:300]
-            if not self._card_final(
-                    s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n> {err}", 5):
-                self._notify_session(s, f"❌ 没办成：{err}")
+            self._card_final(
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n> {err}", 5)
+            # 卡片之外**必须**再补一条真实消息，不能因为卡片更新成功就省掉。
+            # 卡片是原地更新：钉钉不推送、不亮红点，用户看到的仍是几小时前的
+            # 「正在处理…」。2026-10-10 交互群事故——#690 超时失败，卡片确实
+            # 定格成了「没办成 ❌」，发起人却等了 2 小时毫无察觉，因为没人会主动
+            # 回去盯一张旧卡。done/conflict 分支没暴露这个问题，是因为它们附带
+            # _send_full_file 产生了真实消息（有推送）；失败没有附件可发，于是
+            # 成了唯一的静默终态。
+            self._notify_session(s, f"❌ 没办成：{err}")
+            for t in self._extra_targets(s):
+                self._notify(t, f"❌ 没办成：{err}", task_id=tid)
             self._swap_ack(s, "fail_text_emotion")
+            self._alert_terminal_failure(s, row, err)
         elif status == "cancelled":
             if not self._card_final(s, "🍂 **已取消 🚫**", 3):
                 self._notify_session(s, "🚫 已取消。")
@@ -1915,6 +2084,27 @@ class Avatar:
             log(f"{len(s['followups'])} followup(s) queued")
         else:
             s["state"] = "IDLE"
+
+    def _alert_terminal_failure(self, s: dict, row: dict, err: str):
+        """失败终态预警超管。
+
+        发起人收到的是一句业务语言的「没办成」，不含任务号与错误原文；超管这条
+        带全上下文，便于直接定位是超时、内部错误还是门禁拒绝。失败本就少见，
+        不做节流——真出现风暴说明有更大的问题，正该被看见。
+        预警失败只记日志不抛：它是增益，不能反过来影响给发起人的回执。
+        """
+        try:
+            sid, sender = self._ident(s)
+            r = s.get("reply") or {}
+            where = (f"群聊 {r.get('conversation_id') or s.get('last_conv_id') or '?'}"
+                     if r.get("is_group") else "单聊")
+            self._notify_superadmins(
+                f"⚠️ 任务 #{row.get('id')} 失败，已回执发起人\n"
+                f"> 发起人：{sender or sid or '?'}\n"
+                f"> 会话：{where}\n"
+                f"> 错误：{err[:200]}")
+        except Exception as e:
+            log("superadmin failure alert failed:", e)
 
     def _reprompt(self, s: dict):
         now = time.time()

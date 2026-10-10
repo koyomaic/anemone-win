@@ -21,6 +21,14 @@ DEFAULTS: dict[str, Any] = {
     "ingress": {"event_keys": ["user_im_message_receive_o2o_all"],
                 "idle_watchdog_sec": 270, "debounce_sec": 20,
                 "followup_debounce_sec": 30, "session_ttl_sec": 1800,
+                # 重复请求去重：同一发起人在多个会话里发同一需求时只跑一次，
+                # 其余会话绑成额外投递目标（结果送到每一处）。
+                # 为什么必须有：2026-10-10 同一份周报需求 6 分钟内从单聊+两个群
+                # 各触发一个任务，三者收敛出字节相同的报告并写同一路径 → 触发
+                # 冲突守卫；并发抢资源还让其中一个撞上 1800s 超时。
+                # dedup_similarity 用归一化后的 SequenceMatcher 比值；0＝关闭去重。
+                "dedup_window_sec": 900, "dedup_similarity": 0.82,
+                "dedup_min_chars": 12,
                 # resume 上下文预算：链深/累计 tokens 任一触顶即断链另起新会话，
                 # 并注入上一轮结果摘要（resume_digest_chars 截断）保持话题连续。
                 # 为什么必须有：此前 resume 只看 TTL，链可无限续——claude 每轮重放

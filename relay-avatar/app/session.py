@@ -54,6 +54,12 @@ class SessionManager:
             "task_id": None, "last_task_id": None, "deadline": 0,
             "notified_followup": False, "last_activity": time.time(),
             "uid": ev.get("_uid", ""),
+            # 在途请求原文（relay 通路提交后留存），供跨会话重复请求去重比对。
+            # local 通路用 local_desc，BUFFERING 用 buffer，故只在 relay 通路写。
+            "inflight_desc": "",
+            # 去重绑定进来的**同一发起人**的其它会话投递目标。需求只跑一次，
+            # 结果送到他发过这条需求的每一个会话（见 main._bind_duplicate）。
+            "extra_targets": [],
             "reply": {
                 "is_group": is_group,
                 "open_dingtalk_id": sid,

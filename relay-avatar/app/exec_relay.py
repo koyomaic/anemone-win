@@ -24,9 +24,10 @@ class ExecRelay:
         return self.relay.configured
 
     def submit(self, desc: str, resume_from=None, uid: str = "",
-               ingress: str = "dingtalk") -> dict:
+               ingress: str = "dingtalk", requester: str = "") -> dict:
         """提交任务。返回 relay 响应（含 task_id 或 _error）。"""
-        r = self.relay.create_task(desc, resume_from=resume_from)
+        r = self.relay.create_task(desc, resume_from=resume_from,
+                                   requester=requester)
         if "_error" not in r:
             self.audit.log("task_submit", uid, f"#{r.get('task_id')}",
                            backend=self.name, ingress=ingress,
@@ -56,8 +57,9 @@ class ExecRelay:
 
     # ---- local 影子记录：只登记不派发，让 local 任务在任务列表可见 ----
 
-    def create_local_record(self, desc: str, uid: str = "") -> dict:
-        r = self.relay.create_local_record(desc)
+    def create_local_record(self, desc: str, uid: str = "",
+                            requester: str = "") -> dict:
+        r = self.relay.create_local_record(desc, requester=requester)
         if "_error" not in r:
             self.audit.log("local_shadow", uid, f"#{r.get('task_id')}",
                            backend="local", task_id=r.get("task_id"))

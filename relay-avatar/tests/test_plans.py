@@ -63,7 +63,8 @@ class PlanExec:
     def available(self):
         return True
 
-    def submit(self, desc, resume_from=None, uid="", ingress="dingtalk"):
+    def submit(self, desc, resume_from=None, uid="", ingress="dingtalk",
+                 requester=""):
         tid = len(self.submitted) + 1
         self.submitted.append({"tid": tid, "desc": desc, "uid": uid})
         self.tasks[tid] = {"id": tid, "status": "queued"}

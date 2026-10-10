@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 
@@ -34,6 +35,35 @@ def is_volatile(rel: str, patterns: list[str]) -> bool:
     这类改动不是任务产出：不计入 changed_files，也不参与冲突判定。
     """
     return any(fnmatch.fnmatchcase(rel, p) for p in patterns)
+
+
+# 产出文件名里的任务号段（AGENTS.md 命名约定：<YYYYMMDD>_<taskId>_<topic>_v<N>.<ext>）
+TASK_TAG_RE = re.compile(r"_T(\d+)(?=[_.])")
+
+
+def foreign_task_tag(rel: str, own_id) -> int | None:
+    """文件名带的任务号若**不是本任务**，返回那个任务号；否则 None。
+
+    为什么需要：prompt 此前从不告知 agent 自己的任务号，它看到磁盘上已有别的
+    任务产出的 `_T689_` 报告就接着写。2026-10-10 事故里 #690/#691 都写进了
+    `_T689_` 那个路径，三个任务撞在同一文件上触发冲突守卫、双双卡在人工核查。
+    T0（无关联任务）是约定内的合法值，不算越界。
+    """
+    m = TASK_TAG_RE.search(os.path.basename(rel))
+    if not m:
+        return None
+    other = int(m.group(1))
+    if other == 0:
+        return None
+    try:
+        if other == int(own_id):
+            return None
+    except (TypeError, ValueError):
+        # 本任务号未知（None / 非数字）→ 无从确立归属，**不指控**。
+        # 这是检测性启发式，宁可漏报也不制造无法核实的审计噪音；
+        # 真正的覆盖损失由冲突守卫（内容哈希 + 备份）兜住。
+        return None
+    return other
 
 
 def _sha(path: str) -> str:
@@ -159,8 +189,12 @@ class Workspace:
 
         all_changed = sorted(set(created) | set(modified) | set(deleted))
         self.db.set(task["id"], changed_files=all_changed)
+        # 越界写入检测：产出文件名带了别的任务号（见 foreign_task_tag）
+        foreign = sorted({(rel, foreign_task_tag(rel, task["id"]))
+                          for rel in created + modified
+                          if foreign_task_tag(rel, task["id"]) is not None})
         return {"created": created, "modified": modified, "deleted": deleted,
-                "all": all_changed, "volatile": volatile}
+                "all": all_changed, "volatile": volatile, "foreign": foreign}
 
     def _in_runtime_dir(self, rel_file: str) -> bool:
         """rel_file 的任一目录段是否属运行时/非任务产出区（虚拟环境、模型缓存、台账等）。"""
@@ -171,6 +205,28 @@ class Workspace:
                 return True
             acc = os.path.join(acc, p)
         return False
+
+    def identical_version(self, task_a: dict, task_b: dict, rel_file: str) -> bool:
+        """两个任务产出的同一文件是否字节相同。相同即无覆盖损失，不构成真冲突。
+
+        历史事故（2026-10-10）：同一需求经三个会话各触发一次任务，三者收敛出完全
+        一致的周报（三份 MD5 相同），却因"都改动了同一文件"被判 conflict/review，
+        全部卡在人工核查且零外发——发起人在三个会话里等了 2 小时只看到沉默。
+        冲突的本质是**内容分歧导致覆盖损失**，不是"碰过同一个路径"。
+
+        任一版本缺失（已 cleanup 或从未落盘）时返回 False，保守按冲突处理，
+        绝不因为拿不到证据就放行。
+        """
+        pa = os.path.join(task_a["workdir"], ".result", rel_file)
+        pb = os.path.join(task_b["workdir"], ".result", rel_file)
+        try:
+            if not (os.path.isfile(pa) and os.path.isfile(pb)):
+                return False
+            if os.path.getsize(pa) != os.path.getsize(pb):
+                return False          # 尺寸不同必先短路，省掉两次全量哈希
+            return _sha(pa) == _sha(pb)
+        except OSError:
+            return False
 
     def backup_version(self, other_task: dict, rel_file: str) -> tuple[str, str]:
         """把 other_task 产出的 rel_file 版本备份为 <文件>.bak-<用户>-HHMM，绝不静默覆盖。

@@ -72,7 +72,8 @@ class FakeExec:
     def available(self):
         return True
 
-    def submit(self, desc, resume_from=None, uid="", ingress="dingtalk"):
+    def submit(self, desc, resume_from=None, uid="", ingress="dingtalk",
+                 requester=""):
         tid = len(self.submitted) + 1
         self.submitted.append({"tid": tid, "desc": desc,
                                "resume": resume_from, "uid": uid})

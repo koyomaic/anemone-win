@@ -247,13 +247,14 @@ class FakeExec:
     def available(self):
         return True
 
-    def submit(self, desc, resume_from=None, uid="", ingress="dingtalk"):
+    def submit(self, desc, resume_from=None, uid="", ingress="dingtalk",
+                 requester=""):
         tid = len(self.submitted) + 1
         self.submitted.append({"tid": tid, "desc": desc, "uid": uid,
                                "resume_from": resume_from})
         return {"task_id": tid, "status": "queued"}
 
-    def create_local_record(self, desc, uid=""):
+    def create_local_record(self, desc, uid="", requester=""):
         tid = 900 + len(self.shadows) + 1
         self.shadows.append({"tid": tid, "desc": desc, "uid": uid})
         return {"task_id": tid, "status": "running", "backend": "local"}

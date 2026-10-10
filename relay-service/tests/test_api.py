@@ -193,3 +193,52 @@ def test_overlap_409_then_force(relay, member):
     assert member.get(f"/tasks/{r.json()['task_id']}").json()["read_only"] is True
 
     member.post(f"/tasks/{a['task_id']}/cancel")
+
+
+# ── requester：真实发起人归因 ──
+# avatar 全机队共用一个 relay token，故 user 恒为机器人「鲁大师」，看不出任务是谁
+# 提的。2026-10-10 排障时三个任务的冲突提示全写「与鲁大师冲突」，把「同一人重复
+# 提交导致的自我撞车」伪装成「与机器人冲突」，误导了整整一轮定位。
+
+def test_requester_recorded_and_returned(relay, member):
+    r = member.post("/tasks", json={
+        "description": "只回复 ok，不要使用任何工具。",
+        "requester": "赵兴峰",
+    })
+    assert r.status_code == 202
+    tid = r.json()["task_id"]
+    t = member.get(f"/tasks/{tid}").json()
+    t = t.get("task", t)
+    assert t["requester"] == "赵兴峰"
+    assert t["user"] == "tester", "user 仍是鉴权主体，不被 requester 顶替"
+
+
+def test_requester_defaults_empty(relay, member):
+    """回归：不传 requester 时行为不变（空串），老客户端不受影响。"""
+    r = member.post("/tasks", json={
+        "description": "只回复 ok，不要使用任何工具。"})
+    assert r.status_code == 202
+    t = member.get(f"/tasks/{r.json()['task_id']}").json()
+    t = t.get("task", t)
+    assert t["requester"] == ""
+
+
+def test_requester_truncated_to_40(relay, member):
+    """requester 会出现在看板与冲突提示里，长度必须受控。"""
+    r = member.post("/tasks", json={
+        "description": "只回复 ok，不要使用任何工具。",
+        "requester": "某" * 200})
+    assert r.status_code == 202
+    t = member.get(f"/tasks/{r.json()['task_id']}").json()
+    t = t.get("task", t)
+    assert len(t["requester"]) == 40
+
+
+def test_requester_recorded_for_local_shadow(relay, member):
+    """local 影子记录同样要带发起人，否则看板上 local 任务全是机器人。"""
+    r = member.post("/tasks", json={
+        "description": "本机任务", "backend": "local", "requester": "孔德光"})
+    assert r.status_code == 202
+    t = member.get(f"/tasks/{r.json()['task_id']}").json()
+    t = t.get("task", t)
+    assert t["requester"] == "孔德光" and t["engine"] == "local"

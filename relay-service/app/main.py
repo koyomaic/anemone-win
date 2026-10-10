@@ -628,14 +628,25 @@ from .workspace import Workspace
 
 def build_prompt(row: dict, cfg: Settings) -> str:
     targets = ", ".join(row["targets"]) or "（未声明；按任务描述判断，尽量不触碰共享区）"
+    tid = row["id"]
     p = (
         f"任务：{row['description']}\n"
+        f"本任务号：#{tid}\n"
         f"本任务声明的改动目标：{targets}\n"
         f"团队共享区：{cfg.shared_dir}\n"
         f"  - 共享知识已自动加载进本次会话：技能 {cfg.shared_dir}/skills/、"
         f"MCP 工具 {cfg.shared_dir}/mcp/、团队记忆 {cfg.shared_dir}/memory/（已并入 AGENTS.md）\n"
         f"  - 知识库文档 {cfg.shared_dir}/knowledge/：动手前可先查阅；"
         f"产生的可复用经验沉淀到对应主题目录\n"
+        # 产出命名铁律。为什么必须显式写进 prompt：AGENTS.md 虽已规定
+        # `report : <YYYYMMDD>_<taskId>_<topic>_v<N>.<ext>`，但**此前 prompt 从不
+        # 告知 agent 自己的任务号**，它无从遵守。2026-10-10 事故：同一需求经三个
+        # 会话触发 #689/#690/#691，后两个看到磁盘上已有 `_T689_` 的报告就接着写，
+        # 三个任务全写进同一路径 → 触发冲突守卫 → 双双卡在人工核查。
+        f"  - 产出命名铁律：report/data 文件名里的任务号段**只能写本任务号 T{tid}**"
+        f"（无关联任务才写 T0）。禁止创建或覆盖带其它任务号的文件（如 T689）——"
+        f"那是别的任务的交付件，覆盖会触发冲突核查并把双方一起卡住。"
+        f"同一产出要改版就 vN+1，不要同名覆盖。\n"
         f"完成后用 2-5 句话总结：做了什么、改了哪些文件。"
     )
     if row.get("resume_from"):
@@ -651,6 +662,11 @@ class NewTask(BaseModel):
     force: bool = False
     read_only: bool = False  # 纯读声明：跳过事前防碰；事后若发现文件改动仍会置 conflict
     resume_from: int | None = None
+    # 真实发起人（钉钉昵称）。avatar 全机队共用一个 relay token，故 user 恒为
+    # 机器人「鲁大师」；不带上这个字段就看不出任务是谁提的，冲突提示还会把
+    # 「同一人重复提交导致的自我撞车」写成「与鲁大师冲突」（2026-10-10 排障
+    # 被它误导过一整轮）。仅作展示与归因，不参与鉴权/配额。
+    requester: str = ""
     # relay=正常派发执行（默认）；local=只建**影子记录**不派发——调用方（avatar）
     # 在自己进程里跑 claude，relay 仅负责让它在任务列表可见、可查状态变更历史。
     backend: str = "relay"
@@ -969,6 +985,12 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             return
         row = db.task(task_id)  # 刷新
         scan = ws.scan(row)
+        # 越界写入：产出文件名带了别的任务号。不单独置 conflict（内容一致已由
+        # identical_version 放行、内容分歧由下面的冲突守卫兜住），但必须留痕——
+        # 它是"两个任务撞在同一交付件上"的直接证据，排障时比通用冲突提示有用得多。
+        for rel, other_id in (scan.get("foreign") or []):
+            audit.line(task_id, row["user"], "foreign_task_file",
+                       f"{rel} 带的是 #{other_id} 的任务号（本任务 #{task_id}）")
         real_conflicts = _check_conflicts(row, scan, finished)
         conflicts = list(real_conflicts)
         # 只读声明的事后兜底按风险分级：覆盖/删除既有文件 → conflict（有数据损失风险）；
@@ -979,7 +1001,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             conflicts.append({
                 "file": ", ".join((ro_overwritten or scan["all"])[:5]),
                 "with_task": task_id,
-                "with_user": row["user"],
+                "with_user": _who(row),
                 "backup": "",
                 "note": ("任务声明只读（read_only）却覆盖/删除了既有文件，请人工核查"
                          if ro_overwritten else
@@ -1006,11 +1028,27 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         if status in TERMINAL:
             ws.cleanup_terminal(row)
 
+    def _who(row: dict) -> str:
+        """任务归属的**展示名**：优先真实发起人，回落 token 身份。
+
+        avatar 全机队共用一个 relay token，故 user 恒为机器人「鲁大师」。冲突提示
+        若只写 user，同一人重复提交造成的自我撞车会被写成「与鲁大师冲突」——
+        2026-10-10 排障时被这条误导了整整一轮（先怀疑跨任务竞争，实际是同一
+        发起人 6 分钟内从三个会话各触发一次）。
+        """
+        r = str((row or {}).get("requester") or "").strip()
+        u = str((row or {}).get("user") or "").strip()
+        if r and r != u:
+            return f"{r}（经 {u}）"
+        return r or u or "?"
+
     def _check_conflicts(row: dict, scan: dict, finished_at: float) -> list[dict]:
         """同文件冲突判定：仅比对时间窗内（conflict_window_hours）仍有活动的任务。
 
         窗外的先后写入属正常演进（后者基于前者产出继续改），不置 conflict；
         工具自动重写的缓存/凭据已在 scan 阶段剔除，不会进入 scan["all"]。
+        窗内命中后还要过**内容哈希**这一关：字节相同即无覆盖损失，不算冲突
+        （见 Workspace.identical_version）。判定依据是内容分歧，不是路径重合。
         """
         conflicts: list[dict] = []
         win_h = cfg.conflict_window_hours
@@ -1021,10 +1059,17 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                     continue
                 if not other["changed_files"]:
                     continue
+                if ws.identical_version(row, other, rel):
+                    # 内容字节相同 → 无覆盖损失，不是真冲突。同一需求经多个会话
+                    # 重复触发时，各任务往往收敛出完全一致的产出，此前会被误判
+                    # conflict/review 并卡死在人工核查（且不外发），发起人只看到沉默。
+                    audit.line(row["id"], row["user"], "conflict_skipped",
+                               f"{rel} 与 #{other['id']} 内容一致")
+                    continue
                 entry = {
                     "file": rel,
                     "with_task": other["id"],
-                    "with_user": other["user"],
+                    "with_user": _who(other),
                     "backup": "",
                     "note": f"两个任务在 {win_h:g}h 时间窗内都改动了同一文件",
                 }
@@ -1032,20 +1077,21 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                     bak, why = ws.backup_version(other, rel)
                     entry["backup"] = bak
                     if bak:
-                        entry["note"] = (f"任务 #{other['id']}（{other['user']}）先完成，"
+                        entry["note"] = (f"任务 #{other['id']}（{_who(other)}）先完成，"
                                          f"其版本已备份，磁盘保留后写入版本")
                     else:
-                        entry["note"] = (f"任务 #{other['id']}（{other['user']}）先完成，未备份"
+                        entry["note"] = (f"任务 #{other['id']}（{_who(other)}）先完成，未备份"
                                          f"（{why or '源版本已不在 .result 中'}）")
                 else:
-                    entry["note"] = f"任务 #{other['id']}（{other['user']}）同时段也在改动该文件，完成时将互相备份"
+                    entry["note"] = (f"任务 #{other['id']}（{_who(other)}）"
+                                     f"同时段也在改动该文件，完成时将互相备份")
                 if not any(c["with_task"] == other["id"] and c["file"] == rel for c in conflicts):
                     conflicts.append(entry)
                 oc = list(other["conflicts"])
                 back = {
                     "file": rel,
                     "with_task": row["id"],
-                    "with_user": row["user"],
+                    "with_user": _who(row),
                     "note": "有其它任务也在改动该文件，请人工核查",
                 }
                 if not any(c.get("with_task") == row["id"] and c.get("file") == rel for c in oc):
@@ -1281,7 +1327,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 user=principal["name"], description=body.description,
                 project=body.project or "avatar-local", targets=[],
                 priority=body.priority, resume_from=None, read_only=True,
-                status="running", engine="local", started_at=time.time())
+                status="running", engine="local", started_at=time.time(),
+                requester=body.requester[:40])
             audit.line(task_id, principal["name"], "submit_local",
                        body.description[:120])
             bus.publish(task_id, t="status", s="running")
@@ -1308,6 +1355,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             priority=body.priority,
             resume_from=body.resume_from,
             read_only=read_only,
+            requester=body.requester[:40],
         )
         audit.line(task_id, principal["name"], "submit", body.description[:120])
         bus.publish(task_id, t="status", s="queued")

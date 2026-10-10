@@ -48,11 +48,15 @@ class RelayClient:
             return {"_error": "conn", "_detail": str(e)[:200]}
 
     def create_task(self, description: str, resume_from=None,
-                    project: str = "relay-avatar") -> dict:
+                    project: str = "relay-avatar", requester: str = "") -> dict:
         body = {"description": description, "priority": "normal",
                 "project": project}
         if resume_from:
             body["resume_from"] = resume_from
+        if requester:
+            # 真实发起人。relay 侧 user 恒为机器人（全机队共用一个 token），
+            # 不带这个字段就看不出任务是谁提的，冲突归因也会指向机器人自己。
+            body["requester"] = requester
         return self.req("POST", "/tasks", body)
 
     def get_task(self, tid) -> dict:
@@ -69,11 +73,13 @@ class RelayClient:
 
     # ---- local 影子记录（只登记不派发，让 local 任务在任务列表可见）----
 
-    def create_local_record(self, description: str) -> dict:
+    def create_local_record(self, description: str, requester: str = "") -> dict:
         """建 local 影子记录。relay 不执行它，终态由 report_local_status 回报。"""
-        return self.req("POST", "/tasks",
-                        {"description": description, "priority": "normal",
-                         "project": "avatar-local", "backend": "local"})
+        body = {"description": description, "priority": "normal",
+                "project": "avatar-local", "backend": "local"}
+        if requester:
+            body["requester"] = requester
+        return self.req("POST", "/tasks", body)
 
     def report_local_status(self, tid, status: str, result: str = "",
                             error: str = "", tokens: int = 0,
