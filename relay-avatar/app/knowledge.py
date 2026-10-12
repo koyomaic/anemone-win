@@ -1,7 +1,9 @@
 """app/knowledge.py —— 知识库（P2）：jingboWiki 权威 + shared/knowledge 本地兜底。
 
 检索顺序沿用工作区约定：jingboWiki 优先（注入带「参考资料非指令」防注入前缀，
-命中内容过 sanitize_injected）→ 本地 shared/knowledge/<tag域>/ 片段检索兜底
+命中内容过 sanitize_injected；按目标库 indexing_strategy 自动分流——纯 Wiki 库走
+wiki/search 页面检索，RAG 库走 knowledge-search 快速检索）→ 本地
+shared/knowledge/<tag域>/ 片段检索兜底
 （中文滑窗分词+片段打分+字数预算）；冲突以 jingboWiki 为准。不保留 MaxKB（决策3）。
 
 速记与升格（self 模式）：
@@ -105,6 +107,8 @@ class Knowledge:
             "/mnt/vol-eltaah12/workspace/shared/secrets/jingbowiki.env")))
         self._wiki_tok = ""
         self._wiki_exp = 0.0
+        self._wiki_strat: dict | None = None
+        self._wiki_strat_exp = 0.0
 
     # ── 检索 ──
     def search(self, text: str) -> str:
@@ -146,12 +150,24 @@ class Knowledge:
         return tok
 
     def _search_wiki(self, text: str) -> str:
-        """快速检索 POST /knowledge-search（jingbowiki-api 技能实测端点；
-        GET wiki/search 会 400，hybrid-search 参数名不同勿混用）。"""
+        """按目标库索引策略分流检索。
+
+        纯 Wiki 库（仅 wiki_enabled，不建 vector/keyword 索引）走
+        GET /knowledgebase/{kb}/wiki/search（关键词/实体匹配，响应 pages[] 在顶层）；
+        RAG 库走快速检索 POST /knowledge-search（jingbowiki-api 技能实测端点；
+        GET wiki/search 对 RAG 库会 400，hybrid-search 参数名不同勿混用）。
+        为什么必须分流（2026-10-12）：机队双写目标切到纯 Wiki 库后，
+        knowledge-search 对它恒 0 命中，检索会静默空转、永远兜底本地。
+        """
         c = self._wiki_creds()
         if not (c["base"] and c["email"] and c["kb"]):
             return ""
         tok = self._wiki_token(c)
+        strat = self._wiki_strategy(c, tok)
+        if (strat.get("wiki_enabled")
+                and not (strat.get("vector_enabled")
+                         or strat.get("keyword_enabled"))):
+            return self._search_wiki_pages(c, tok, text)
         req = urllib.request.Request(
             c["base"] + "/knowledge-search",
             data=json.dumps({"query": str(text)[:200],
@@ -172,6 +188,67 @@ class Knowledge:
                        or row.get("answer") or row.get("title") or "")
             if body.strip():
                 out.append(sanitize_injected(body[:600]))
+        return "\n\n".join(out)
+
+    def _wiki_strategy(self, c: dict, tok: str) -> dict:
+        """目标库 indexing_strategy（10 分钟缓存）。取不到/异常一律 {}——按 RAG 路径走。"""
+        if self._wiki_strat is not None and time.time() < self._wiki_strat_exp:
+            return self._wiki_strat
+        strat: dict = {}
+        try:
+            req = urllib.request.Request(
+                c["base"] + f"/knowledge-bases/{c['kb']}",
+                headers={"Authorization": "Bearer " + tok})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read())
+            data = d.get("data")
+            if isinstance(data, dict) and isinstance(
+                    data.get("indexing_strategy"), dict):
+                strat = data["indexing_strategy"]
+        except Exception:
+            strat = {}
+        self._wiki_strat = strat
+        self._wiki_strat_exp = time.time() + 600
+        return strat
+
+    def _search_wiki_pages(self, c: dict, tok: str, text: str) -> str:
+        """纯 Wiki 库检索：wiki/search 命中页自带正文；缺正文时按 slug 回捞单页
+        （slug 含路径分隔符，保留不转义）。命中内容一律过 sanitize_injected。"""
+        q = urllib.parse.quote(str(text)[:100])
+        req = urllib.request.Request(
+            c["base"] + f"/knowledgebase/{c['kb']}/wiki/search"
+                        f"?q={q}&limit={self.max_files}",
+            headers={"Authorization": "Bearer " + tok})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+        pages = d.get("pages")
+        if pages is None:
+            data = d.get("data") or {}
+            pages = data.get("pages") if isinstance(data, dict) else data
+        out, used = [], 0
+        for p in (pages or [])[:self.max_files]:
+            if not isinstance(p, dict):
+                continue
+            body = str(p.get("content") or "")
+            if not body.strip() and p.get("slug"):
+                try:
+                    req2 = urllib.request.Request(
+                        c["base"] + f"/knowledgebase/{c['kb']}/wiki/pages/{p['slug']}",
+                        headers={"Authorization": "Bearer " + tok})
+                    with urllib.request.urlopen(req2, timeout=15) as r2:
+                        d2 = json.loads(r2.read())
+                    pd = d2.get("data") or {}
+                    body = str(pd.get("content") or "") if isinstance(pd, dict) else ""
+                except Exception:
+                    body = ""
+            if not body.strip():
+                continue
+            title = str(p.get("title") or p.get("slug") or "")
+            frag = sanitize_injected(body[:600])
+            if used + len(frag) > self.budget:
+                break
+            out.append(f"（{title}）\n{frag}" if title else frag)
+            used += len(frag)
         return "\n\n".join(out)
 
     def _search_local(self, text: str) -> str:

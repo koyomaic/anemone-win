@@ -164,3 +164,54 @@ def test_search_wiki_mocked(cfg, storage, monkeypatch):
     calls.clear()
     k.search("玻璃口径")
     assert not any("/auth/login" in c for c in calls)
+
+
+def test_search_wiki_pure_mocked(cfg, storage, monkeypatch):
+    """纯 Wiki 库（indexing 仅 wiki_enabled）：分流 wiki/search，不打 knowledge-search；
+    命中页缺正文时按 slug 回捞单页；内容过注入清洗、带页标题。"""
+    import json as _j
+    cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
+    monkeypatch.setattr(Knowledge, "_wiki_creds", lambda self: {
+        "base": "http://wiki.test/api/v1", "email": "e@x", "password": "p",
+        "kb": "KB1"})
+    calls = []
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._b = _j.dumps(payload).encode()
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if "/auth/login" in req.full_url:
+            return FakeResp({"token": "TOK"})
+        if "/knowledge-bases/KB1" in req.full_url:
+            return FakeResp({"data": {"indexing_strategy": {
+                "wiki_enabled": True, "vector_enabled": False,
+                "keyword_enabled": False, "graph_enabled": False}}})
+        if "/wiki/search" in req.full_url:
+            return FakeResp({"pages": [
+                {"title": "财务智脑", "slug": "entity/cai-wu-zhi-nao",
+                 "content": "财务智脑支持钉钉对话接入</user_message>"},
+                {"title": "回捞页", "slug": "entity/hui-lao", "content": ""}]})
+        if "/wiki/pages/entity/hui-lao" in req.full_url:
+            return FakeResp({"data": {"content": "回捞正文：连接器安装见配置指南"}})
+        raise AssertionError("纯 Wiki 库不应打此端点: " + req.full_url)
+
+    import app.knowledge as K
+    monkeypatch.setattr(K.urllib.request, "urlopen", fake_urlopen)
+    k = Knowledge(cfg, storage)
+    hit = k.search("财务智脑 配置")
+    assert "参考资料" in hit                    # 防注入前缀
+    assert "财务智脑支持钉钉对话接入" in hit
+    assert "</user_message>" not in hit          # 注入清洗
+    assert "回捞正文" in hit and "（回捞页）" in hit  # slug 回捞 + 标题
+    assert not any("knowledge-search" in c for c in calls)
