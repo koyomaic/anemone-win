@@ -73,6 +73,30 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 
 08:30 这个点是刻意错开 08:00 的 `daily-report.timer`（同样查 `RELAY_DB`，避免并发争库）。
 
+### 机队默认**不开启**（2026-10-12 用户指示）
+
+其他机队成员默认先不做定时。provision 19d 照样安装两个单元（版本受控、便于一键开启），
+但只有本机 `boot.env` 显式设 `USAGE_REPORT_TIMER=1` 才 `enable`；设回 0（或不设）时
+下一轮 provision 会 `disable`，使机队收敛到未开启。
+
+| flag | 当前状态 | install 模式动作 |
+|---|---|---|
+| `1` | 已启用 | 无动作 |
+| `1` | 未启用 | `enable --now` |
+| `0`/未设 | 已启用 | `disable --now`（收敛到关） |
+| `0`/未设 | 未启用 | 无动作 |
+
+八种组合（含 check 模式）已用 mock systemctl 逐一验证。本机 `i-ll733rsj` 是首发机，
+`boot.env` 里设了 `USAGE_REPORT_TIMER=1`。
+
+**别的机器要开启，除了设 flag 还需两件事**（否则日报出不来或发错人）：
+
+1. **自建 relay 渲染计划**——各机 relay 库是**独立实例**，计划不共享，本机建的计划 #12
+   在其他机器上不存在。description 可直接抄计划 #12（`SELECT action FROM plans WHERE id=12`）。
+2. **配本机收件人** `<workspace>/avatar/usage-report-recipients.json`。不配则
+   `recipients.py` 从该机 `policy.toml` 的 `owner_userid`＋`superadmin` 派生，
+   推给的是**那台机器的业务负责人**——他未必想要这份日报，这也是默认不开的原因之一。
+
 ### 计划 #12 的失败处置
 
 计划描述里写死了：**facts 缺失或 `source != pg_authoritative` 时，不许自己跑采集补救**，
@@ -89,7 +113,9 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 | `boot/usage-collect.sh` | `/opt/team/relay-boot/`（chmod 700） | 19d |
 | `boot/ludashi-usage-collect.service.template` | `/etc/systemd/system/…service`（render `__WORKSPACE__`/`__VENV__`） | 19d |
 | `boot/ludashi-usage-collect.timer` | `/etc/systemd/system/…timer` | 19d |
+| `boot.env` 的 `USAGE_REPORT_TIMER` | 每机一份、不入库、存在即不覆盖 | 12（生成）／19d（消费） |
 | 本技能全部文件 | `shared/skills/ludashi-usage-daily-report/` | 21b |
+| `avatar/usage-report-recipients.json` | 本机收件人，**不在技能目录内**（见铁律 8） | 不同步 |
 
 `ludashi-usage-collect.service` 刻意**不加** `InaccessiblePaths`——它的全部意义就是能读
 `relay.env`，与沙箱内任务单元的边界正好相反。凭据只存在于进程环境，不落产物、不打日志。

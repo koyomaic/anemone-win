@@ -223,6 +223,8 @@ HEALTH_URL=$HEALTH_URL
 KEEP=3
 LOG=/opt/team/relay-deploy/boot.log
 ALERT_TO=$ALERT_TO
+# 使用日报预采集定时器：机队默认不开（详见 boot.env.example 的同名项说明）
+USAGE_REPORT_TIMER=0
 EOF
   ok "已生成"
 else bad "缺失"; fi
@@ -374,6 +376,9 @@ else bad "未启用"; fi
 # 静默降级成 logs_only（日报只剩入站消息数，任务级/用户级全空）。
 # 08:30 跑，错开 08:00 的 daily-report（同查 RELAY_DB，避免并发争库）。
 # 依赖 21b 先把技能同步到 shared/skills；本步只装触发器，采集器本体在技能里。
+# **机队默认不开启**：单元照装但只在 boot.env 设 USAGE_REPORT_TIMER=1 的机器上 enable
+# （用户 2026-10-12 指示）。各机 relay 库是独立实例，故计划与定时器都是本机范围，
+# 不存在跨机抢占；但其他机器的业务负责人未必想要这份日报，故不替他们打开。
 step "usage-collect脚本"
 if [ -f "$BOOT_DIR/usage-collect.sh" ] && cmp -s "$RES_ROOT/boot/usage-collect.sh" "$BOOT_DIR/usage-collect.sh"; then ok
 elif heal; then
@@ -383,12 +388,26 @@ else bad "缺失"; fi
 sync_unit "ludashi-usage-collect.service" "$RES_ROOT/boot/ludashi-usage-collect.service.template" ludashi-usage-collect.service render no
 sync_unit "ludashi-usage-collect.timer"   "$RES_ROOT/boot/ludashi-usage-collect.timer"            ludashi-usage-collect.timer   copy   no
 step "usage-collect定时器"
-if systemctl is-enabled --quiet ludashi-usage-collect.timer 2>/dev/null && systemctl is-active --quiet ludashi-usage-collect.timer; then ok
-elif heal; then
-  miss "启用"
-  systemctl enable --now ludashi-usage-collect.timer 2>/dev/null
-  systemctl is-active --quiet ludashi-usage-collect.timer && ok "已启用" || bad "无法激活"
-else bad "未启用"; fi
+# 机队默认**不开**（用户 2026-10-12 指示：其他机队成员默认先不做定时，或定时不开启）。
+# 单元照装（版本受控、便于一键开启），但只有本机 boot.env 显式设 USAGE_REPORT_TIMER=1
+# 才 enable。否则若已启用则停用，使机队收敛到「未开启」——避免其他机器天天采集并推送
+# 给各自 policy 派生出的收件人（那台的业务负责人未必想要这份日报）。
+if [ "${USAGE_REPORT_TIMER:-0}" = "1" ]; then
+  if systemctl is-enabled --quiet ludashi-usage-collect.timer 2>/dev/null && systemctl is-active --quiet ludashi-usage-collect.timer; then ok "已启用（USAGE_REPORT_TIMER=1）"
+  elif heal; then
+    miss "启用（本机 USAGE_REPORT_TIMER=1）"
+    systemctl enable --now ludashi-usage-collect.timer 2>/dev/null
+    systemctl is-active --quiet ludashi-usage-collect.timer && ok "已启用" || bad "无法激活"
+  else bad "未启用（本机要求开启）"; fi
+else
+  if systemctl is-enabled --quiet ludashi-usage-collect.timer 2>/dev/null; then
+    if heal; then
+      miss "按机队默认停用（USAGE_REPORT_TIMER≠1）"
+      systemctl disable --now ludashi-usage-collect.timer 2>/dev/null
+      ok "已停用（单元仍在；boot.env 设 USAGE_REPORT_TIMER=1 即开启）"
+    else warn "已启用但 USAGE_REPORT_TIMER≠1（install 模式将停用）"; fi
+  else ok "按机队默认未启用（boot.env 设 USAGE_REPORT_TIMER=1 可开启）"; fi
+fi
 
 # ---------- 20 opencode.jsonc（模型 provider+密钥，SOFT） ----------
 step "opencode.jsonc"
