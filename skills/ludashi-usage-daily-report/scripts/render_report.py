@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import sys
 
@@ -28,26 +29,9 @@ STATUS_CN = {"done": "完成", "failed": "失败", "cancelled": "中断",
              "review": "待复核", "conflict": "冲突待裁", "queued": "排队", "running": "执行中"}
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
-# 需求类型自动归类：按关键词命中，命中不了才留待填。标「(自动)」提示可人工覆盖。
-TOPIC_RULES = [
-    ("数据归档/台账", ("归档", "台账", "补登记", "落盘", "store add")),
-    ("文件接收/暂存", ("已收到《", "暂存", "不支持的文件类型")),
-    ("预算/目标设定", ("预算", "目标设定", "限额", "经营计划")),
-    ("行情/价格预测", ("预测", "行情", "价格", "原油", "成品油", "头寸")),
-    ("审核/复核", ("审核", "复核", "校验", "核对")),
-    ("权限/名单查询", ("权限", "名单", "白名单", "授权")),
-    ("报告/方案撰写", ("报告", "大纲", "方案", "研判", "建议")),
-    ("投递/转发", ("撤回", "单独发给", "发到", "转发")),
-    ("系统/元操作", ("你能做什么", "能力清单", "说人话")),
-]
-
-
-def topic_of(desc: str) -> str:
-    d = desc or ""
-    for label, kws in TOPIC_RULES:
-        if any(k in d for k in kws):
-            return f"{label}(自动)"
-    return "{{待填：需求类型}}"
+# 需求类型由采集器归类后放进 facts 的 topic 字段（原文不出采集器，见 usage_collect.TOPIC_RULES）。
+# 渲染器只消费类别，不再自己分类——否则原文得先流到这一层，违背数据最小化。
+TOPIC_OTHER = "其他/未归类"
 
 
 def idx_mark(i: int) -> str:
@@ -177,7 +161,7 @@ def render(f: dict, mode: str) -> str:
         ["重点用户活跃", f"{n(k.get('active'))}/{n(k.get('roster_size'))}",
          d_(k.get("active"), k.get("prev_active")), f"活跃率 {n(k.get('active_rate'))}%"],
         ["交付成功率（提问级）", f"{n(t.get('q_success_rate'))}%", dp(t.get("q_success_rate"), p.get("q_success_rate")),
-         f"失败 {n(t.get('q_failed'))}、中断 {n(t.get('q_cancelled'))}"],
+         f"失败 {n(t.get('q_failed'))}、中断 {n(t.get('q_cancelled'))}、待复核 {n(t.get('q_review'))}"],
         ["cron 占比", f"{n(round((t.get('by_source') or {}).get('cron',0)*100.0/t['task_rows'],1)) if t.get('task_rows') else '-'}%",
          "-", "周末基线见下" if weekend else "工作日基线"],
         ["入站消息数（钉钉）", n(lg.get("inbound_msgs")), "-",
@@ -308,7 +292,13 @@ def render(f: dict, mode: str) -> str:
     L.append("> **填写说明**：按提问数降序（同数按 token 降序）。")
     L.append("")
 
-    L.append("### 3.3 当日会话清单与交付（结构化卡片）")
+    L.append("### 3.3 当日会话清单（结构化卡片）")
+    L.append("")
+    L.append("> **数据最小化**：本文件**不留存**用户提问原文与交付正文——报告要落 "
+             "`shared/report/` 并进台账（机队可见、长期留存），而原文含预算数字、期货策略、"
+             "头寸限额等经营敏感信息，不该随使用度量一起持久化。故每张卡片只记"
+             "**需求类型（自动归类）＋提问长度＋时效＋状态**；要看具体内容请回原任务"
+             "（卡片里给了任务行号，可 `store q --task <id>` 或查 relay 台账追溯）。")
     L.append("")
     if not qs:
         L.append("当日无人工会话。")
@@ -317,23 +307,20 @@ def render(f: dict, mode: str) -> str:
         if q.get("start_ts") and q.get("end_ts"):
             dur = round(q["end_ts"] - q["start_ts"])
         st = STATUS_CN.get(q.get("status"), q.get("status") or "-")
-        L.append(f"**{idx_mark(i)} {q['who']}（{q['source']}）· {topic_of(q.get('core'))}**")
+        L.append(f"**{idx_mark(i)} {q['who']}（{q['source']}）· {q.get('topic') or TOPIC_OTHER}**")
         L.append("")
         proj = ", ".join(q.get("projects") or []) or "-"
         L.append(f"- **时间/轮次**：{q.get('start','-')} 至 {q.get('end','-')}"
                  f"｜任务行 {'+'.join(str(x) for x in (q.get('task_rows') or []))}（{proj}）")
-        L.append(f"- **需求**：{(q.get('core') or '')[:150]}")
-        rh = (q.get("result_head") or "").strip()
-        L.append(f"- **交付**：{rh[:220] if rh else '{{待填：给出结论/关键数值，分号分隔}}'}")
+        L.append(f"- **提问规模**：{q.get('desc_len', 0)} 字（原文不留存）")
         L.append(f"- **耗时/时效**：{f'{dur//60}分{dur%60}秒' if dur else '未完成/无记录'}"
                  f"｜engine={q.get('engine') or '-'}｜token={q.get('tokens',0):,}")
         L.append(f"- **状态**：{st}")
         err = (q.get("error") or "").strip()
-        if err:
-            # 完成态任务里残留的 error 多是历史提示（如「升级 relay 门禁」），不是失败原因，
-            # 分开标注，避免让领导误读成交付失败。
-            label = "备注" if q.get("status") != "done" else "遗留提示（任务已完成）"
-            L.append(f"- **{label}**：`{err[:180]}`")
+        if err and q.get("status") != "done":
+            # 只在非完成态显示 error：完成态里残留的多是历史提示（如「升级 relay 门禁」），
+            # 不是失败原因，显示出来会让领导误读成交付有问题。
+            L.append(f"- **备注**：`{err[:180]}`")
         L.append("")
 
     sysq = [q for q in qs if q["who"] == "unknown"]
@@ -369,17 +356,31 @@ def render(f: dict, mode: str) -> str:
     L.append("")
     L.append("### 4.2 有活动重点用户详情")
     L.append("")
+    L.append("> 同样不留提问原文，只给**用量画像**：时段、需求类型构成、状态构成、耗时与 token。")
+    L.append("")
     act = k.get("active_names") or {}
     if not act:
         L.append("**当日无。**")
     else:
         for name, cnt in sorted(act.items(), key=lambda x: -x[1]):
             mine = [q for q in qs if q["who"] == name]
-            L.append(f"**{name}**（{cnt} 条提问）")
+            if not mine:
+                continue
+            topics = collections.Counter(q.get("topic") or TOPIC_OTHER for q in mine)
+            stats = collections.Counter(STATUS_CN.get(q.get("status"), q.get("status") or "-")
+                                        for q in mine)
+            toks = sum(q.get("tokens", 0) for q in mine)
+            durs = [round(q["end_ts"] - q["start_ts"]) for q in mine
+                    if q.get("start_ts") and q.get("end_ts")]
+            span = f"{mine[0].get('start','-')}–{mine[-1].get('end','-')}"
+            L.append(f"**{name}**（{cnt} 条提问｜{span}）")
             L.append("")
-            for q in mine:
-                st = STATUS_CN.get(q.get("status"), q.get("status") or "-")
-                L.append(f"- {q.get('start','-')}–{q.get('end','-')}｜{st}｜{(q.get('core') or '')[:90]}")
+            L.append(f"- 需求类型：{'、'.join(f'{t}×{c}' for t, c in topics.most_common())}")
+            L.append(f"- 状态：{'、'.join(f'{s}×{c}' for s, c in stats.most_common())}")
+            avg = round(sum(durs) / len(durs)) if durs else None
+            L.append(f"- 耗时：均 {f'{avg//60}分{avg%60}秒' if avg is not None else '-'}"
+                     f"｜最长 {f'{max(durs)//60}分{max(durs)%60}秒' if durs else '-'}"
+                     f"｜token {toks:,}")
             L.append("")
     L.append("")
     L.append("### 4.3 当日无活动重点用户（静默追踪）")
@@ -491,18 +492,79 @@ def render(f: dict, mode: str) -> str:
     return "\n".join(L)
 
 
+def render_summary(f: dict) -> str:
+    """推送用摘要：只聚焦**用户使用量**，不含任何任务原文。
+
+    2026-10-12 用户指示：推送一律「摘要＋文件」，摘要聚焦使用量、再精简。
+    故这里刻意不放第 5 节观察与建议整表（那是文件里的内容），异常压成一行。
+    """
+    pg = f.get("pg") or {}
+    lg = f.get("logs") or {}
+    date = f["report_date"]
+    wk = f.get("weekday", "")
+    trade = "非交易日" if f.get("is_weekend") else "交易日"
+
+    if not pg.get("ok"):
+        return (f"**鲁大师用户日度使用分析（{date} {wk}）**\n\n"
+                f"**[降级]** {(f.get('degraded') or ['PG 不可用'])[0]}\n"
+                f"当日仅有机日志口径：入站消息 {lg.get('inbound_msgs', 0)} 条、"
+                f"审计异常 {len(lg.get('anomalies') or [])} 项。任务级与用户级指标缺失，"
+                f"不可用于经营判断，请查 /var/log/ludashi-usage-collect.log。")
+
+    t = pg["today"]
+    p = pg.get("prev") or {}
+    k = pg.get("key_users") or {}
+    bs = t.get("by_source") or {}
+
+    top = [(w, c) for w, c in (t.get("humans") or {}).items() if w != "unknown"]
+    top = sorted(top, key=lambda x: -x[1])[:5]
+    anom = collections.Counter(a["action"] for a in (lg.get("anomalies") or []))
+    anom_txt = "；".join(f"{a} ×{c}" for a, c in anom.most_common(3)) or "无"
+    if f.get("is_weekend"):
+        anom_txt = "[周末基线] 低活跃属正常节律，不与工作日同比" + (f"；{anom_txt}" if anom else "")
+
+    chan = " · ".join(f"{SRC_LABEL.get(s, s).split('（')[0]} {c} 行"
+                      for s, c in sorted(bs.items(), key=lambda x: -x[1]) if c)
+    per = round(t["questions"] / t["active_users"], 1) if t.get("active_users") else "-"
+
+    L = [
+        f"**鲁大师用户日度使用分析（{date} {wk}·{trade}）**",
+        "",
+        f"**用量**：人工提问 **{t.get('questions', 0)}** 条（环比 {d_(t.get('questions'), p.get('questions'))}）"
+        f"｜活跃 **{t.get('active_users', 0)}** 人｜人均 {per} 条",
+        f"**重点用户**：{k.get('active', 0)}/{k.get('roster_size', 0)} 活跃"
+        f"（{k.get('active_rate', '-')}%）｜静默 {len([s for s in (k.get('silence') or []) if not s.get('active_today')])} 人",
+        f"**渠道**：{chan or '-'}（任务行 {t.get('task_rows', 0)}，影子执行去重后 {t.get('questions', 0)} 条提问）",
+        f"**交付**：提问级成功率 **{t.get('q_success_rate', '-')}%**"
+        f"（失败 {t.get('q_failed', 0)}、中断 {t.get('q_cancelled', 0)}、待复核 {t.get('q_review', 0)}）",
+        f"**Top 用户**：{' · '.join(f'{w} {c}' for w, c in top) or '当日无人工提问'}",
+        f"**入站消息**：{lg.get('inbound_msgs', 0)} 条"
+        f"（{'、'.join(f'{a}{b}' for a, b in (lg.get('inbound_kinds') or {}).items())}）"
+        f"｜多轮会话 {lg.get('multi_round_sessions', 0)} 个",
+        f"**异常/提示**：{anom_txt}",
+        "",
+        "完整件见附件——按数据最小化要求，**文件不留存用户提问原文与交付正文**，"
+        "只记需求类型、时效、状态与用量；需追溯具体内容可用卡片里的任务行号查 relay 台账。",
+    ]
+    return "\n".join(L)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="渲染鲁大师用户日度使用分析报告")
     ap.add_argument("--facts", required=True)
     ap.add_argument("--out")
     ap.add_argument("--mode", default="自动-skill", help="人工 / 自动-skill")
+    ap.add_argument("--summary", action="store_true",
+                    help="只输出推送用摘要（聚焦用户使用量，不含任务原文）；推送一律「摘要＋文件」")
     a = ap.parse_args()
     f = json.load(open(a.facts, encoding="utf-8"))
-    md = render(f, a.mode)
+    md = render_summary(f) if a.summary else render(f, a.mode)
     if a.out:
         open(a.out, "w", encoding="utf-8").write(md)
         todo = md.count("{{待填")
-        print(f"report → {a.out}  ({len(md)} bytes, {todo} 处待填叙述位)", file=sys.stderr)
+        kind = "summary" if a.summary else "report"
+        extra = "" if a.summary else f", {todo} 处待填叙述位"
+        print(f"{kind} → {a.out}  ({len(md)} 字符{extra})", file=sys.stderr)
     else:
         print(md)
     return 0

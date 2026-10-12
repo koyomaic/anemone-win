@@ -55,6 +55,34 @@ DINGTALK_PROJECTS = {"avatar-local", "relay-avatar"}
 # relay 侧代投任务描述里追加的投递铁律尾巴，去重前剥掉
 DESC_TAIL = re.compile(r"\s*---\s*【投递铁律.*$", re.S)
 
+# 需求类型归类：只输出**类别**，不输出用户原文。
+# 数据最小化要求（2026-10-12 用户指示）：日报文件不留存具体用户的任务内容——
+# 报告要落 shared/report/ 并进台账（机队可见、长期留存），而提问原文与交付正文里
+# 含预算数字、期货策略、头寸限额等经营敏感信息，不该随使用度量一起持久化。
+# 故采集阶段就把原文压成类别，facts.json 与报告文件里都不出现原文。
+TOPIC_RULES = [
+    ("数据归档/台账", ("归档", "台账", "补登记", "落盘", "store add")),
+    ("文件接收/暂存", ("已收到《", "暂存", "不支持的文件类型")),
+    ("预算/目标设定", ("预算", "目标设定", "限额", "经营计划")),
+    ("行情/价格预测", ("预测", "行情", "价格", "原油", "成品油", "头寸")),
+    ("审核/复核", ("审核", "复核", "校验", "核对")),
+    ("权限/名单查询", ("权限", "名单", "白名单", "授权")),
+    ("报告/方案撰写", ("报告", "大纲", "方案", "研判", "建议")),
+    ("投递/转发", ("撤回", "单独发给", "发到", "转发")),
+    ("图片/附件消息", ("[图片消息]", "mediaId")),
+    ("系统/元操作", ("你能做什么", "能力清单", "说人话")),
+]
+TOPIC_OTHER = "其他/未归类"
+
+
+def topic_of(desc: str) -> str:
+    """把提问原文压成需求类型类别（原文不出采集器）。"""
+    d = desc or ""
+    for label, kws in TOPIC_RULES:
+        if any(k in d for k in kws):
+            return label
+    return TOPIC_OTHER
+
 
 # ---------------------------------------------------------------- 基础工具
 def load_env() -> None:
@@ -203,7 +231,7 @@ def load_audit_last_seen(cutoff: float | None = None) -> dict:
 
 # ---------------------------------------------------------------- PG 采集
 def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dict,
-               audit_last: dict) -> dict:
+               audit_last: dict, keep_content: bool = False) -> dict:
     try:
         import psycopg2
     except ImportError:
@@ -299,7 +327,7 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
         u = (t.get("user") or "").strip()
         return u if u and u not in SYSTEM_ACCOUNTS else ""
 
-    def summarize(items: list[dict]) -> dict:
+    def summarize(items: list[dict], keep_content: bool = False) -> dict:
         by_src = collections.Counter()
         by_status = collections.Counter()
         by_engine = collections.Counter()
@@ -329,28 +357,36 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
                                              t["finished_at"] > questions[key]["end_ts"]):
                     questions[key]["end"] = fmt_ts(t["finished_at"])
                     questions[key]["end_ts"] = float(t["finished_at"])
-                # 影子对里哪一行有产出就用哪一行的结论
-                if not questions[key].get("result_head"):
-                    questions[key]["result_head"] = re.sub(
+                # 影子对里哪一行有产出就用哪一行的（仅排障模式下才留原文）
+                if keep_content and not questions[key].get("_result_head"):
+                    questions[key]["_result_head"] = re.sub(
                         r"\s+", " ", (t.get("result") or "")).strip()[:400]
                 if not questions[key].get("error"):
-                    questions[key]["error"] = (t.get("error") or "").strip()[:300]
+                    questions[key]["error"] = (t.get("error") or "").strip()[:200]
                 questions[key]["tokens"] += int(t.get("tokens") or 0)
                 questions[key]["cost"] += float(t.get("cost") or 0)
+                questions[key]["desc_len"] = max(
+                    questions[key]["desc_len"],
+                    len(re.sub(r"\s+", "", DESC_TAIL.sub("", t.get("description") or ""))))
             else:
                 humans[w] += 1
-                res = re.sub(r"\s+", " ", (t.get("result") or "")).strip()
+                raw_desc = t.get("description") or ""
                 questions[key] = {
-                    "who": w, "source": src, "core": core,
-                    "desc": (t.get("description") or "").strip(),
+                    "who": w, "source": src,
+                    # 只留类别与长度，不留原文（数据最小化，见 TOPIC_RULES 注释）
+                    "topic": topic_of(raw_desc),
+                    "desc_len": len(re.sub(r"\s+", "", DESC_TAIL.sub("", raw_desc))),
                     "task_rows": [t["id"]], "projects": {(t.get("project") or "").strip()},
                     "status": t.get("status"), "engine": t.get("engine") or "",
                     "start": fmt_ts(t.get("created_at")), "start_ts": float(t.get("created_at") or 0),
                     "end": fmt_ts(t.get("finished_at")), "end_ts": float(t.get("finished_at") or 0),
-                    "error": (t.get("error") or "").strip()[:300],
-                    "result_head": res[:400],
+                    "error": (t.get("error") or "").strip()[:200],
                     "tokens": int(t.get("tokens") or 0), "cost": float(t.get("cost") or 0),
                 }
+                if keep_content:      # 仅排障用，默认关；开了就别把 facts 交出去
+                    questions[key]["_desc"] = raw_desc.strip()
+                    questions[key]["_result_head"] = re.sub(
+                        r"\s+", " ", (t.get("result") or "")).strip()[:400]
         total = len(items)
         done = by_status.get("done", 0)
         qs = list(questions.values())
@@ -370,13 +406,17 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
             "q_done": q_done,
             "q_failed": sum(1 for x in qs if x["status"] == "failed"),
             "q_cancelled": sum(1 for x in qs if x["status"] == "cancelled"),
+            # 提问级的待复核/冲突：摘要里跟「提问级成功率」并列展示，
+            # 不能混用行级的 review/conflict（影子对会让行级数翻倍）。
+            "q_review": sum(1 for x in qs if x["status"] == "review"),
+            "q_conflict": sum(1 for x in qs if x["status"] == "conflict"),
             "active_users": len([h for h in humans if h != "unknown"]),
             "humans": dict(humans.most_common()),
             "_questions": qs,
         }
 
-    cur_sum = summarize(tasks)
-    prev_sum = summarize(prev_tasks)
+    cur_sum = summarize(tasks, keep_content)
+    prev_sum = summarize(prev_tasks, keep_content)
     qs = cur_sum.pop("_questions")
     prev_sum.pop("_questions", None)
     # set 不能直接 JSON 序列化（default=str 会把它变成字符串，渲染时被逐字符迭代）
@@ -531,6 +571,8 @@ def main() -> int:
     ap.add_argument("--out", help="JSON 输出路径（默认 stdout）")
     ap.add_argument("--no-pg", action="store_true", help="跳过 PG，仅用本机日志")
     ap.add_argument("--roster", help="重点用户名单路径")
+    ap.add_argument("--keep-content", action="store_true",
+                    help="排障用：在 facts 里保留提问原文与交付正文（_desc/_result_head）。\n默认关闭——日报要落 shared/report 并进台账，不得留存用户任务内容。开了就别外发 facts。")
     args = ap.parse_args()
 
     today = dt.datetime.now(TZ).date()
@@ -558,7 +600,8 @@ def main() -> int:
         "degraded": [], "gaps": [],
     }
 
-    pg = None if args.no_pg else collect_pg(date, prev, roster, audit_actor, audit_last)
+    pg = None if args.no_pg else collect_pg(date, prev, roster, audit_actor,
+                                                audit_last, args.keep_content)
     if pg and pg.get("ok"):
         facts["pg"] = pg
         facts["source"] = "pg_authoritative"

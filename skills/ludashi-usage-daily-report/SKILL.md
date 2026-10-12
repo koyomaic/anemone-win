@@ -15,6 +15,13 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 3. **`{{待填：…}}` 标记必须由你补齐**后才能交付；补不齐就保留标记并说明原因，不要用套话填。
 4. **第 5 节每条「发现」必须带当天数据支撑**，不许写"建议加强用户运营"这类空话。
 5. 报告落盘后**必须**登记台账（`store add`），否则算未完成。
+6. **不留存用户任务内容**（2026-10-12 用户指示）。报告要落 `shared/report/` 并进台账
+   （机队可见、长期留存），而提问原文与交付正文里含预算数字、期货策略、头寸限额等
+   经营敏感信息，不该随使用度量一起持久化。采集器已把原文压成**需求类型类别**，
+   facts.json 与报告文件里都不出现原文——**不要想办法把原文捞回来**
+   （`--keep-content` 只供排障，开了就别外发 facts）。
+7. **推送一律「摘要＋文件」**：摘要用 `render_report.py --summary` 生成（聚焦用户使用量，
+   ~430 字符），完整件作附件发。不要把整份报告塞进消息正文。
 
 ## 每日自动化：两段式（宿主机采集 → 沙箱渲染）
 
@@ -187,7 +194,7 @@ $PY $S/build_roster.py --no-dws               # 离线：跳过通讯录，沿�
 `dws` 的 profile 各机不同，`build_roster.py` 从 `dws auth status` 动态取
 （`corp_id:user_id`），不写死。企业邮箱对报告无用且属 PII，**不写入文件**。
 
-## 你要补的 7 处叙述位
+## 你要补的 5 处叙述位
 
 渲染器只填数字，判断类的留给你：
 
@@ -197,26 +204,61 @@ $PY $S/build_roster.py --no-dws               # 离线：跳过通讯录，沿�
 | 2.1 填写说明 | 点明当天主体（如「周日，人工提问为主体，22 条」） |
 | 2.2 填写说明 | 1–2 句解释主要渠道变化 |
 | 3.1 追问结构 | 与前日对比多轮会话增减 |
-| 3.3 每张卡片的「交付」 | facts 里 `result_head` 已给前 400 字，**提炼成结论/关键数值**，分号分隔；别整段照抄 |
-| 3.3 需求类型 | 已自动归类并标 `(自动)`，明显不对才改 |
 | 5 节 观察与建议 | 从渲染器给的「候选观察」里挑，补上建议动作/优先级/归属 |
 
 第 5 节的候选观察是渲染器**从数据直接算出来的**（台账登记失败次数、算力放大倍数、
 超 30 天静默人数、归属缺口等），可直接取用，但**建议动作要你自己写**。
 
-## 交付
+3.3 卡片的「需求类型」由采集器自动归类（`usage_collect.TOPIC_RULES`），不再留待填；
+归类明显不对就去改规则，别在报告里手改单条。
+
+> 模板原文 3.3 要求每张卡片有「需求」和「交付」两个字段填用户原文/结论——
+> 按铁律 6 已取消，改为「提问规模（字数）＋需求类型」。模板与实现的这处差异是**有意的**。
+
+## 交付：落盘 → 台账 → 摘要＋文件推送
 
 ```bash
-# 1) 落盘（域名用「自检报告」，系统自身运行度量最贴合）
+D=2026-10-11                                   # 报告日
+PY=/mnt/vol-eltaah12/finaagent/.venv/bin/python
+S=/mnt/vol-eltaah12/finaagent/relay-dev/skills/ludashi-usage-daily-report/scripts
 OUT=/mnt/vol-eltaah12/workspace/shared/report/自检报告/$(date +%Y-%m)
-mkdir -p $OUT
-cp /tmp/report-$D.md $OUT/$(date +%Y%m%d)_T<任务号>_鲁大师用户日度使用分析_${D}_v1.md
+F=$OUT/$(date +%Y%m%d)_T<任务号>_鲁大师用户日度使用分析_${D}_v1.md
 
-# 2) 登记台账（必须，否则算未完成）
-store add <上面的路径> --kind report --task <任务号> --topic 用户日度使用分析
+# 1) 落盘（域用「自检报告」＝系统自身运行度量，最贴合）
+mkdir -p $OUT && cp /tmp/report-$D.md "$F"
+
+# 2) 登记台账（必须，否则算未完成）。注意是 --domain 不是 --topic；同 path 重复 add 是幂等 upsert
+store add "$F" --kind report --domain 自检报告 --task <任务号> --note "报告日 $D"
+
+# 3) 生成推送摘要（聚焦用户使用量，~430 字符，不含任务原文）
+$PY $S/render_report.py --facts /tmp/facts-$D.json --summary --out /tmp/summary-$D.md
 ```
 
-需要 HTML 成品或要发钉钉时，按团队现行惯例走（`dws chat +dm --content` 用 Markdown）。
+### 推送：一律「摘要＋文件」两条消息
+
+```bash
+DWS=/root/fenshen-ludashi/bin/dws
+PROF=ding3b5622356ccdf1e2:37505774            # 各机不同，从 dws auth status 取 corp_id:user_id
+
+# ① 摘要（Markdown DM）
+$DWS chat +dm --to <收件人> --content "$(cat /tmp/summary-$D.md)" --profile $PROF --yes --format json
+
+# ② 完整件（附件）。--file 只吃**工作目录内的相对路径**，绝对路径会被拒 → 先 cd
+cd "$(dirname "$F")"
+$DWS chat +messages-send --user-query <收件人> --file "$(basename "$F")" --profile $PROF --yes --format json
+```
+
+**发完必须回读核验**，不能只看 `success: true`：
+
+```bash
+# 拿 openTaskId 换真实 messageId
+$DWS chat +messages-query-send-status --open-task-id '<openTaskId>' --profile $PROF --format json
+# 再回读会话确认内容在（默认 desc＝最新在前，取 msgs[:n] 不是 msgs[-n:]）
+$DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --format json
+```
+
+回读的 `text` 字段是**纯文本投影**，会剥掉 Markdown 表格线与反引号，所以字数比原文少
+（实测 1923 字符发出、回读 950 字）——**这不是截断**，比对末尾内容是否一致即可判断完整性。
 
 ## 常见坑
 
