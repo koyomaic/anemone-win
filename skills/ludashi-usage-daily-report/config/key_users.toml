@@ -1,0 +1,155 @@
+# 鲁大师重点用户名单（日度使用分析报告第 4 节用）
+#
+# ⚠ 模板原文写「17 人」，但全盘无该名单定义（T760 排查已确认）。
+#   本文件是按可追溯出处重建的真实名单，共 12 人。若业务方另有 17 人原始名单，
+#   直接追加 [[user]] 块即可，报告会自动按实际人数算活跃率（N/M），不写死 17。
+#
+# 出处（source 字段）：
+#   policy_owner       = policy.toml 的 owner_userid
+#   static_whitelist   = policy.toml 的 whitelist（永久有效）
+#   dynamic_grant      = run/whitelist_dynamic.json（grant_valid_days=90 会过期）
+#   historical_active  = audit.log 里出现过的真实发起人
+#
+# org/dept/title 由 dws contact user get 反查（2026-10-12），非手抄。
+# 反查不到的留空并注记，不编造。
+
+# 服务账号：有 token 但不是人，归 api_server/cron 口径，不参与用户级排名
+[[service_account]]
+name = "鲁大师"
+note = "分身本体；plans.owner_name 全是它 → 计划触发任务的 user 值"
+
+[[service_account]]
+name = "中鲁运营"
+note = "API token 账号；跑云端打包/清理等运维任务，非人工提问"
+
+[[service_account]]
+name = "舒瀚-trae"
+note = "舒瀚的 trae IDE token；如需并入舒瀚统计，在报告里做别名归并"
+
+[[service_account]]
+name = "__admin__"
+note = "管理接口调用"
+
+[[service_account]]
+name = "canary"
+note = "健康探针"
+
+[[user]]
+id = "20102"
+name = "崔成东"
+org = "京博控股集团"
+dept = "ZLRN链利润管理中心"
+title = "中心总经理"
+tier = "owner"
+source = "policy_owner"
+note = "policy.toml owner_userid；系统负责人"
+
+[[user]]
+id = "18434"
+name = "王洪彬"
+org = "京博控股集团"
+dept = "KGAI应用特别执行委员会办公室"
+title = "一级AIBP"
+tier = "L2"
+source = "static_whitelist"
+note = "policy.toml whitelist"
+
+[[user]]
+id = "40714"
+name = "邹雄"
+org = "京博控股集团"
+dept = "KG组织薪酬与人力资本管理委员会"
+title = "总经理(主岗)"
+tier = "L3"
+source = "static_whitelist"
+note = "policy.toml whitelist；总经理"
+
+[[user]]
+id = "40125"
+name = "孙瑞昱"
+org = "京博控股集团"
+dept = "SH卓越运营管理部"
+title = "三级AI数智化管理担当"
+tier = "L2"
+source = "static_whitelist"
+note = "policy.toml whitelist"
+
+[[user]]
+id = "48332"
+name = "邵磊"
+org = "京博控股集团"
+dept = "SH卓越运营管理部"
+title = "三级AI数智化管理担当"
+tier = "L2"
+source = "static_whitelist"
+note = "policy.toml whitelist"
+
+[[user]]
+id = "DJTDWXe5Omkca6fEkz0vxWVZZG4c4SxTc"
+name = "赵兴峰"
+org = ""
+dept = ""
+title = ""
+tier = "L2"
+source = "static_whitelist"
+note = "外部常驻人员；跨组织无本 corp userId，仅 openId，通讯录不可反查"
+
+[[user]]
+id = "19173"
+name = "舒瀚"
+org = "京博控股集团"
+dept = "HSRN高管层"
+title = "法定代表人兼总经理(主岗)"
+tier = "L1"
+source = "dynamic_grant"
+note = "whitelist_dynamic.json；崔成东授权"
+
+[[user]]
+id = "12139"
+name = "孔德光"
+org = "京博控股集团"
+dept = "ZLRN链利润管理部"
+title = "经理(主岗)"
+tier = "L2"
+source = "dynamic_grant"
+note = "whitelist_dynamic.json；崔成东授权"
+
+[[user]]
+id = "34718"
+name = "闫路英"
+org = "京博控股集团"
+dept = "ZLRN链利润管理部"
+title = "市场策划师岗"
+tier = "L2"
+source = "dynamic_grant"
+note = "whitelist_dynamic.json；崔成东授权"
+
+[[user]]
+id = "12223"
+name = "靳光传"
+org = ""
+dept = ""
+title = ""
+tier = "L2"
+source = "dynamic_grant"
+note = "whitelist_dynamic.json；通讯录反查返回空（数据缺口）"
+
+[[user]]
+id = "23518"
+name = "王思义"
+org = "京博控股集团"
+dept = "ZLRN链利润管理部"
+title = "市场策划师岗"
+tier = "L2"
+source = "dynamic_grant"
+note = "whitelist_dynamic.json；管理员授权"
+
+[[user]]
+id = "18377"
+name = "毕倩"
+org = "京博控股集团"
+dept = "SH卓越运营管理部"
+title = "二级AI数智化管理担当"
+tier = "-"
+source = "historical_active"
+note = "audit.log 历史活跃发起人；未在白名单"
