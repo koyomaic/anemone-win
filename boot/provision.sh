@@ -541,11 +541,101 @@ else
       rc=$?
       [ "$rc" = 0 ] && ok "任务侧凭据已自愈（每机私有角色，不影响机队其他机器）"
     fi
-    if [ "$rc" = 0 ]; then ok "CLI+骨架+台账就绪（root=$STORE_ROOT）"
-    elif [ "$rc" = 2 ]; then bad "PG 不可达——relay 依赖同一个库，通常意味着服务已瘫，需人工介入"
-    elif [ "$rc" = 3 ]; then bad "任务侧凭据失效且自愈失败——任务内台账登记会全部失败，需人工 store init"
-    else warn "台账表未建；首次需人工执行: $STORE_BIN init（会建表，故不自动跑）"
-    fi
+     if [ "$rc" = 0 ]; then ok "CLI+骨架+台账就绪（root=$STORE_ROOT）"
+     elif [ "$rc" = 2 ]; then bad "PG 不可达——relay 依赖同一个库，通常意味着服务已瘫，需人工介入"
+     elif [ "$rc" = 3 ]; then bad "任务侧凭据失效且自愈失败——任务内台账登记会全部失败，需人工 store init"
+     else warn "台账表未建；首次需人工执行: $STORE_BIN init（会建表，故不自动跑）"
+     fi
+   fi
+fi
+
+# ---------- 21f jingboWiki 双写通道（登录+目标库可达+模型槽位，只读探测，SOFT） ----------
+# 为什么必须有：store 双写目标三 ID 硬编码在 CLI，而 wiki 侧有「空间成员」语义——
+# 旧「纯Wiki资料知识库」在空间变更后对机队账号整体 403（MODEL 404、AGENT 消失），
+# 双写通道静默死亡数周（store_wiki_sync 长期 0 行），体检清单却无一项能兜住。
+# 本项只读探测（登录→目标库→模型槽位），不写 wiki、不触发合成；上游 model-id
+# 漂移（如 LCBD 被 403 拒）须实跑合成才暴露，超出体检范围，靠 push 后
+# store sync verify 的 parse_status 兜底。目标库解析顺序与 store --kb 缺省一致：
+# STORE_KB_ID env > store 脚本 KB_ID 常量 > jingbowiki.env 的 JINGBOWIKI_KB_ID。
+step "jingboWiki双写通道"
+WIKI_ENVF="$WORKSPACE/shared/secrets/jingbowiki.env"
+WIKI_PY="$VENV/bin/python"; [ -x "$WIKI_PY" ] || WIKI_PY="$(command -v python3 || true)"
+if [ ! -f "$WIKI_ENVF" ]; then warn "缺凭据文件 $WIKI_ENVF（双写与检索均不可用）"
+elif [ -z "$WIKI_PY" ]; then warn "无可用 python3，跳过探测"
+else
+  wiki_out="$("$WIKI_PY" - "$WIKI_ENVF" "${STORE_BIN:-/usr/local/bin/store}" 2>&1 <<'PYEOF'
+import json, os, re, sys, urllib.request
+envf, store_cli = sys.argv[1], sys.argv[2]
+w = {}
+try:
+    for ln in open(envf, encoding="utf-8"):
+        m = re.match(r"\s*(?:export\s+)?([A-Z_]+)\s*=\s*(.+?)\s*$", ln)
+        if m:
+            w[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+except OSError as e:
+    raise SystemExit(f"凭据不可读: {e}")
+base = (os.environ.get("JINGBOWIKI_BASE") or w.get("JINGBOWIKI_BASE") or "").rstrip("/")
+if not base:
+    base = "http://10.200.3.235:18082"
+if not base.endswith("/api/v1"):
+    base += "/api/v1"
+def call(path, tok=None, data=None):
+    h = {"Content-Type": "application/json"}
+    if tok:
+        h["Authorization"] = "Bearer " + tok
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(base + path, data=body, headers=h,
+                                 method="POST" if body else "GET")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+try:
+    d = call("/auth/login", data={"email": w.get("JINGBOWIKI_EMAIL", ""),
+                                  "password": w.get("JINGBOWIKI_PASSWORD", "")})
+except Exception as e:
+    raise SystemExit(f"登录失败: {str(e)[:100]}")
+tok = d.get("token") or (d.get("data") or {}).get("token") or ""
+if not tok:
+    raise SystemExit("登录未返回 token（凭据失效？）")
+kb = os.environ.get("STORE_KB_ID") or ""
+model = ""
+try:
+    src = open(store_cli, encoding="utf-8").read()
+    if not kb:
+        m = re.search(r'^KB_ID\s*=\s*"([^"]+)"', src, re.M)
+        if m:
+            kb = m.group(1)
+    m = re.search(r'^MODEL_ID\s*=\s*"([^"]+)"', src, re.M)
+    if m:
+        model = m.group(1)
+except OSError:
+    pass
+kb = kb or w.get("JINGBOWIKI_KB_ID") or ""
+if not kb:
+    raise SystemExit("目标库 ID 缺失（STORE_KB_ID / store KB_ID / JINGBOWIKI_KB_ID 均无）")
+try:
+    d = call("/knowledge-bases/" + kb, tok)
+except Exception as e:
+    code = getattr(e, "code", "")
+    raise SystemExit(f"目标库不可达 {kb[:8]}（HTTP {code or str(e)[:60]}）——空间成员变更或库被删？")
+data = d.get("data")
+name = data.get("name") if isinstance(data, dict) else ""
+if not (d.get("success") or name):
+    raise SystemExit(f"目标库返回异常 {kb[:8]}: {str(d)[:80]}")
+msg = f"登录OK；目标库 {kb[:8]}={name or '?'}"
+if model:
+    try:
+        ms = call("/models", tok).get("data") or []
+    except Exception:
+        ms = []
+    if ms:
+        if not any(isinstance(m, dict) and m.get("id") == model for m in ms):
+            raise SystemExit(f"模型槽位缺失 {model[:8]}（库={name or '?'}）——wiki 合成会失败，需重注册")
+        msg += f"；模型槽位 {model[:8]} 在位"
+print(msg)
+PYEOF
+)"
+  if [ "$?" = 0 ]; then ok "$wiki_out"
+  else warn "通道异常：$(printf '%s' "$wiki_out" | tail -1 | cut -c1-150)（双写会静默失败，查凭据/空间成员/目标ID）"
   fi
 fi
 
