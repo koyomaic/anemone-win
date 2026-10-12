@@ -16,13 +16,17 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 4. **第 5 节每条「发现」必须带当天数据支撑**，不许写"建议加强用户运营"这类空话。
 5. 报告落盘后**必须**登记台账（`store add`），否则算未完成。
 
-## 两步跑完
+## 跑法
 
 ```bash
 PY=/mnt/vol-eltaah12/finaagent/.venv/bin/python     # 必须用这个 venv，系统 python 无 psycopg2
 S=/mnt/vol-eltaah12/finaagent/relay-dev/skills/ludashi-usage-daily-report/scripts
 D=2026-10-11                                        # 报告日；不传默认昨天
 
+# ⓪ 换机器或人员变动后才需要：重派生本机名单（平时跳过）
+$PY $S/build_roster.py --dry-run
+
+# ① 采集 → ② 渲染
 $PY $S/usage_collect.py --date $D --out /tmp/facts-$D.json
 $PY $S/render_report.py --facts /tmp/facts-$D.json --out /tmp/report-$D.md
 ```
@@ -79,21 +83,52 @@ requester（PG，权威）→ audit.log 的 task_id→actor（覆盖历史，实
 | `--source all` / `--source "dingtalk,api_server"` CLI | 不存在此命令 | `usage_collect.py` 即其替代实现 |
 | `acp` / `飞书` 渠道 | 本机无独立日志 | 恒为 0，标 `[缺档]` |
 
-## 重点用户名单：不是 17 人
+## 重点用户名单：运行时从本机派生，不是固定 17 人
 
-模板写「17 人」，但**全盘无该名单定义**（T760 排查已确认）。`config/key_users.toml`
-是按可追溯出处重建的真实名单，**12 人**：
+模板写「17 人」，但**全盘无该名单定义**（T760 排查已确认）。更关键的是——
+**机队各机的名单本来就不同**：本机 `policy.toml` 是 `owner_userid=20102`＋白名单 5 人，
+而机队模板 `policy.example.toml` 是 `owner_userid=18434`＋`whitelist=[]`。
+把某一台的名单提交进 git，夜间 provision 会把它强加给其他 7 台 → 活跃率与静默追踪全错。
 
-- `policy_owner` 1 人（崔成东）
-- `static_whitelist` 5 人（王洪彬、邹雄、孙瑞昱、邵磊、赵兴峰）
-- `dynamic_grant` 5 人（舒瀚、孔德光、闫路英、靳光传、王思义）
-- `historical_active` 1 人（毕倩）
+所以：**成员＝运行时从本机授权真源派生**，`config/key_users.toml` 只是派生结果的
+**缓存**（存 dws 反查来的 org/dept/title，省得每次跑报告都打通讯录）。
 
-活跃率按**实际人数**算（N/12），不写死 17。业务方若给出原始 17 人名单，
-直接往 `key_users.toml` 追加 `[[user]]` 块即自动生效。
+```bash
+$PY $S/build_roster.py --dry-run              # 先看派生结果
+$PY $S/build_roster.py                        # 写入 config/key_users.toml
+$PY $S/build_roster.py --include-historical   # 把 audit 历史活跃发起人也纳入
+$PY $S/build_roster.py --no-dws               # 离线：跳过通讯录，沿用缓存里的 org/dept
+```
 
-名单里的 org/dept/title 是 `dws contact user get --ids …` 反查的真值，不是手抄。
-**靳光传(12223) 通讯录返回空**，故其岗位留空——这是数据缺口，不要猜。
+派生来源（每人标 `source`，可追溯）：
+
+| source | 来源 | 本机人数 |
+|---|---|---|
+| `policy_owner` | policy.toml `owner_userid` | 1（崔成东） |
+| `superadmin` | policy.toml `superadmin` | 1（毕倩） |
+| `static_whitelist` | policy.toml `whitelist` | 5（王洪彬、邹雄、孙瑞昱、邵磊、赵兴峰） |
+| `file_uploader` | policy.toml `file_uploaders` | 0 |
+| `dynamic_grant` | `run/whitelist_dynamic.json` **且未过期** | 5（舒瀚、孔德光、闫路英、靳光传、王思义） |
+| `historical_active` | audit.log 历史活跃发起人 | 需 `--include-historical` |
+
+本机合计 **12 人**。活跃率按**实际人数**算（N/12），不写死 17；换台机器自动变成那台的数。
+业务方若给出原始名单，往 `key_users.toml` 追加 `[[user]]` 块即可（重跑派生会保留人工 `note`）。
+
+### 姓名/部门反查的三个坑
+
+1. **通讯录返回顺序随机**：邹雄(40714) 有 **34 个部门**，连查两次 `depts[0]` 分别是
+   「KG董事局成员」和「乐安家族管理委员会成员」。直接取 `depts[0]` 会让报告每天显示不同部门。
+   → `pick_dept()` 确定性选择：**旧缓存的部门若仍在列表里就沿用**（跨次稳定），
+   否则取 `deptPathName` 最短者、同级按名排序。
+2. **多部门高管显示岗位而非部门**：`dept_count > 3` 时报告改显示 `orgTitle`
+   （邹雄 → 「京博控股集团／总经理(主岗)（兼 34 部门，取岗位）」），比随机挑一个董事会名有意义。
+3. **通讯录查不到的人**：靳光传(12223) 返回全空（离职/无权限/id 变更），
+   赵兴峰跨组织无本 corp userId。姓名回退链必须含 `whitelist_dynamic.json`——
+   靳光传的名字**只有那里有**，漏掉这一环就会退化成用 id 当姓名。
+   查不到的 org/dept 标 `[缺档] 通讯录无返回`，**不要猜**。
+
+`dws` 的 profile 各机不同，`build_roster.py` 从 `dws auth status` 动态取
+（`corp_id:user_id`），不写死。企业邮箱对报告无用且属 PII，**不写入文件**。
 
 ## 你要补的 7 处叙述位
 
@@ -141,8 +176,11 @@ store add <上面的路径> --kind report --task <任务号> --topic 用户日�
 
 | 路径 | 作用 |
 |---|---|
+| `scripts/build_roster.py` | 从本机 policy.toml＋whitelist_dynamic＋events＋通讯录派生重点用户名单 |
 | `scripts/usage_collect.py` | 采集器：PG＋audit＋events＋rounds → facts.json |
 | `scripts/render_report.py` | 渲染器：facts.json → 报告 Markdown |
-| `config/key_users.toml` | 重点用户名单（12 人）＋服务账号，可编辑 |
+| `config/key_users.toml` | 名单**缓存**（派生结果＋org/dept/title），换机自动重派生 |
 | `references/template.md` | 用户给的报告模板原文 |
 | `references/data-sources.md` | 真实数据源映射、字段含义、已知缺口 |
+
+**换机器 / 人员变动后先跑 `build_roster.py`**，否则名单是上一台的。

@@ -54,6 +54,27 @@ def idx_mark(i: int) -> str:
     return CIRCLED[i - 1] if 1 <= i <= len(CIRCLED) else f"({i})"
 
 
+def orgdept(u: dict) -> str:
+    """公司/部门列的取值。
+
+    多部门高管（如邹雄 34 个部门）的 dept 是任意挑的，展示出来会误导；
+    这类人改显示岗位（orgTitle），语义更准也更稳定。
+    """
+    if not u:
+        return "[缺档] 不在名单，需 dws contact 反查"
+    org = u.get("org") or ""
+    try:
+        dc = int(u.get("dept_count") or 0)
+    except (TypeError, ValueError):
+        dc = 0
+    if dc > 3:
+        second = u.get("title") or u.get("dept") or ""
+        tail = f"（兼 {dc} 部门，取岗位）" if second else f"（兼 {dc} 部门）"
+        return "／".join(x for x in (org, second) if x) + tail
+    second = u.get("dept") or u.get("title") or ""
+    return "／".join(x for x in (org, second) if x) or "[缺档] 通讯录无返回"
+
+
 def g(d, *ks, default=None):
     for k in ks:
         if not isinstance(d, dict):
@@ -272,8 +293,7 @@ def render(f: dict, mode: str) -> str:
     rows = []
     for i, (w, a) in enumerate(sorted(agg.items(), key=lambda x: (-x[1]["q"], -x[1]["tokens"])), 1):
         u = by_name.get(w) or {}
-        orgdept = "／".join(x for x in (u.get("org"), u.get("dept")) if x)
-        rows.append([i, w, orgdept or "[缺档] 不在名单，需 dws contact 反查",
+        rows.append([i, w, orgdept(u),
                      a["q"], a["rows"], f"{a['tokens']:,}",
                      "是" if w in roster_names else "否", f"{a['done']}/{a['q']}"])
     if rows:
@@ -365,10 +385,10 @@ def render(f: dict, mode: str) -> str:
     L.append("")
     sil = [s for s in (k.get("silence") or []) if not s.get("active_today")]
     if sil:
-        rows = [[s["name"], s.get("title") or s.get("dept") or "-", s["last_seen"],
+        rows = [[s["name"], orgdept(s), s["last_seen"],
                  n(s["silent_days"]), "是" if s.get("over_30d") else "否", s.get("source", "-")]
                 for s in sil]
-        L.append(tbl(["姓名", "岗位/部门", "最近一次活动", "静默天数", "超 30 天", "名单出处"], rows))
+        L.append(tbl(["姓名", "公司/部门", "最近一次活动", "静默天数", "超 30 天", "名单出处"], rows))
         over = [s["name"] for s in sil if s.get("over_30d")]
         L.append("")
         L.append(f"> **填写说明**：按静默天数降序。{len(sil)} 人当日无活动，"

@@ -381,6 +381,7 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
         silence.append({
             "name": n, "id": u.get("id", ""), "org": u.get("org", ""),
             "dept": u.get("dept", ""), "title": u.get("title", ""),
+            "dept_count": u.get("dept_count", ""),
             "tier": u.get("tier", ""), "source": u.get("source", ""),
             "last_seen": dt.datetime.fromtimestamp(ls, TZ).strftime("%Y-%m-%d") if ls else "无记录",
             "silent_days": days,

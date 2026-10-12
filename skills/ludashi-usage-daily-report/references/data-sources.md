@@ -139,19 +139,64 @@ plan_create 11、gate_confirm 11、plan_op 7。
 `employee.db` **全盘不存在**（`/` 与 `/mnt/vol-eltaah12` 全量 find 无果）。
 relay 的 `users` 表只有 `token/name/created_at/consumed_at`，无公司部门。
 
-实际途径：
+### 名单必须运行时派生，不能入库固定
 
-```bash
-/root/fenshen-ludashi/bin/dws contact user get --ids 18434,40714,40125,48332,20102,19173,12139,34718,23518,18377 \
-  --profile ding3b5622356ccdf1e2:37505774 --format json
-# → orgEmployeeModel: orgUserId/orgUserName/orgName/depts[].deptName/orgTitle/orgAuthEmail
+机队各机 `policy.toml` 完全不同：
+
+| | 本机 | 机队模板 `policy.example.toml` |
+|---|---|---|
+| `owner_userid` | `20102`（崔成东） | `18434`（王洪彬） |
+| `superadmin` | `["20102","18377"]` | `["18434"]` |
+| `whitelist` | 5 人 | `[]` |
+
+固定名单进 git → 夜间 provision 把它同步给其他 7 台 → 活跃率/静默追踪全错。
+故 `build_roster.py` 每次从**本机**真源派生，`key_users.toml` 只是缓存。
+
+派生输入：
+
+| 来源 | 路径 | 取什么 |
+|---|---|---|
+| policy.toml | `avatar/policy.toml` | `owner_userid` / `superadmin` / `whitelist` / `file_uploaders`（tomllib 递归找键，因分节） |
+| 动态授权 | `avatar/run/whitelist_dynamic.json` | userId → {name,tier,by,expires}；**须剔除已过期**（grant_valid_days=90） |
+| openId→姓名 | `avatar/events-*.ndjson` | `sender_open_dingtalk_id` → `sender`（实测 23 个）；跨组织人员唯一姓名源 |
+| openId→userId | `avatar/run/contacts.json` | `miss:` 前缀＝未解析 |
+| 历史活跃 | `avatar/audit/audit.log` | actor（需 `--include-historical`） |
+| org/dept/title | `dws contact user get --ids …` | profile 从 `dws auth status` 动态取（`corp_id:user_id`），各机不同 |
+
+### 通讯录反查的三个坑（实测）
+
+**① depts 返回顺序随机。** 邹雄(40714) 有 **34 个部门**，连查两次 `depts[0]`：
+
+```
+第1次 depts[0]: KG董事局成员
+第2次 depts[0]: 乐安家族管理委员会成员
 ```
 
-实测 11 个 id 只返回 10 人：**靳光传(12223) 返回全 None**（离职/无权限/id 变更），
-故名单里其岗位留空。赵兴峰跨组织无 userId，通讯录不可反查。
+直接取 `depts[0]` → 报告每天显示不同部门。`pick_dept()` 的确定性规则：
+旧缓存的部门若仍在当前列表 → 沿用（跨次稳定）；否则取 `deptPathName` 最短者、同级按名排序。
+实测连跑两次 `build_roster.py` 输出 diff 为空。
 
-反查结果已固化进 `config/key_users.toml`（org 全是「京博控股集团」，dept 各异）。
-**人员变动后需重跑反查更新名单**，不要手改。
+**② 多部门高管显示岗位更有意义。** `dept_count > 3` 时渲染器改显示 `orgTitle`：
+邹雄 → 「京博控股集团／总经理(主岗)（兼 34 部门，取岗位）」，而不是随机一个「JFCL董事会」。
+
+**③ 有些人通讯录查不到，姓名回退链不能漏 `whitelist_dynamic.json`。**
+
+| 人 | 通讯录 | 姓名来源 |
+|---|---|---|
+| 靳光传(12223) | 返回全 None（离职/无权限/id 变更） | **只有 whitelist_dynamic.json 有** |
+| 赵兴峰 | 跨组织无本 corp userId，不可反查 | events 的 sender ＋ policy.toml 注释 |
+
+回退链：`通讯录 → whitelist_dynamic → events(openId) → 旧缓存 → id 占位`。
+漏掉 whitelist_dynamic 这一环，靳光传就会退化成用「12223」当姓名。
+查不到的 org/dept 标 `[缺档] 通讯录无返回`，**不要猜**。
+
+企业邮箱（`orgAuthEmail`）对报告无用且属 PII，**不写入 key_users.toml**。
+
+### 服务账号
+
+`key_users.toml` 的 `[[service_account]]` 段人工维护（中鲁运营/__admin__/canary 等），
+但**分身本体名各机不同**（provision 29b 让 `avatar_name` 跟随本机 dws 认证名），
+故 `usage_collect.py` 还会自动把 PG `plans.owner_name` 并入服务账号判别，不依赖名单里写死「鲁大师」。
 
 ## 7. 模板要求但本机无源（照实标 [缺档]）
 
@@ -161,7 +206,7 @@ relay 的 `users` 表只有 `token/name/created_at/consumed_at`，无公司部�
 | `prediction_log` | 全盘不存在（无文件/表/目录） | 标 [缺档]，需业务方给路径 |
 | `--source all` / `--source "dingtalk,api_server"` CLI | 不存在此聚合命令 | `usage_collect.py` 即替代实现 |
 | `acp` / `飞书` 渠道 | 本机无独立日志 | 恒为 0，标 [缺档] |
-| 重点用户「17 人」清单 | 全盘 grep `17人\|17 人\|重点用户` 无定义性命中 | 用可追溯出处重建的 12 人，活跃率按实际人数算 |
+| 重点用户「17 人」清单 | 全盘 grep `17人\|17 人\|重点用户` 无定义性命中 | 运行时从本机 policy.toml＋whitelist_dynamic 派生（本机 12 人），活跃率按实际人数算，见 §6 |
 | 法定节假日日历 | 未接 | 交易日判定只按周末，调休日会误判，需手工纠正 |
 
 D-17 成品油价格预测自 2026-09-23 断供，是**上游数据源问题**（P-01 孙瑞昱），非代码缺陷；
