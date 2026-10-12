@@ -181,7 +181,8 @@ def render(f: dict, mode: str) -> str:
         ["cron 占比", f"{n(round((t.get('by_source') or {}).get('cron',0)*100.0/t['task_rows'],1)) if t.get('task_rows') else '-'}%",
          "-", "周末基线见下" if weekend else "工作日基线"],
         ["入站消息数（钉钉）", n(lg.get("inbound_msgs")), "-",
-         f"{lg.get('inbound_kinds') or {}}；含未成任务的消息"],
+         "、".join(f"{k} {v}" for k, v in (lg.get("inbound_kinds") or {}).items())
+         + "；含未成任务的消息"],
     ]))
     L.append("")
     L.append(f"**当日异常/提示**：{anom_txt}")
