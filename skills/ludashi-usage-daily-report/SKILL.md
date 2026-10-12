@@ -16,6 +16,63 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 4. **第 5 节每条「发现」必须带当天数据支撑**，不许写"建议加强用户运营"这类空话。
 5. 报告落盘后**必须**登记台账（`store add`），否则算未完成。
 
+## 每日自动化：两段式（宿主机采集 → 沙箱渲染）
+
+**为什么必须拆两段**：本地任务沙箱的 `local_sandbox_hide` 整体隐藏 `relay.env`
+（policy.toml 明写「凭据在沙箱内**不可见**，不是可见但禁读」，是沙箱出网不限后的剩余防线）。
+所以沙箱内的计划任务读不到 `RELAY_DB` → 采集器必然降级 `logs_only` → 日报只剩入站消息数，
+任务级/用户级全空。**直接在计划里跑采集会每天静默产出废报告。**
+
+| 段 | 触发 | 跑什么 | 凭据 | 产物 |
+|---|---|---|---|---|
+| ① 采集 | 宿主机 systemd `ludashi-usage-collect.timer`，每日 **08:30** | `boot/usage-collect.sh` → `usage_collect.py` | 需要 `RELAY_DB`（宿主机可读） | `shared/tmp/usage/facts-<日>.json` |
+| ② 渲染投递 | relay 计划 **#12「每日鲁大师用户日度使用分析报告」**，每日 **08:45** | `render_report.py` ＋ 补叙述 ＋ 落盘 ＋ 台账 ＋ DM | 不需要（纯标准库，系统 python3 即可） | `shared/report/自检报告/<YYYY-MM>/…md` |
+
+衔接点 `shared/tmp/usage/` 的可达性已实测：
+
+- **不在** `local_sandbox_hide` → 沙箱**可读**（宿主机写、沙箱读，只读正好）
+- `shared/report`、`shared/skills` **在** `local_sandbox_rw` 16 项里 → 沙箱能读脚本、能写报告
+- `render_report.py` 不 import psycopg2 → 沙箱内系统 `python3` 直接可跑（已实测）
+
+08:30 这个点是刻意错开 08:00 的 `daily-report.timer`（同样查 `RELAY_DB`，避免并发争库）。
+
+### 计划 #12 的失败处置
+
+计划描述里写死了：**facts 缺失或 `source != pg_authoritative` 时，不许自己跑采集补救**，
+改为 DM 王洪彬一句「预采集缺失，当日日报不可用，查 `/var/log/ludashi-usage-collect.log`」后结束。
+理由是沙箱内跑采集只会产出降级件，反而把「预采集坏了」这个真故障盖住。
+
+宿主机侧 `usage-collect.sh` 自己也会预警：采集退出非 0、产物为空、或 `source` 不是
+`pg_authoritative` → 钉钉 DM 王洪彬（沿用 `daily-report.sh` 的惯例）。
+
+### 相关文件（均在 git，provision 同步）
+
+| 路径 | 安装位 | provision 步骤 |
+|---|---|---|
+| `boot/usage-collect.sh` | `/opt/team/relay-boot/`（chmod 700） | 19d |
+| `boot/ludashi-usage-collect.service.template` | `/etc/systemd/system/…service`（render `__WORKSPACE__`/`__VENV__`） | 19d |
+| `boot/ludashi-usage-collect.timer` | `/etc/systemd/system/…timer` | 19d |
+| 本技能全部文件 | `shared/skills/ludashi-usage-daily-report/` | 21b |
+
+`ludashi-usage-collect.service` 刻意**不加** `InaccessiblePaths`——它的全部意义就是能读
+`relay.env`，与沙箱内任务单元的边界正好相反。凭据只存在于进程环境，不落产物、不打日志。
+产物 `facts-*.json` 会落在沙箱可读路径，故已扫描确认**不含连接串/令牌/密码/邮箱**
+（openId 会出现，但 policy.toml 本就对沙箱可见，非新增暴露）。
+
+### 与既有 daily-report.sh 的关系（不重复）
+
+本机 08:00 已有 `daily-report.sh` + `daily-report.timer`，发钉钉群「G·鲁大师训练营」，
+内容是**任务战果/练习明细/活跃成员/新增共享资产**。本技能是**用户日度使用分析**
+（渠道分布/重点用户活跃/静默追踪/交付质量/逐会话卡片），受众与口径都不同，互补不替代。
+
+它的日志可用作**独立交叉验证**——`/var/log/relay-daily-report.log` 的「昨日任务=N」
+应与本技能 facts 的 `task_rows` 完全相等。实测 10-09/10-10/10-11 三天分别为
+29/53/36，两边逐日吻合。对不上就说明有一边口径漂了。
+
+> ⚠ `daily-report.sh` **不在 git 里**（provision 完全不管它），只存在于本机
+> `/opt/team/relay-boot/`，属未纳管漂移：不会分发到其他机器，重装机器会丢。
+> 本技能的三段（脚本＋两个单元）都已入库并由 provision 19d 同步。
+
 ## 跑法
 
 ```bash

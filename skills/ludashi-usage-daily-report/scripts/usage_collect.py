@@ -231,6 +231,17 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
         cur = conn.cursor()
         plans = q(cur, "SELECT id,name,owner_name,on_calendar,action,enabled FROM plans")
         plan_owners = {p["owner_name"] for p in plans if p["owner_name"]}
+        # (owner, 计划动作描述) 指纹 → 精确识别计划触发的任务；同时供 cron 构成归并复用
+        plan_sigs, desc2plan = set(), {}
+        for p in plans:
+            try:
+                act = json.loads(p["action"]) if isinstance(p["action"], str) else (p["action"] or {})
+            except Exception:
+                act = {}
+            d = (act.get("description") or "").strip()
+            if d:
+                plan_sigs.add((p["owner_name"], d))
+                desc2plan[d] = p["name"]
         sel = """SELECT id,"user",requester,description,status,engine,project,result,
                         created_at,started_at,finished_at,error,tokens,cost,changed_files
                  FROM tasks WHERE created_at >= %s AND created_at < %s ORDER BY created_at"""
@@ -264,10 +275,15 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
             return "dingtalk"
         if proj == "avatar-replay":
             return "replay"
+        # ⚠ 计划判定必须**早于**系统账号判定：计划的 owner_name 取决于建计划时用谁的
+        #   凭据（admin token → __admin__，分身设备 → 鲁大师），而 __admin__ 同时在
+        #   SYSTEM_ACCOUNTS 里。若先判系统账号，admin 建的计划任务会被误归 system，
+        #   cron 占比就漏统计。先按 (owner, 计划动作描述) 精确匹配，再按 owner 兜底。
+        desc = (t.get("description") or "").strip()
+        if (user, desc) in plan_sigs or user in plan_owners:
+            return "cron"
         if user in SYSTEM_ACCOUNTS:
             return "system"
-        if user in plan_owners:
-            return "cron"
         if user in svc:
             return "api_server"
         return "cli"  # 真人持自己 token 直连
@@ -391,16 +407,8 @@ def collect_pg(date: dt.date, prev_date: dt.date, roster: dict, audit_actor: dic
         })
     silence.sort(key=lambda x: (x["silent_days"] is None, -(x["silent_days"] or 0)))
 
-    # cron 构成：按 plan 名归并（描述精确匹配；匹配不上的归「其他计划触发」）
-    desc2plan = {}
-    for p in plans:
-        try:
-            act = json.loads(p["action"]) if isinstance(p["action"], str) else (p["action"] or {})
-        except Exception:
-            act = {}
-        d = (act.get("description") or "").strip()
-        if d:
-            desc2plan[d] = p["name"]
+    # cron 构成：按 plan 名归并（描述精确匹配；匹配不上的归「计划已改名/删除」）
+    # desc2plan 已在上面与 plan_sigs 一并构建，此处直接复用，勿重复解析 action。
     cron_by_plan = collections.Counter()
     for t in tasks:
         if classify(t) == "cron":

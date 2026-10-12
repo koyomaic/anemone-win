@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily 08:30 ludashi usage pre-collect (feeds the 08:45 sandboxed render plan)
+
+[Timer]
+# 08:30：错开 08:00 的 daily-report（同样查 RELAY_DB，避免并发争库），
+# 且必须早于 08:45 的渲染计划——沙箱内读不到 relay.env，只能吃这里预采的 facts。
+OnCalendar=*-*-* 08:30:00
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

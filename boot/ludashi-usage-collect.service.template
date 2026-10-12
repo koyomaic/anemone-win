@@ -1,0 +1,19 @@
+[Unit]
+Description=Ludashi usage daily report - host-side pre-collect (needs RELAY_DB, sandbox cannot)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/team/relay-boot/usage-collect.sh
+Environment=RELAY_WORKSPACE=__WORKSPACE__
+Environment=RELAY_VENV=__VENV__
+NoNewPrivileges=true
+
+# 只读跑：采集器只写 shared/tmp/usage 与日志，不动系统区。
+# 刻意**不加** InaccessiblePaths——本单元的全部意义就是能读 relay.env（宿主机侧带凭据），
+# 与沙箱内任务单元的边界正好相反。凭据只存在于进程环境，不落产物、不打日志、不回显。
+ProtectSystem=strict
+ReadWritePaths=-__WORKSPACE__/shared/tmp -/var/log -/tmp -/var/tmp
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true

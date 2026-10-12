@@ -367,6 +367,29 @@ elif heal; then
   systemctl is-active --quiet relay-plan.timer && ok "已启用" || bad "无法激活"
 else bad "未启用"; fi
 
+# ---------- 19d 鲁大师使用日报·宿主机预采集（脚本+单元+定时器，SOFT） ----------
+# 两段式的第一段：宿主机带凭据跑 usage_collect.py 采 facts → shared/tmp/usage/，
+# 沙箱内的渲染计划（第二段）只读 facts 渲染。之所以必须拆两段：本地任务沙箱的
+# local_sandbox_hide 整体隐藏 relay.env，沙箱内读不到 RELAY_DB，直接跑采集会每天
+# 静默降级成 logs_only（日报只剩入站消息数，任务级/用户级全空）。
+# 08:30 跑，错开 08:00 的 daily-report（同查 RELAY_DB，避免并发争库）。
+# 依赖 21b 先把技能同步到 shared/skills；本步只装触发器，采集器本体在技能里。
+step "usage-collect脚本"
+if [ -f "$BOOT_DIR/usage-collect.sh" ] && cmp -s "$RES_ROOT/boot/usage-collect.sh" "$BOOT_DIR/usage-collect.sh"; then ok
+elif heal; then
+  miss "从资源树同步"
+  cp "$RES_ROOT/boot/usage-collect.sh" "$BOOT_DIR/usage-collect.sh" && chmod 700 "$BOOT_DIR/usage-collect.sh" && ok "已同步" || bad "同步失败"
+else bad "缺失"; fi
+sync_unit "ludashi-usage-collect.service" "$RES_ROOT/boot/ludashi-usage-collect.service.template" ludashi-usage-collect.service render no
+sync_unit "ludashi-usage-collect.timer"   "$RES_ROOT/boot/ludashi-usage-collect.timer"            ludashi-usage-collect.timer   copy   no
+step "usage-collect定时器"
+if systemctl is-enabled --quiet ludashi-usage-collect.timer 2>/dev/null && systemctl is-active --quiet ludashi-usage-collect.timer; then ok
+elif heal; then
+  miss "启用"
+  systemctl enable --now ludashi-usage-collect.timer 2>/dev/null
+  systemctl is-active --quiet ludashi-usage-collect.timer && ok "已启用" || bad "无法激活"
+else bad "未启用"; fi
+
 # ---------- 20 opencode.jsonc（模型 provider+密钥，SOFT） ----------
 step "opencode.jsonc"
 if [ -f "$OC_CONFIG" ] && ! grep -q 'sk-REPLACE_ME' "$OC_CONFIG"; then ok
