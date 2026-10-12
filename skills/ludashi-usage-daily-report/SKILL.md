@@ -30,8 +30,15 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
    python3 $S/recipients.py --kind alert     # 失败预警收件人
    ```
 
-   它读 `config/recipients.local.json`——该文件被 `.gitignore` 挡掉、**不入库**，
-   provision 21b 只比对/下发仓库里存在的文件，故不会覆盖也不会分发到别的机器。
+   它读**本机配置区**的 `avatar/usage-report-recipients.json`（与 `policy.toml` 同级），
+   查找顺序：`$USAGE_RECIPIENTS` → `avatar/usage-report-recipients.json` →
+   `<技能目录>/config/recipients.local.json`（开发/兼容）。
+
+   > ⚠ 主位置刻意**不放技能目录内**：技能目录是 provision 21b 的同步目标，一次
+   > 「rm -rf 安装位 + 重拷」就会抹掉本机配置 → 解析器静默回退成 policy 派生值，
+   > 收件人从「王洪彬、崔成东」变成「崔成东、毕倩」，**报告发错人且无人察觉**（实测踩过）。
+   > `avatar/` 永不被同步，故安全。已验证全量重同步后收件人不变。
+
    配置缺失时自动从本机 `policy.toml` 的 `owner_userid`＋`superadmin` 派生并写出该文件，
    所以新机器零配置也能跑，且推给的是**本机**负责人。
 
@@ -311,9 +318,12 @@ $DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --f
 | `scripts/recipients.py` | 解析**本机**收件人（report / alert 两类） | ✓ |
 | `config/key_users.toml` | 名单**缓存**（派生结果＋org/dept/title），换机自动重派生 | ✓ |
 | `config/recipients.example.json` | 收件人配置模板与说明 | ✓ |
-| `config/recipients.local.json` | **本机收件人**（各机不同） | ✗ gitignore |
+
+本机收件人配置**不在技能目录里**，在 `avatar/usage-report-recipients.json`（各机不同、
+不入库、provision 不同步）；`.gitignore` 另有 `skills/*/config/*.local.json` 兜住开发期
+放在技能目录内的副本。
 | `references/template.md` | 用户给的报告模板原文 | ✓ |
 | `references/data-sources.md` | 真实数据源映射、字段含义、已知缺口 | ✓ |
 
 **换机器 / 人员变动后先跑 `build_roster.py`**，否则名单是上一台的。
-**换机器后检查 `recipients.local.json`**，否则会按本机 policy 派生（可能不是你想发的人）。
+**换机器后检查 `avatar/usage-report-recipients.json`**，否则会按本机 policy 派生（可能不是你想发的人）。

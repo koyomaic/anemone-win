@@ -26,16 +26,39 @@ import sys
 import tomllib
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOCAL = os.path.join(SKILL_DIR, "config", "recipients.local.json")
 EXAMPLE = os.path.join(SKILL_DIR, "config", "recipients.example.json")
 ROSTER = os.path.join(SKILL_DIR, "config", "key_users.toml")
 POLICY_CANDIDATES = [
     "/mnt/vol-eltaah12/workspace/avatar/policy.toml",
     "/root/fenshen-ludashi/avatar/policy.toml",
 ]
+
+# 本机配置的查找顺序。
+# ⚠ 主位置刻意放在 avatar/ 而**不是技能目录内**：技能目录是 provision 21b 的同步目标，
+#   一次「rm -rf 安装位 + cp -r」式的全量重同步就会把本机配置抹掉（实测踩过：安装位丢了
+#   local 配置 → 解析器静默回退成 policy 派生值，收件人从王洪彬+崔成东变成崔成东+毕倩，
+#   报告发错人且无人察觉）。avatar/ 是 policy.toml 所在的本机配置区，永不被同步。
+WORKSPACE = os.environ.get("RELAY_WORKSPACE", "/mnt/vol-eltaah12/workspace")
+LOCAL_CANDIDATES = [
+    os.environ.get("USAGE_RECIPIENTS", ""),                      # ① 显式指定
+    os.path.join(WORKSPACE, "avatar", "usage-report-recipients.json"),  # ② 本机配置区（主）
+    os.path.join(SKILL_DIR, "config", "recipients.local.json"),  # ③ 技能目录内（开发/兼容）
+]
+LOCAL_CANDIDATES = [p for p in LOCAL_CANDIDATES if p]
+# 写出时一律写主位置
+LOCAL_WRITE = os.path.join(WORKSPACE, "avatar", "usage-report-recipients.json")
+
 # 机队惯例：部署/采集类失败预警发王洪彬（见 AGENTS.md）。仅用于 alert 缺省，
 # report 缺省一律走本机 policy 派生，不套用这个。
 FLEET_ALERT_DEFAULT = "王洪彬"
+
+
+def local_path() -> str | None:
+    """返回第一个存在的本机配置路径。"""
+    for p in LOCAL_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def name_by_id() -> dict:
@@ -75,7 +98,7 @@ def derive_from_policy() -> tuple[list[str], list[str], list[str]]:
     p = find_policy()
     if not p:
         notes.append(f"[缺档] 未找到 policy.toml（试过 {'、'.join(POLICY_CANDIDATES)}）；"
-                     f"report 收件人留空，需人工填 {LOCAL}")
+                     f"report 收件人留空，需人工填 {LOCAL_WRITE}")
         return [], [FLEET_ALERT_DEFAULT], notes
     try:
         with open(p, "rb") as fh:
@@ -115,14 +138,16 @@ def derive_from_policy() -> tuple[list[str], list[str], list[str]]:
     return report, [FLEET_ALERT_DEFAULT], notes
 
 
-def load_local() -> dict | None:
-    if not os.path.exists(LOCAL):
-        return None
+def load_local() -> tuple[dict | None, str | None]:
+    """返回 (配置, 命中的路径)。按 LOCAL_CANDIDATES 顺序取第一个存在的。"""
+    path = local_path()
+    if not path:
+        return None, None
     try:
-        d = json.load(open(LOCAL, encoding="utf-8"))
-        return d if isinstance(d, dict) else None
+        d = json.load(open(path, encoding="utf-8"))
+        return (d if isinstance(d, dict) else None), path
     except Exception:
-        return None
+        return None, path
 
 
 def write_local(report: list[str], alert: list[str], notes: list[str]) -> None:
@@ -134,19 +159,19 @@ def write_local(report: list[str], alert: list[str], notes: list[str]) -> None:
         "alert": alert,
         "_derived_notes": notes,
     }
-    os.makedirs(os.path.dirname(LOCAL), exist_ok=True)
-    with open(LOCAL, "w", encoding="utf-8") as fh:
+    os.makedirs(os.path.dirname(LOCAL_WRITE), exist_ok=True)
+    with open(LOCAL_WRITE, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
 
 
 def resolve(kind: str, do_init: bool, force: bool) -> tuple[list[str], list[str]]:
     """返回 (收件人列表, 备注)。"""
-    cfg = load_local()
+    cfg, cfg_path = load_local()
     if cfg is None or force:
         report, alert, notes = derive_from_policy()
         if cfg is None:
-            notes.append(f"local 配置不存在 → 已按本机 policy 派生并写出 {LOCAL}")
+            notes.append(f"local 配置不存在 → 已按本机 policy 派生并写出 {LOCAL_WRITE}")
         else:
             notes.append("--force：已用本机 policy 派生结果覆盖原 local 配置")
         if do_init or force or cfg is None:
@@ -155,7 +180,7 @@ def resolve(kind: str, do_init: bool, force: bool) -> tuple[list[str], list[str]
         return list(cfg.get(kind) or []), notes
     vals = cfg.get(kind)
     if not isinstance(vals, list):
-        return [], [f"[缺档] {LOCAL} 的 {kind} 字段不是数组"]
+        return [], [f"[缺档] {cfg_path or LOCAL_WRITE} 的 {kind} 字段不是数组"]
     out = [str(x).strip() for x in vals if str(x).strip()]
     if not out and kind == "alert":
         out = [FLEET_ALERT_DEFAULT]
@@ -176,7 +201,7 @@ def main() -> int:
         for x in notes:
             print(f"[recipients] {x}", file=sys.stderr)
     if not names:
-        print(f"[recipients] {a.kind} 收件人为空——请填 {LOCAL}", file=sys.stderr)
+        print(f"[recipients] {a.kind} 收件人为空——请填 {LOCAL_WRITE}", file=sys.stderr)
         return 1
     print(",".join(names) if a.csv else "\n".join(names))
     return 0
