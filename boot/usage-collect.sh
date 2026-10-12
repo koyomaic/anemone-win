@@ -16,7 +16,6 @@ export HOME=/root LC_ALL=C.UTF-8
 unset HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy
 
 LOG="${USAGE_LOG:-/var/log/ludashi-usage-collect.log}"
-ALERT_USER="${USAGE_ALERT_USER:-王洪彬}"
 WORKSPACE="${RELAY_WORKSPACE:-/mnt/vol-eltaah12/workspace}"
 VENV="${RELAY_VENV:-/mnt/vol-eltaah12/finaagent/.venv}"
 SKILL="${USAGE_SKILL_DIR:-$WORKSPACE/shared/skills/ludashi-usage-daily-report}"
@@ -24,16 +23,35 @@ OUTDIR="${USAGE_OUT_DIR:-$WORKSPACE/shared/tmp/usage}"
 KEEP_DAYS="${USAGE_KEEP_DAYS:-30}"
 DRY=""
 
+# 预警收件人**不写死**：机队各机不同（用户 2026-10-12 明确「并不都是王洪彬和崔成东」）。
+# 由技能的 recipients.py 从本机 config/recipients.local.json 解析（该文件不入库、
+# provision 不覆盖）；缺失时它会自动从本机 policy.toml 的 owner_userid+superadmin 派生。
+# USAGE_ALERT_USER 环境变量仍可临时覆盖，便于排障时定向发给自己。
+alert_users() {
+  if [ -n "${USAGE_ALERT_USER:-}" ]; then printf '%s\n' "$USAGE_ALERT_USER"; return 0; fi
+  local py="$VENV/bin/python"; [ -x "$py" ] || py="$(command -v python3)"
+  if [ -n "$py" ] && [ -f "$SKILL/scripts/recipients.py" ]; then
+    "$py" "$SKILL/scripts/recipients.py" --kind alert --quiet 2>/dev/null && return 0
+  fi
+  printf '%s\n' "王洪彬"   # 兜底：机队惯例（AGENTS.md 部署/采集类失败预警王洪彬）
+}
+
 log(){ echo "[$(date '+%F %T')] $*" >>"$LOG" 2>/dev/null || echo "[$(date '+%F %T')] $*"; }
 alert(){
   [ -n "$DRY" ] && return 0
-  timeout 60 dws chat +dm --to "$ALERT_USER" --yes --content "**鲁大师使用日报·预采集失败**
+  local u sent=0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    timeout 60 dws chat +dm --to "$u" --yes --content "**鲁大师使用日报·预采集失败**
 - 时间：$(date '+%F %T')
 - 主机：$(hostname)
 - 原因：$1
 - 日志：$LOG
 
-沙箱内的渲染任务会因缺 facts 而降级，当日日报不可用。" >/dev/null 2>&1 || true
+沙箱内的渲染任务会因缺 facts 而降级，当日日报不可用。" >/dev/null 2>&1 && sent=$((sent+1))
+  done < <(alert_users)
+  [ "$sent" -eq 0 ] && log "WARN 预警未能送达任何收件人（dws 不可用或收件人解析为空）"
+  return 0
 }
 
 while [ $# -gt 0 ]; do

@@ -22,6 +22,29 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
    （`--keep-content` 只供排障，开了就别外发 facts）。
 7. **推送一律「摘要＋文件」**：摘要用 `render_report.py --summary` 生成（聚焦用户使用量，
    ~430 字符），完整件作附件发。不要把整份报告塞进消息正文。
+8. **收件人不许写死**（2026-10-12 用户指示：机队各机推送对象不同，并不都是王洪彬和崔成东）。
+   一律用 `recipients.py` 从本机配置解析，并**逐个收件人各发一遍**：
+
+   ```bash
+   python3 $S/recipients.py --kind report    # 日报收件人（每行一个姓名）
+   python3 $S/recipients.py --kind alert     # 失败预警收件人
+   ```
+
+   它读 `config/recipients.local.json`——该文件被 `.gitignore` 挡掉、**不入库**，
+   provision 21b 只比对/下发仓库里存在的文件，故不会覆盖也不会分发到别的机器。
+   配置缺失时自动从本机 `policy.toml` 的 `owner_userid`＋`superadmin` 派生并写出该文件，
+   所以新机器零配置也能跑，且推给的是**本机**负责人。
+
+   | 机器 | policy 派生结果 | 本机实际配置 |
+   |---|---|---|
+   | 本机 i-ll733rsj（owner=20102） | 崔成东、毕倩 | **王洪彬、崔成东**（用户指定） |
+   | 机队模板（owner=18434） | 王洪彬 | 各机自定 |
+
+   > 反例：`dingtalk-chat-digest/local.config.json` 把本机路径提交进了 git，
+   > 会被 provision 推给其他机器。本技能的收件人配置刻意不入库就是为了避开这个坑。
+
+   `boot/usage-collect.sh` 的失败预警同样走 `recipients.py --kind alert`，
+   不再写死人名；`USAGE_ALERT_USER` 环境变量可临时覆盖（排障时定向发给自己）。
 
 ## 每日自动化：两段式（宿主机采集 → 沙箱渲染）
 
@@ -234,21 +257,25 @@ store add "$F" --kind report --domain 自检报告 --task <任务号> --note "�
 $PY $S/render_report.py --facts /tmp/facts-$D.json --summary --out /tmp/summary-$D.md
 ```
 
-### 推送：一律「摘要＋文件」两条消息
+### 推送：一律「摘要＋文件」两条消息，逐个收件人各发一遍
 
 ```bash
 DWS=/root/fenshen-ludashi/bin/dws
 PROF=ding3b5622356ccdf1e2:37505774            # 各机不同，从 dws auth status 取 corp_id:user_id
+SK=/mnt/vol-eltaah12/workspace/shared/skills/ludashi-usage-daily-report/scripts
 
-# ① 摘要（Markdown DM）
-$DWS chat +dm --to <收件人> --content "$(cat /tmp/summary-$D.md)" --profile $PROF --yes --format json
-
-# ② 完整件（附件）。--file 只吃**工作目录内的相对路径**，绝对路径会被拒 → 先 cd
-cd "$(dirname "$F")"
-$DWS chat +messages-send --user-query <收件人> --file "$(basename "$F")" --profile $PROF --yes --format json
+# 收件人从本机配置解析，不许写死人名
+while IFS= read -r R; do
+  [ -n "$R" ] || continue
+  # ① 摘要（Markdown DM）
+  $DWS chat +dm --to "$R" --content "$(cat /tmp/summary-$D.md)" --profile $PROF --yes --format json
+  # ② 完整件（附件）。--file 只吃**工作目录内的相对路径**，绝对路径会被拒 → 先 cd
+  ( cd "$(dirname "$F")" && $DWS chat +messages-send --user-query "$R" --file "$(basename "$F")" \
+      --profile $PROF --yes --format json )
+done < <(python3 $SK/recipients.py --kind report)
 ```
 
-**发完必须回读核验**，不能只看 `success: true`：
+**发完必须逐个收件人回读核验**，不能只看 `success: true`；部分成功要如实报告：
 
 ```bash
 # 拿 openTaskId 换真实 messageId
@@ -259,6 +286,9 @@ $DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --f
 
 回读的 `text` 字段是**纯文本投影**，会剥掉 Markdown 表格线与反引号，所以字数比原文少
 （实测 1923 字符发出、回读 950 字）——**这不是截断**，比对末尾内容是否一致即可判断完整性。
+
+发错了要撤回：`$DWS chat +messages-recall --msg-id '<messageId>' --conversation-id '<cid>' --yes`
+（`+messages-query-send-status` 的 `nextActions` 里会直接给出可用参数）。
 
 ## 常见坑
 
@@ -273,13 +303,17 @@ $DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --f
 
 ## 文件
 
-| 路径 | 作用 |
-|---|---|
-| `scripts/build_roster.py` | 从本机 policy.toml＋whitelist_dynamic＋events＋通讯录派生重点用户名单 |
-| `scripts/usage_collect.py` | 采集器：PG＋audit＋events＋rounds → facts.json |
-| `scripts/render_report.py` | 渲染器：facts.json → 报告 Markdown |
-| `config/key_users.toml` | 名单**缓存**（派生结果＋org/dept/title），换机自动重派生 |
-| `references/template.md` | 用户给的报告模板原文 |
-| `references/data-sources.md` | 真实数据源映射、字段含义、已知缺口 |
+| 路径 | 作用 | 入库 |
+|---|---|---|
+| `scripts/build_roster.py` | 从本机 policy.toml＋whitelist_dynamic＋events＋通讯录派生重点用户名单 | ✓ |
+| `scripts/usage_collect.py` | 采集器：PG＋audit＋events＋rounds → facts.json（宿主机跑，需凭据） | ✓ |
+| `scripts/render_report.py` | 渲染器：facts.json → 报告 MD；`--summary` 出推送摘要（纯标准库） | ✓ |
+| `scripts/recipients.py` | 解析**本机**收件人（report / alert 两类） | ✓ |
+| `config/key_users.toml` | 名单**缓存**（派生结果＋org/dept/title），换机自动重派生 | ✓ |
+| `config/recipients.example.json` | 收件人配置模板与说明 | ✓ |
+| `config/recipients.local.json` | **本机收件人**（各机不同） | ✗ gitignore |
+| `references/template.md` | 用户给的报告模板原文 | ✓ |
+| `references/data-sources.md` | 真实数据源映射、字段含义、已知缺口 | ✓ |
 
 **换机器 / 人员变动后先跑 `build_roster.py`**，否则名单是上一台的。
+**换机器后检查 `recipients.local.json`**，否则会按本机 policy 派生（可能不是你想发的人）。

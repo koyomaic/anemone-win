@@ -11,3 +11,8 @@ relay-service/skills/
 *.key
 *.pem
 relay-tls/
+
+# 各机日报收件人不同（用户 2026-10-12 明确：机队成员推送对象并不都是王洪彬和崔成东），
+# 故本机收件人配置不入库；provision 21b 只比对/下发仓库里存在的文件，不会覆盖它。
+# 模板见 skills/ludashi-usage-daily-report/config/recipients.example.json
+skills/*/config/*.local.json

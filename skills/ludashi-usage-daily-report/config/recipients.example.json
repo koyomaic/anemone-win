@@ -1,0 +1,10 @@
+{
+  "_说明": "本机日报收件人配置**模板**。复制成 recipients.local.json 后按本机实际填写。",
+  "_为什么不入库": "机队各机的收件人不同（用户 2026-10-12 明确指出：并不都是王洪彬和崔成东）。recipients.local.json 已被 .gitignore 挡掉，provision 21b 只比对/下发仓库里存在的文件，故不会覆盖也不会分发本机配置。反例：dingtalk-chat-digest/local.config.json 把本机路径提交进了 git，会被推给其他机器。",
+  "_缺省行为": "recipients.local.json 不存在时，recipients.py 会从本机 policy.toml 派生缺省值（owner_userid + superadmin）并自动写出该文件，然后按派生结果推送——所以新机器零配置也能跑，但会推给本机负责人而非王洪彬。",
+  "_姓名要求": "填钉钉可解析的姓名/花名（dws chat +dm --to 按姓名唯一解析）。多候选或零命中时 dws 会停下发，此时改填 userId 并用 --by-id。",
+
+  "host": "填本机 hostname，仅作留痕，便于排查是哪台机器的配置",
+  "report": ["本机日报收件人姓名1", "本机日报收件人姓名2"],
+  "alert": ["采集/推送失败时的预警收件人，缺省沿用机队惯例 王洪彬"]
+}
