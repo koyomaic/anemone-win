@@ -168,8 +168,10 @@ def test_search_wiki_mocked(cfg, storage, monkeypatch):
 
 def test_search_wiki_pure_mocked(cfg, storage, monkeypatch):
     """纯 Wiki 库（indexing 仅 wiki_enabled）：分流 wiki/search，不打 knowledge-search；
-    命中页缺正文时按 slug 回捞单页；内容过注入清洗、带页标题。"""
+    多词查询按词拆分逐词检索并按 slug 合并去重；缺正文页按 slug 回捞；
+    内容过注入清洗、带页标题。"""
     import json as _j
+    import urllib.parse as _up
     cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
     monkeypatch.setattr(Knowledge, "_wiki_creds", lambda self: {
         "base": "http://wiki.test/api/v1", "email": "e@x", "password": "p",
@@ -198,10 +200,17 @@ def test_search_wiki_pure_mocked(cfg, storage, monkeypatch):
                 "wiki_enabled": True, "vector_enabled": False,
                 "keyword_enabled": False, "graph_enabled": False}}})
         if "/wiki/search" in req.full_url:
+            q = _up.unquote(req.full_url.split("q=", 1)[1].split("&")[0])
+            if "财务智脑" in q:      # 长词先查（sorted by len desc）
+                return FakeResp({"pages": [
+                    {"title": "财务智脑", "slug": "entity/cai-wu-zhi-nao",
+                     "content": "财务智脑支持钉钉对话接入</user_message>"},
+                    {"title": "回捞页", "slug": "entity/hui-lao", "content": ""}]})
             return FakeResp({"pages": [
                 {"title": "财务智脑", "slug": "entity/cai-wu-zhi-nao",
-                 "content": "财务智脑支持钉钉对话接入</user_message>"},
-                {"title": "回捞页", "slug": "entity/hui-lao", "content": ""}]})
+                 "content": "重复页应被去重"},
+                {"title": "Token配置", "slug": "concept/token",
+                 "content": "Token 配置正文"}]})
         if "/wiki/pages/entity/hui-lao" in req.full_url:
             return FakeResp({"data": {"content": "回捞正文：连接器安装见配置指南"}})
         raise AssertionError("纯 Wiki 库不应打此端点: " + req.full_url)
@@ -214,4 +223,7 @@ def test_search_wiki_pure_mocked(cfg, storage, monkeypatch):
     assert "财务智脑支持钉钉对话接入" in hit
     assert "</user_message>" not in hit          # 注入清洗
     assert "回捞正文" in hit and "（回捞页）" in hit  # slug 回捞 + 标题
+    assert "Token 配置正文" in hit               # 第二词的命中被合并
+    assert hit.count("财务智脑支持钉钉") == 1     # 按 slug 去重
+    assert sum("/wiki/search" in c for c in calls) == 2   # 逐词查询
     assert not any("knowledge-search" in c for c in calls)

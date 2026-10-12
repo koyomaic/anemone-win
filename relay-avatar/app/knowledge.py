@@ -212,23 +212,37 @@ class Knowledge:
         return strat
 
     def _search_wiki_pages(self, c: dict, tok: str, text: str) -> str:
-        """纯 Wiki 库检索：wiki/search 命中页自带正文；缺正文时按 slug 回捞单页
-        （slug 含路径分隔符，保留不转义）。命中内容一律过 sanitize_injected。"""
-        q = urllib.parse.quote(str(text)[:100])
-        req = urllib.request.Request(
-            c["base"] + f"/knowledgebase/{c['kb']}/wiki/search"
-                        f"?q={q}&limit={self.max_files}",
-            headers={"Authorization": "Bearer " + tok})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            d = json.loads(r.read())
-        pages = d.get("pages")
-        if pages is None:
-            data = d.get("data") or {}
-            pages = data.get("pages") if isinstance(data, dict) else data
+        """纯 Wiki 库检索：wiki/search 是关键词/实体匹配，带空格的多词查询几乎
+        必然 0 命中（实测「财务智脑」5 页、「财务智脑 配置」0 页），故按空白/标点
+        切词后逐词查询（取最长的前 3 个），按 slug 合并去重；页面缺正文时按 slug
+        回捞单页（slug 含路径分隔符，保留不转义）。命中内容一律过 sanitize_injected。
+        """
+        words = [w for w in re.split(r"[^\w\u4e00-\u9fff]+", str(text))
+                 if len(w) >= 2]
+        cands = sorted(set(words), key=len, reverse=True)[:3] or [str(text)[:50]]
+        merged: list = []
+        seen: set = set()
+        for q in cands:
+            req = urllib.request.Request(
+                c["base"] + f"/knowledgebase/{c['kb']}/wiki/search"
+                            f"?q={urllib.parse.quote(q[:50])}&limit={self.max_files}",
+                headers={"Authorization": "Bearer " + tok})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.loads(r.read())
+            pages = d.get("pages")
+            if pages is None:
+                data = d.get("data") or {}
+                pages = data.get("pages") if isinstance(data, dict) else data
+            for p in pages or []:
+                if not isinstance(p, dict):
+                    continue
+                key = str(p.get("slug") or p.get("id") or p.get("title") or "")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(p)
         out, used = [], 0
-        for p in (pages or [])[:self.max_files]:
-            if not isinstance(p, dict):
-                continue
+        for p in merged[:self.max_files]:
             body = str(p.get("content") or "")
             if not body.strip() and p.get("slug"):
                 try:
