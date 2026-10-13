@@ -88,7 +88,10 @@ enabled = false                # 群@监听默认关；开启需显式改本文�
 default_mode = "whitelist"     # whitelist=名单外一律 guest（空名单即除 super 外全拒）；blacklist 需显式配置
 guest_mode = "silent"          # 名单外处置：silent=彻底静默忽略（不回话不建会话，默认，防与自动回复 bot 互刷死循环）；
                                # guide=自我介绍+引导「申请授权/申请传文件」审批流（同人 1h 只引导一次）
-superadmin = ["18434"]         # super：全权 + 审批动态白名单
+superadmin = ["18434"]         # super：全权 + 审批动态白名单。钉钉单聊指令：
+                               #   授权 `同意 <工号|姓名>` / `同意传 <…>`(L3)；驳回待审 `拒绝 <…>`；
+                               #   收回已授权 `撤销 <工号>` 或 `撤销授权 <工号|姓名>`（仅动态白名单热撤；
+                               #   静态名单 whitelist/admins/superadmin 需改本文件后重启，不可钉钉撤）。
 admins = []                    # L1：管理员
 whitelist = []                 # L2：静态白名单
 blacklist = []                 # BLOCKED

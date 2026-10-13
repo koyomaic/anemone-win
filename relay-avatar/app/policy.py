@@ -3,6 +3,7 @@
 分层：guest / L3（文件投递）/ L2（白名单）/ L1（管理员）/ super（超管）。
 动态白名单钉钉内闭环：guest 发「申请授权/申请传文件」→ super 收通知回
 「同意/拒绝/同意传 <工号或姓名>」→ 热生效，默认 90 天过期（修 fenshen P1 无过期）。
+super 回「撤销/撤销授权 <工号或姓名>」→ 热收回动态白名单（静态名单需改 policy.toml）。
 动态数据落 run/（whitelist_dynamic.json / pending_requests.json / rate.json），
 不进 policy.toml（TOML 不宜频繁改写）。
 
@@ -335,6 +336,42 @@ class Policy:
         return [(uid, info) for uid, info in d.items()
                 if info.get("name") == target_key]
 
+    def find_dynamic_all(self, target_key: str) -> list:
+        """按 userId 或姓名找动态白名单记录（重名返回多条，由超管用工号消歧）。"""
+        wl = self.load_dynamic_wl()
+        if target_key in wl:
+            return [(target_key, wl[target_key])]
+        return [(uid, rec) for uid, rec in wl.items()
+                if rec.get("name") == target_key]
+
+    def classify_revoke(self, target: str) -> tuple:
+        """撤销目标分类 → (kind, payload)，供 _do_revoke 决策：
+          ('super', None)              目标是超管/管理员，不可自助撤
+          ('ambiguous', [(uid,rec)..]) 动态白名单重名，需工号消歧
+          ('dynamic', (uid, rec))      可热撤（revoke_dynamic）
+          ('pending_ambiguous', [..])  待审重名
+          ('pending', (uid, info))     仍是待审申请（应走「拒绝」而非撤销）
+          ('static', level)            静态名单（policy.toml，不可热撤）
+          ('none', None)               没找到任何记录
+        优先级：超管/管理员 > 动态白名单 > 待审 > 静态 > 无。
+        """
+        sl = self._static_level(target)
+        if sl in ("super", "L1"):
+            return "super", None
+        dyn = self.find_dynamic_all(target)
+        if len(dyn) > 1:
+            return "ambiguous", dyn
+        if len(dyn) == 1:
+            return "dynamic", dyn[0]
+        pend = self.find_pending_all(target)
+        if len(pend) > 1:
+            return "pending_ambiguous", pend
+        if len(pend) == 1:
+            return "pending", pend[0]
+        if sl in ("L2", "L3"):
+            return "static", sl
+        return "none", None
+
     def grant(self, uid: str, name: str, tier: str = "L2",
               by_name: str = "", valid_days: int | None = None):
         wl = self.load_dynamic_wl()
@@ -367,7 +404,7 @@ class Policy:
         return bool(self._load(self._pend_file, {}))
 
     def parse_approval(self, text: str):
-        """超管审批指令解析：('grant'|'grant_l3'|'deny', target) 或 None。"""
+        """超管审批指令解析：('grant'|'grant_l3'|'deny'|'revoke', target) 或 None。"""
         t = (text or "").strip().lstrip("/／").strip()
         m = re.match(r"^(同意传|批准传|通过传)\s*(.+)$", t)
         if m:
@@ -376,6 +413,14 @@ class Policy:
         if m:
             kind = "grant" if m.group(1) in ("同意", "通过", "批准") else "deny"
             return kind, m.group(2).strip()
+        # 撤销已授权用户（动态白名单）。显式「撤销授权 X」接受任意目标；
+        # 裸「撤销/回收」仅当目标为纯数字 uid——避免误吞「撤销刚才的任务」等日常话。
+        m = re.match(r"^(撤销授权|回收授权|取消授权|解除授权)\s*(.+)$", t)
+        if m:
+            return "revoke", m.group(2).strip()
+        m = re.match(r"^(撤销|回收)\s*(\d+)$", t)
+        if m:
+            return "revoke", m.group(2).strip()
         return None
 
     # ── 限流（每用户日任务数） ──

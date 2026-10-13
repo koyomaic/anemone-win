@@ -402,8 +402,18 @@ class Avatar:
 
     def _do_approval(self, ap, su_uid: str) -> str:
         kind, target = ap
+        if kind == "revoke":
+            return self._do_revoke(target, su_uid)
         uid, info, err = self._resolve_pending(target)
         if err:
+            # 死胡同修复：目标可能已是授权用户（不在待审），拒绝会「没找到」。
+            # 给出明确出路，而不是让超管对着「可能已处理」发懵。
+            if kind == "deny":
+                dyn = self.policy.find_dynamic_all(target)
+                if dyn:
+                    hint = dyn[0][0] if len(dyn) == 1 else target
+                    return (f"「{target}」不在待审申请里——TA 已是**授权用户**。"
+                            f"如需收回权限请回 `撤销 {hint}`。")
             return err
         name = info.get("name", target)
         avatar = self.cfg.avatar_name
@@ -426,6 +436,50 @@ class Avatar:
             return f"✅ 已给 {name}（{uid}）开通**文件投递**（L3，{days}天有效），已通知本人。{note}"
         self._dm(uid, f"✅ 你的使用申请已通过，现在可以用我了～ 我是「{avatar}」。")
         return f"✅ 已开通 {name}（{uid}）的权限（L2，{days}天有效），已通知本人。{note}"
+
+    def _do_revoke(self, target: str, su_uid: str) -> str:
+        """超管撤销已授权用户（动态白名单热收回）。仅 super 门禁可达。
+
+        边界：静态名单（policy.toml 的 whitelist/admins/superadmin）不在此热撤——
+        toml 回写风险高，且撤超管/管理员属配置变更，须走主机改文件（与 dashboard
+        「静态名单不在此写」同源）。待审申请应用「拒绝」而非撤销。
+        """
+        avatar = self.cfg.avatar_name
+        kind, payload = self.policy.classify_revoke(target)
+        if kind == "super":
+            return (f"「{target}」是管理员/超管，不能在钉钉里撤销；"
+                    f"如需调整请在主机改 policy.toml 后重启 avatar。")
+        if kind == "ambiguous":
+            lines = "\n".join(f"- {r.get('name', '?')}（工号 {u}）"
+                              for u, r in payload)
+            return f"有多个叫「{target}」的授权用户，请用**工号**指定：\n{lines}"
+        if kind == "dynamic":
+            uid, rec = payload
+            name = rec.get("name", target)
+            tier = rec.get("tier", "L2")
+            if not self.policy.revoke_dynamic(uid):
+                return f"撤销失败：{name}（{uid}）已不在动态白名单。"
+            self.audit.log("revoke_access", su_uid,
+                           f"撤销 {name}({uid}) tier={tier}")
+            try:
+                self._dm(uid, f"⚠️ 你的「{avatar}」使用权限已被管理员收回。"
+                              f"如需恢复请重新发「申请授权」。")
+            except Exception as e:
+                log("revoke notify failed:", e)
+            return f"✅ 已撤销 {name}（{uid}）的权限（原 {tier}），已通知本人。"
+        if kind == "pending_ambiguous":
+            lines = "\n".join(f"- {i.get('name', '?')}（工号 {u}）"
+                              for u, i in payload)
+            return f"有多个叫「{target}」的待审申请，请用**工号**指定：\n{lines}"
+        if kind == "pending":
+            uid, info = payload
+            return (f"「{info.get('name', target)}」还是**待审申请**（尚未授权），"
+                    f"无需撤销；如不批准请回 `拒绝 {uid}`。")
+        if kind == "static":
+            return (f"「{target}」在**静态名单**（policy.toml，{payload}）里，"
+                    f"不能热撤销；需在主机改 policy.toml 后重启 avatar。")
+        return (f"没找到「{target}」的授权记录（撤销只对**已授权用户**生效；"
+                f"待审申请请用 `拒绝 {target}`）。")
 
     def _handle_unauthorized(self, uid: str, sender: str, text: str,
                              is_group: bool, ev: dict) -> str:

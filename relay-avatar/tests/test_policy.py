@@ -64,6 +64,68 @@ def test_parse_approval(policy):
     assert policy.parse_approval("你好") is None
 
 
+def test_parse_approval_revoke(policy):
+    # 显式「撤销授权 X」接受任意目标（uid 或姓名）
+    assert policy.parse_approval("撤销授权 王思义") == ("revoke", "王思义")
+    assert policy.parse_approval("取消授权 张三") == ("revoke", "张三")
+    assert policy.parse_approval("回收授权 23518") == ("revoke", "23518")
+    assert policy.parse_approval("解除授权 李四") == ("revoke", "李四")
+    # 裸「撤销/回收」仅当目标为纯数字 uid
+    assert policy.parse_approval("撤销 23518") == ("revoke", "23518")
+    assert policy.parse_approval("回收 12139") == ("revoke", "12139")
+    assert policy.parse_approval("/撤销 555") == ("revoke", "555")
+    # 裸动词 + 非数字目标 → 不拦截，落回日常会话（防误吞「撤销任务」）
+    assert policy.parse_approval("撤销刚才的任务") is None
+    assert policy.parse_approval("撤销任务8") is None
+    assert policy.parse_approval("回收") is None
+    # 既有 grant/deny 语义不受影响
+    assert policy.parse_approval("同意 555") == ("grant", "555")
+    assert policy.parse_approval("拒绝 555") == ("deny", "555")
+
+
+def test_find_dynamic_all(policy):
+    policy.grant("555", "张三", tier="L2")
+    assert policy.find_dynamic_all("555")[0][0] == "555"
+    assert policy.find_dynamic_all("张三")[0][1]["name"] == "张三"
+    assert policy.find_dynamic_all("nobody") == []
+    # 重名 → 多条，由超管用工号消歧
+    policy.grant("666", "张三", tier="L3")
+    assert len(policy.find_dynamic_all("张三")) == 2
+    assert len(policy.find_dynamic_all("555")) == 1
+
+
+def test_classify_revoke(policy):
+    # 超管/管理员不可自助撤
+    assert policy.classify_revoke("18434") == ("super", None)   # superadmin
+    assert policy.classify_revoke("100") == ("super", None)     # admin L1
+    # 动态白名单（按 uid 与姓名）
+    policy.grant("555", "张三", tier="L2")
+    k, p = policy.classify_revoke("555")
+    assert k == "dynamic" and p[0] == "555"
+    k, p = policy.classify_revoke("张三")
+    assert k == "dynamic" and p[0] == "555"
+    # 动态重名 → ambiguous
+    policy.grant("666", "张三", tier="L3")
+    k, p = policy.classify_revoke("张三")
+    assert k == "ambiguous" and len(p) == 2
+    # 待审申请 → pending（应走拒绝）
+    policy.record_pending("777", "李四", "")
+    assert policy.classify_revoke("777")[0] == "pending"
+    # 静态名单 → static（不可热撤）
+    assert policy.classify_revoke("200") == ("static", "L2")   # whitelist
+    assert policy.classify_revoke("300") == ("static", "L3")   # file_uploaders
+    # 没找到
+    assert policy.classify_revoke("nobody") == ("none", None)
+
+
+def test_revoke_dynamic_roundtrip(policy):
+    policy.grant("555", "张三", tier="L2")
+    assert policy.get_level("555") == "L2"
+    assert policy.revoke_dynamic("555") is True
+    assert policy.get_level("555") == "NONE"
+    assert policy.revoke_dynamic("555") is False   # 幂等：再撤返回 False
+
+
 def test_level_of_multi_ident(policy):
     """静态名单兼容 openId/显示名（im-bridge 迁移语义）；动态授权只认 userId。"""
     policy.whitelist.add("OPENID-X")     # 旧 config.json 里的 openId 条目

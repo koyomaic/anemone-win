@@ -171,6 +171,71 @@ def test_approval_deny_and_missing(avatar):
     assert any("没找到" in t for t in texts(avatar))
 
 
+def test_approval_revoke_flow(avatar):
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
+    # 先授权 555
+    avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="20"))
+    avatar.on_event(ev("同意 555", sid="sid18434", sender="王洪彬", n="21"))
+    assert avatar.policy.get_level("555") == "L2"
+    # 超管撤销 555（裸撤销 + 数字 uid）
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("撤销 555", sid="sid18434", sender="王洪彬", n="22"))
+    assert avatar.policy.get_level("555") == "NONE"
+    assert any("已撤销" in t for t in texts(avatar))
+    # 被撤人收到收回通知
+    assert any(tgt.get("user_id") == "555" and "收回" in t
+               for tgt, t in avatar.dws.sent)
+    audit = (avatar.cfg.state / "audit" / "audit.log").read_text("utf-8")
+    assert "revoke_access" in audit
+
+
+def test_revoke_by_name_and_explicit_verb(avatar):
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
+    avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="30"))
+    avatar.on_event(ev("同意 555", sid="sid18434", n="31"))
+    # 显式「撤销授权 <姓名>」
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("撤销授权 访客", sid="sid18434", n="32"))
+    assert avatar.policy.get_level("555") == "NONE"
+    assert any("已撤销" in t for t in texts(avatar))
+
+
+def test_deny_already_granted_hints_revoke(avatar):
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
+    avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="23"))
+    avatar.on_event(ev("同意 555", sid="sid18434", n="24"))
+    avatar.dws.sent.clear()
+    # 对已授权用户误用「拒绝」→ 死胡同修复：提示改用撤销，且不误撤
+    avatar.on_event(ev("拒绝 555", sid="sid18434", n="25"))
+    joined = "\n".join(texts(avatar))
+    assert "撤销 555" in joined
+    assert avatar.policy.get_level("555") == "L2"
+
+
+def test_revoke_superadmin_refused(avatar):
+    # 超管不能被钉钉自助撤销
+    avatar.on_event(ev("撤销 18434", sid="sid18434", n="26"))
+    assert any("管理员/超管" in t for t in texts(avatar))
+    assert avatar.policy.get_level("18434") == "super"
+
+
+def test_revoke_static_whitelist_refused(avatar):
+    # 静态白名单（policy.toml）不可热撤
+    avatar.on_event(ev("撤销授权 200", sid="sid18434", n="27"))
+    assert any("静态名单" in t for t in texts(avatar))
+    assert avatar.policy.get_level("200") == "L2"
+
+
+def test_revoke_pending_hints_deny(avatar):
+    avatar.cfg._p.setdefault("permissions", {})["guest_mode"] = "guide"
+    avatar.on_event(ev("申请授权", sid="sid555", sender="访客", n="28"))
+    avatar.dws.sent.clear()
+    # 对待审申请用撤销 → 提示改用拒绝，不误撤待审
+    avatar.on_event(ev("撤销 555", sid="sid18434", n="29"))
+    assert any("待审申请" in t and "拒绝 555" in t for t in texts(avatar))
+    assert avatar.policy.find_pending_all("555")
+
+
 def test_l3_file_uploader_text(avatar):
     avatar.on_event(ev("帮我查一下", sid="sid300", sender="李四", n="9"))
     assert any("尚未在本机启用" in t for t in texts(avatar))
