@@ -236,6 +236,24 @@ class Executor:
             state = os.path.join(self.cfg.users_root, _state_dirname(user), ".claude")
             os.makedirs(state, exist_ok=True)
             env["CLAUDE_CONFIG_DIR"] = state
+            # 单轮 LLM 调用保护。task_timeout 只管整个任务，管不到单轮：实测
+            # 20/145 轮是「停顿轮」（输出 <2000 字符却 >60s），吃掉 LLM 总时间
+            # 的 35%，最坏一轮单次 API 调用挂 269s 只产出 1150 字符。claude-code
+            # 的 API_TIMEOUT_MS 默认 600s，这种停顿完全在阈值内、不触发重试。
+            # 取值依据见 config.py 的 api_timeout_ms 注释（合法轮最长 133.5s，
+            # 设 120s 会误杀，故取 180s 留 35% 余量）。0/负值＝不设，沿用默认。
+            if self.cfg.api_timeout_ms > 0:
+                env["API_TIMEOUT_MS"] = str(int(self.cfg.api_timeout_ms))
+            if self.cfg.api_first_byte_timeout_ms > 0:
+                # 专管「连上了但迟迟不吐首字节」，claude-code 对该原因有独立重试
+                # 上限（不占会话预算），内部钳位 [10s, 1800s]。
+                env["CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS"] = str(
+                    int(self.cfg.api_first_byte_timeout_ms))
+            if self.cfg.api_max_retries >= 0:
+                # 名字必须是 CLAUDE_CODE_MAX_RETRIES：MAX_RETRIES 在 claude 二进制
+                # 里 0 命中（只作为前者后缀存在），传了等于没传。钳位上限 15。
+                env["CLAUDE_CODE_MAX_RETRIES"] = str(
+                    min(int(self.cfg.api_max_retries), 15))
         return env
 
     async def run(self, *, task_id: int, workdir: str, prompt: str,

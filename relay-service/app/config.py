@@ -139,6 +139,29 @@ class Settings:
     admin_token: str = "change-me"
     max_concurrent: int = 3
     task_timeout: float = 1800.0
+    # ── 单轮 LLM 调用保护（claude 引擎专用，透传为 claude-code 环境变量）──
+    #
+    # 为什么需要：task_timeout 只管**整个任务**，管不到单轮。2026-10-13 实测
+    # T769/T770/T771/T775/T782 五任务 145 轮，其中 20 轮是「停顿轮」（输出
+    # <2000 字符却耗时 >60s），合计 2101s ＝ LLM 总时间的 35%。最极端一轮
+    # （T775 R25）tool_result 落在 02:48:45.307、下一条 assistant 消息
+    # 02:53:14.707——单次 API 调用挂了 269 秒只产出 1150 字符（4 字符/s，
+    # 而正常生成速率是 116~201 字符/s）。claude-code 的 API_TIMEOUT_MS 默认
+    # 600000ms(10min)，所以这种停顿完全在默认阈值内，不会触发任何重试。
+    #
+    # 取值依据（不能拍脑袋设小）：同批实测**合法**轮最长 133.5s（一次 Write
+    # 生成 26532 字符 HTML）。设 120s 会误杀 2 个合法轮，故取 180s——比合法
+    # 最长值留 35% 余量，同时仍能截掉 269s/236s 两个最坏停顿，且比默认 600s
+    # 紧 3.3 倍。0/负值＝不设限（沿用 claude-code 默认）。
+    api_timeout_ms: float = 180000.0
+    # 首字节窗口：等响应头的上限。与 api_timeout_ms 互补——后者管整次调用，
+    # 前者专管「连上了但迟迟不吐第一个字节」，正是停顿轮的典型形态。claude-code
+    # 对该原因有独立重试上限（不占会话重试预算），故可以设得比 api_timeout_ms 紧。
+    # 内部钳位区间 [10s, 1800s]。0/负值＝不设。
+    api_first_byte_timeout_ms: float = 60000.0
+    # 重试次数。注意环境变量名是 CLAUDE_CODE_MAX_RETRIES，**不是** MAX_RETRIES
+    # （后者在 claude 二进制里 0 命中，只作为前者的后缀存在）；内部钳位上限 15。
+    api_max_retries: int = 3
     engine: str = "opencode"  # opencode | claude
     agent_bin: str = ""
     model: str = ""
@@ -193,6 +216,10 @@ class Settings:
             admin_token=os.environ.get("RELAY_ADMIN_TOKEN", "change-me"),
             max_concurrent=int(os.environ.get("RELAY_MAX_CONCURRENT", "3")),
             task_timeout=float(os.environ.get("RELAY_TASK_TIMEOUT", "1800")),
+            api_timeout_ms=float(os.environ.get("RELAY_API_TIMEOUT_MS", "180000")),
+            api_first_byte_timeout_ms=float(
+                os.environ.get("RELAY_API_FIRST_BYTE_TIMEOUT_MS", "60000")),
+            api_max_retries=int(os.environ.get("RELAY_API_MAX_RETRIES", "3")),
             engine=os.environ.get("RELAY_ENGINE", "opencode"),
             agent_bin=os.environ.get("RELAY_AGENT_BIN", ""),
             model=os.environ.get("RELAY_MODEL", ""),

@@ -93,6 +93,73 @@ def test_build_env_opencode_no_claude_vars(tmp_path):
     ex = Executor(_cfg(tmp_path, engine="opencode"))
     env = ex.build_env(str(tmp_path / "wd"), None, user="u")
     assert "IS_SANDBOX" not in env and "CLAUDE_CONFIG_DIR" not in env
+    # 单轮保护是 claude-code 专有环境变量，opencode 分支不得注入
+    for k in ("API_TIMEOUT_MS", "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS",
+              "CLAUDE_CODE_MAX_RETRIES"):
+        assert k not in env
+
+
+# ---- 单轮 LLM 调用保护（停顿轮治理）----
+#
+# 背景：task_timeout 只管整个任务，管不到单轮。实测 20/145 轮是停顿轮
+# （输出 <2000 字符却 >60s），吃掉 LLM 总时间 35%，最坏一轮单次 API 调用
+# 挂 269s。claude-code 的 API_TIMEOUT_MS 默认 600s，停顿完全在阈值内。
+
+def test_build_env_claude_api_guards_default(tmp_path):
+    env = Executor(_cfg(tmp_path)).build_env(str(tmp_path / "wd"), None, user="u")
+    assert env["API_TIMEOUT_MS"] == "180000"
+    assert env["CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS"] == "60000"
+    assert env["CLAUDE_CODE_MAX_RETRIES"] == "3"
+
+
+def test_build_env_claude_retry_var_name(tmp_path):
+    """名字必须是 CLAUDE_CODE_MAX_RETRIES：MAX_RETRIES 在 claude 二进制里 0 命中
+    （只作为前者后缀存在），传了等于没传——这条防的是「静默无效」回归。"""
+    env = Executor(_cfg(tmp_path)).build_env(str(tmp_path / "wd"), None, user="u")
+    assert "MAX_RETRIES" not in env, "裸 MAX_RETRIES 不是 claude-code 的环境变量名"
+    assert "CLAUDE_CODE_MAX_RETRIES" in env
+
+
+def test_build_env_claude_api_guards_from_settings(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.api_timeout_ms = 240000.0
+    cfg.api_first_byte_timeout_ms = 90000.0
+    cfg.api_max_retries = 5
+    env = Executor(cfg).build_env(str(tmp_path / "wd"), None, user="u")
+    assert env["API_TIMEOUT_MS"] == "240000"
+    assert env["CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS"] == "90000"
+    assert env["CLAUDE_CODE_MAX_RETRIES"] == "5"
+
+
+def test_build_env_claude_api_guards_disabled(tmp_path):
+    """0/负值＝不设限，沿用 claude-code 默认（逃生舱：阈值误杀合法轮时可关）。"""
+    cfg = _cfg(tmp_path)
+    cfg.api_timeout_ms = 0.0
+    cfg.api_first_byte_timeout_ms = -1.0
+    env = Executor(cfg).build_env(str(tmp_path / "wd"), None, user="u")
+    assert "API_TIMEOUT_MS" not in env
+    assert "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS" not in env
+    assert "CLAUDE_CODE_MAX_RETRIES" in env, "重试次数独立于两个超时，不受其开关影响"
+
+
+def test_build_env_claude_max_retries_clamped(tmp_path):
+    """claude-code 内部钳位上限 15；超了会被静默 clamp 并打 warn，不如自己先夹。"""
+    cfg = _cfg(tmp_path)
+    cfg.api_max_retries = 99
+    env = Executor(cfg).build_env(str(tmp_path / "wd"), None, user="u")
+    assert env["CLAUDE_CODE_MAX_RETRIES"] == "15"
+
+
+def test_settings_api_guards_from_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAY_API_TIMEOUT_MS", "150000")
+    monkeypatch.setenv("RELAY_API_FIRST_BYTE_TIMEOUT_MS", "45000")
+    monkeypatch.setenv("RELAY_API_MAX_RETRIES", "2")
+    monkeypatch.setenv("RELAY_WORKSPACE", str(tmp_path))
+    from app.config import Settings
+    s = Settings.from_env()
+    assert s.api_timeout_ms == 150000.0
+    assert s.api_first_byte_timeout_ms == 45000.0
+    assert s.api_max_retries == 2
 
 
 def test_state_dirname():
