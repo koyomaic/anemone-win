@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""把 usage_collect.py 的 facts.json 渲染成《鲁大师用户日度使用分析报告》Markdown。
+"""把 usage_collect.py 的 facts.json 渲染成《<本机分身>用户日度使用分析报告》Markdown。
+
+报告抬头的分身名**按机取**（facts.display_name，由宿主机 usage_collect.py 写入）：
+本机（bot 自称鲁大师）显示「鲁大师」，其他机显示各自 avatar_name——技能机队共享但
+抬头不写死鲁大师。人工裸跑无 facts.display_name 时由 self_name.py 兜底解析。
 
 用法：
     render_report.py --facts facts.json [--out report.md] [--mode auto-skill]
@@ -15,7 +19,19 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import sys
+
+# 本机分身展示名解析器（同目录 self_name.py）。正常路径下 display_name 已由宿主机
+# usage_collect.py 写进 facts，这里只在 facts 缺该字段（如人工裸跑）时兜底解析。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from self_name import LUDASHI, resolve_display_name as _resolve_display_name
+except Exception:                       # 解析器缺失也不让渲染中断
+    LUDASHI = "鲁大师"
+
+    def _resolve_display_name() -> str:
+        return LUDASHI
 
 TEMPLATE_VERSION = "v1.0（2026-10-12 依用户模板固化）"
 SRC_ORDER = ["cron", "dingtalk", "api_server", "cli", "acp", "feishu", "system", "replay"]
@@ -108,9 +124,10 @@ def render(f: dict, mode: str) -> str:
     lg = f.get("logs") or {}
     date = f["report_date"]
     weekend = f.get("is_weekend")
+    name = f.get("display_name") or LUDASHI   # 本机分身展示名（宿主机已写进 facts）
 
     # ── 抬头
-    L.append(f"# 鲁大师用户日度使用分析报告（{date}）")
+    L.append(f"# {name}用户日度使用分析报告（{date}）")
     L.append("")
     w = f.get("window") or {}
     trade = "非交易日（周末）" if weekend else "交易日（未扣除法定节假日，见附录 A）"
@@ -503,9 +520,10 @@ def render_summary(f: dict) -> str:
     date = f["report_date"]
     wk = f.get("weekday", "")
     trade = "非交易日" if f.get("is_weekend") else "交易日"
+    name = f.get("display_name") or LUDASHI   # 本机分身展示名
 
     if not pg.get("ok"):
-        return (f"**鲁大师用户日度使用分析（{date} {wk}）**\n\n"
+        return (f"**{name}用户日度使用分析（{date} {wk}）**\n\n"
                 f"**[降级]** {(f.get('degraded') or ['PG 不可用'])[0]}\n"
                 f"当日仅有机日志口径：入站消息 {lg.get('inbound_msgs', 0)} 条、"
                 f"审计异常 {len(lg.get('anomalies') or [])} 项。任务级与用户级指标缺失，"
@@ -528,7 +546,7 @@ def render_summary(f: dict) -> str:
     per = round(t["questions"] / t["active_users"], 1) if t.get("active_users") else "-"
 
     L = [
-        f"**鲁大师用户日度使用分析（{date} {wk}·{trade}）**",
+        f"**{name}用户日度使用分析（{date} {wk}·{trade}）**",
         "",
         f"**用量**：人工提问 **{t.get('questions', 0)}** 条（环比 {d_(t.get('questions'), p.get('questions'))}）"
         f"｜活跃 **{t.get('active_users', 0)}** 人｜人均 {per} 条",
@@ -550,14 +568,36 @@ def render_summary(f: dict) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="渲染鲁大师用户日度使用分析报告")
-    ap.add_argument("--facts", required=True)
+    ap = argparse.ArgumentParser(description="渲染本机分身用户日度使用分析报告")
+    ap.add_argument("--facts")
     ap.add_argument("--out")
     ap.add_argument("--mode", default="自动-skill", help="人工 / 自动-skill")
     ap.add_argument("--summary", action="store_true",
                     help="只输出推送用摘要（聚焦用户使用量，不含任务原文）；推送一律「摘要＋文件」")
+    ap.add_argument("--name",
+                    help="覆盖报告展示名（缺省取 facts.display_name，再缺省按机解析：本机鲁大师/其他机 avatar_name）")
+    ap.add_argument("--print-name", action="store_true",
+                    help="只打印本机报告展示名（供 shell 拼报告文件名），不渲染报告")
     a = ap.parse_args()
+
+    # --print-name 可脱离 facts 单独取展示名（拼文件名时 facts 可能还没生成）
+    if a.print_name and not a.facts:
+        print(a.name or _resolve_display_name())
+        return 0
+    if not a.facts:
+        ap.error("--facts 必填（除非用 --print-name 单独取展示名）")
+
     f = json.load(open(a.facts, encoding="utf-8"))
+    # 展示名优先级：--name 覆盖 > facts.display_name（宿主机采集时写入）> 按机兜底解析
+    if a.name:
+        f["display_name"] = a.name
+    elif not f.get("display_name"):
+        f["display_name"] = _resolve_display_name()
+
+    if a.print_name:
+        print(f["display_name"])
+        return 0
+
     md = render_summary(f) if a.summary else render(f, a.mode)
     if a.out:
         open(a.out, "w", encoding="utf-8").write(md)

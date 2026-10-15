@@ -8,6 +8,12 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 
 按固定模板盘点**某一天**鲁大师的使用情况，产出可交给领导的 Markdown 报告。
 
+> **报告抬头按机取分身名（2026-10-15）**：本技能机队共享，但报告**标题/摘要/文件名**里的分身名
+> **不写死鲁大师**——由 `scripts/self_name.py` 按机解析：本机（bot 自称鲁大师）显示「鲁大师」，
+> 其他机显示各自 `policy.toml` 的 `avatar_name`（如智微办）。宿主机 `usage_collect.py` 把解析结果写进
+> `facts.display_name`，渲染端只读它（沙箱读不到 identity/policy 也不会错）。下文其余「鲁大师」多指
+> **relay 全机队共用 bot token 的主体名**（PG 里 `tasks.user`/`plans.owner_name` 的字面值），属事实口径，不随机器变。
+
 ## 铁律（先读，违反即报告失真）
 
 1. **数字只能来自 `usage_collect.py` 的 facts.json**，不许自己心算、不许从日志里"目测"。
@@ -278,7 +284,10 @@ D=2026-10-11                                   # 报告日
 PY=/mnt/vol-eltaah12/finaagent/.venv/bin/python
 S=/mnt/vol-eltaah12/finaagent/relay-dev/skills/ludashi-usage-daily-report/scripts
 OUT=/mnt/vol-eltaah12/workspace/shared/report/自检报告/$(date +%Y-%m)
-F=$OUT/$(date +%Y%m%d)_T<任务号>_鲁大师用户日度使用分析_${D}_v1.md
+# 报告抬头/文件名用**本机分身名**，不写死鲁大师：本机=鲁大师，其他机=各自 avatar_name。
+# display_name 由宿主机 usage_collect.py 写进 facts；--print-name 取出，与报告标题同源一致。
+NAME=$($PY $S/render_report.py --facts /tmp/facts-$D.json --print-name)
+F=$OUT/$(date +%Y%m%d)_T<任务号>_${NAME}用户日度使用分析_${D}_v1.md
 
 # 1) 落盘（域用「自检报告」＝系统自身运行度量，最贴合）
 mkdir -p $OUT && cp /tmp/report-$D.md "$F"
@@ -340,7 +349,8 @@ $DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --f
 |---|---|---|
 | `scripts/build_roster.py` | 从本机 policy.toml＋whitelist_dynamic＋events＋通讯录派生重点用户名单 | ✓ |
 | `scripts/usage_collect.py` | 采集器：PG＋audit＋events＋rounds → facts.json（宿主机跑，需凭据） | ✓ |
-| `scripts/render_report.py` | 渲染器：facts.json → 报告 MD；`--summary` 出推送摘要（纯标准库） | ✓ |
+| `scripts/render_report.py` | 渲染器：facts.json → 报告 MD；`--summary` 出推送摘要；`--print-name` 出本机展示名（纯标准库） | ✓ |
+| `scripts/self_name.py` | 解析**本机**分身展示名：bot 自称鲁大师→鲁大师，否则 policy.toml `avatar_name`（标题/摘要/文件名用） | ✓ |
 | `scripts/recipients.py` | 解析**本机**收件人（report / alert 两类） | ✓ |
 | `config/key_users.toml` | 名单**缓存**（派生结果＋org/dept/title），换机自动重派生 | ✓ |
 | `config/recipients.example.json` | 收件人配置模板与说明 | ✓ |

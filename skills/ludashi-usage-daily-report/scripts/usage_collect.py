@@ -50,6 +50,15 @@ RELAY_ENV = "/mnt/vol-eltaah12/workspace/relay.env"
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROSTER = os.path.join(SKILL_DIR, "config", "key_users.toml")
 
+# 本机分身展示名解析器（同目录 self_name.py）。宿主机采集时解析并写进 facts，
+# 渲染端（沙箱）只读 facts.display_name，避免沙箱读不到 identity.local.json/policy.toml。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from self_name import resolve_display_name as _resolve_display_name
+except Exception:                       # 解析器缺失也不让采集中断，兜底鲁大师
+    def _resolve_display_name() -> str:
+        return "鲁大师"
+
 SYSTEM_ACCOUNTS = {"__admin__", "canary", "__plan_tick__", ""}
 DINGTALK_PROJECTS = {"avatar-local", "relay-avatar"}
 # relay 侧代投任务描述里追加的投递铁律尾巴，去重前剥掉
@@ -588,6 +597,7 @@ def main() -> int:
     facts = {
         "report_date": date.isoformat(),
         "prev_date": prev.isoformat(),
+        "display_name": _resolve_display_name(),   # 本机分身展示名（标题/摘要/文件名用）
         "weekday": "周" + "一二三四五六日"[date.weekday()],
         "is_weekend": date.weekday() >= 5,
         "snapshot_time": dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
