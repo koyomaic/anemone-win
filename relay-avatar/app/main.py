@@ -78,6 +78,13 @@ SEND_MAX_FILES = 5            # 单次结果最多代投几件，防刷
 DELETE_BLOCK_RE = re.compile(r"```delete_file[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 DELETE_MAX_FILES = 10
 
+# agent 收尾自总结段的标题（build_prompt 要求「完成后用 2-5 句话总结：做了什么、
+# 改了哪些文件」，通常落在结果末尾）。断链摘要优先取它，而非头部硬截断。
+SUMMARY_HEAD_RE = re.compile(
+    r"^(?:#{1,6}\s*)?(?:\*\*|【)?\s*"
+    r"(总结|小结|完成情况|做了什么|本次(?:完成|改动|变更)|改动(?:了)?(?:哪些)?文件|"
+    r"变更(?:了)?(?:哪些)?文件|交付(?:物)?(?:清单)?|结果汇总|收尾)")
+
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
@@ -911,7 +918,8 @@ class Avatar:
             return
         resume = self.sess.resume_candidate(s)
         desc = self._with_chain_digest(s, desc, resume)
-        r = self.exec_relay.submit(desc + self._relay_marker_rules(s),
+        # resume 时上一轮 desc 已带完整铁律且在重放的 transcript 里，只发精简版去重
+        r = self.exec_relay.submit(desc + self._relay_marker_rules(s, brief=bool(resume)),
                                    resume_from=resume, uid=uid,
                                    requester=self._requester_name(s))
         if "_error" in r:
@@ -1401,22 +1409,51 @@ class Avatar:
                 self._dm(su, txt)
 
     def _chain_digest(self, row: dict) -> str:
-        """上一任务 result → 接续摘要：剥掉所有围栏标记后截断。
+        """上一任务 result → 接续摘要：剥标记后优先取 agent 收尾自总结。
 
         **必须剥标记**：`row["result"]` 是原始结果——`_consume_plan_markers` /
         `_consume_send_markers` 只在 `_send_result` 的局部变量上剔除，不改 row。
         若把含 ```plan``` / ```send_file``` 的原文当摘要注入下一轮 desc，agent
         一旦回显，消费侧会**重复建计划 / 重复代投**——与 _plan_create_note 的
         占位符防护同类事故，只不过这次来源是我们自己。
+
+        **为何不再头部硬截断**：build_prompt 要求 agent 收尾出 2-5 句总结（落在结果
+        **末尾**），旧的 `txt[:cap]` 取**开头**，大概率截不到总结、还截在句中。改为
+        超 cap 时优先取末尾自总结段；无显式总结标题则取末尾窗口并对齐段落边界（总结
+        在结尾，末尾窗口比头部更可能命中它，且不截在句中）。
         """
         txt = str(row.get("result") or "")
         for rx in (PLAN_BLOCK_RE, SEND_BLOCK_RE, DELETE_BLOCK_RE):
             txt = rx.sub("", txt)
         txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
         cap = int(self.cfg.get("ingress", "resume_digest_chars", 2000))
-        if cap > 0 and len(txt) > cap:
-            txt = txt[:cap].rstrip() + "…（已截断）"
-        return txt
+        if cap <= 0 or len(txt) <= cap:
+            return txt
+        body = self._locate_summary(txt)
+        if body is None:
+            body = txt[-cap:]
+            nl = body.find("\n\n")
+            if 0 <= nl < len(body) * 0.6:   # 丢弃首段残句，从完整段落起
+                body = body[nl + 2:]
+            body = body.lstrip()
+        if len(body) > cap:
+            body = body[:cap].rstrip()
+        return body.rstrip() + "…（已截断）"
+
+    @staticmethod
+    def _locate_summary(txt: str) -> str | None:
+        """定位末尾自总结段（标题命中 SUMMARY_HEAD_RE 且落在后半段）。无则 None。"""
+        lines = txt.split("\n")
+        n = len(lines)
+        start = None
+        for i, ln in enumerate(lines):
+            if i < n * 0.4:        # 只看后半段，避免命中正文中段的「总结」字样
+                continue
+            if SUMMARY_HEAD_RE.match(ln.strip()):
+                start = i          # 取最后一处命中的总结标题
+        if start is None:
+            return None
+        return "\n".join(lines[start:]).strip()
 
     def _with_chain_digest(self, s: dict, desc: str, resume) -> str:
         """断链时把上一轮结果摘要前置进 desc，并清零链计数。
@@ -1439,7 +1476,7 @@ class Avatar:
                 "提到的文件。\n"
                 f"{digest}\n\n---\n\n{desc}")
 
-    def _relay_marker_rules(self, s: dict) -> str:
+    def _relay_marker_rules(self, s: dict, brief: bool = False) -> str:
         """附在 relay 任务描述末尾的标记铁律：发起人身份 + 代投/代建通道。
 
         为什么必须显式写进描述：relay 任务的 CLAUDE.md **不含发起人身份**（#242 的
@@ -1473,6 +1510,18 @@ class Avatar:
         r = s.get("reply") or {}
         who = str(r.get("sender") or "").strip() or "发起人"
         conv = "群聊" if r.get("is_group") else "单聊"
+        if brief:
+            # 接续会话（resume）：上一轮 desc 已带完整铁律、仍在重放的 transcript 里，
+            # 这轮再发一遍纯属重复（每轮多 ~4KB≈1.5K token，链尾随深度翻倍）。只补
+            # 动态身份 + 核心禁令 + 指向上文；字段示例不重发，防 agent 凭记忆改写格式。
+            return (
+                f"\n\n---\n【投递铁律｜接续会话，完整口径见上文】\n"
+                f"本任务由「{who}」通过钉钉分身（{conv}）发起，结果回到该会话。\n"
+                f"· 仍**禁止自行跑 dws/钉钉发送**（本机 dws 账号是机器人"
+                f"「{self.cfg.avatar_name}」，自发只会发给机器人自己、发起人收不到）；\n"
+                f"· 交付文件用 ```send_file``` 围栏块、定时计划用 ```plan``` 围栏块，"
+                f"由分身代办——字段与示例见本会话上文铁律，**勿凭记忆改写格式**。\n"
+            )
         return (
             f"\n\n---\n【投递铁律｜由分身代投，禁止自行发送】\n"
             f"本任务由「{who}」通过钉钉分身（{conv}）发起，结果会回到该会话。\n"

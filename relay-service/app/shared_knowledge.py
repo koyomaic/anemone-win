@@ -94,12 +94,66 @@ def load_shared_mcp(shared_dir: str) -> dict:
     return out
 
 
+# 注入 CLAUDE.md/AGENTS.md 时从团队记忆滤掉的「运行时元数据」：附录／溯源／度量口径。
+# 它们对 agent 执行任务无约束力，却每轮随上下文重放——口径与红线.md 59KB 里光附录
+# （附一抽取对应表／附二续补登记／附三版本记录）就占 13KB，实测每任务 CLAUDE.md
+# 61.5KB≈2 万 token 起步（含只读复核这类 600-token 小任务）。只删确定无约束力的部分：
+# `## 附*` 整节、`溯源:`／`度量口径` 行；`若→则`／红线／EFF 纪律逐字保留。
+# 完整原文仍在 shared/memory/，agent 需要时按文末指引 Read。
+#
+# 为什么在「注入时过滤」而不是把附录拆成单独文件：shared/memory/ 不经 store 索引、
+# 也不随 git 传播（仅 dashboard 逐机上传，见 relay-service main.py 的 shared_memory_upload），
+# 机队每台各存一份本地卷。拆出新持久文件就得逐机重新上传、还可能与 store/wiki 血缘打架；
+# 而过滤逻辑是 CODE，走 relay-dev→boot.sh 天然全机队一致生效，原文保持单一权威件不动。
+_MEM_DROP_SECTION_RE = re.compile(r"^##\s*附")
+_MEM_DROP_LINE_RE = re.compile(r"^\s*[-*·]?\s*\**\s*(溯源|度量口径)")
+
+
+def _slim_memory_body(body: str) -> tuple[str, bool]:
+    """滤掉记忆正文里的运行时元数据，返回 (瘦身后正文, 是否有删减)。
+
+    删三类（均无任务约束力）：①第一个 `## ` 规则节之前的 `>` 前言块引用
+    （版本线／来源／日期／修订留痕等变更日志）；②`## 附*` 整节（抽取对应表／
+    续补登记／版本记录）；③行首 `溯源:`／`度量口径` 行。规则节内的 `>` 块引用
+    保留（可能是示例），`若→则`／红线／EFF 纪律逐字不动。
+    """
+    out: list[str] = []
+    dropping = False        # 处于被删的 ## 附* 节内
+    seen_section = False    # 是否已到第一个 ## 规则节（其前的 > 块是前言元数据）
+    dropped = False
+    for ln in body.split("\n"):
+        if ln.startswith("## "):
+            seen_section = True
+            dropping = bool(_MEM_DROP_SECTION_RE.match(ln))
+            if dropping:
+                dropped = True
+                continue
+        if dropping:
+            dropped = True
+            continue
+        if not seen_section and ln.lstrip().startswith(">"):
+            dropped = True
+            continue
+        if _MEM_DROP_LINE_RE.match(ln):
+            dropped = True
+            continue
+        out.append(ln)
+    slim = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return slim, dropped
+
+
 def shared_memory_text(shared_dir: str) -> str | None:
-    """拼接 shared/memory/*.md；为空返回 None。"""
+    """拼接 shared/memory/*.md（滤掉附录/溯源/度量等运行时元数据）；为空返回 None。
+
+    瘦身理由与「为何在注入时过滤而非拆文件」见 _MEM_DROP_SECTION_RE 注释。被滤掉的
+    完整原文仍在 shared/memory/（机队每台本地都有），文末附一行指引让 agent 按需 Read，
+    故无需新建任何要跨机同步的派生文件。
+    """
     root = os.path.join(shared_dir, "memory")
     if not os.path.isdir(root):
         return None
     parts: list[str] = []
+    slimmed: list[str] = []
     for fn in sorted(os.listdir(root)):
         if not fn.endswith(".md"):
             continue
@@ -111,12 +165,24 @@ def shared_memory_text(shared_dir: str) -> str | None:
                 body = f.read().strip()
         except OSError:
             continue
-        if body:
-            parts.append(f"## [{fn}]\n{body}")
+        if not body:
+            continue
+        slim, dropped = _slim_memory_body(body)
+        if not slim:
+            continue
+        parts.append(f"## [{fn}]\n{slim}")
+        if dropped:
+            slimmed.append(fn)
     if not parts:
         return None
-    return ("# 团队共享记忆（来自 shared/memory/，全员 agent 自动加载，上传即生效）\n\n"
+    text = ("# 团队共享记忆（来自 shared/memory/，全员 agent 自动加载，上传即生效）\n\n"
             + "\n\n".join(parts))
+    if slimmed:
+        text += ("\n\n---\n（注：以上为可执行核心；"
+                 + "、".join(f"`shared/memory/{fn}`" for fn in slimmed)
+                 + " 的附录／溯源／度量口径等元数据为省上下文已略去，"
+                 "需要完整原文时 Read 对应文件。）")
+    return text
 
 
 def _sync_symlink(dst: str, src: str) -> None:

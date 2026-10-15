@@ -1475,6 +1475,28 @@ def test_chain_digest_zero_cap_keeps_full(av, cfg, shared):
     assert len(av._chain_digest({"id": 1, "result": "乙" * 500})) == 500
 
 
+def test_chain_digest_prefers_trailing_summary(av, cfg, shared):
+    """断链摘要优先取 agent 收尾自总结（在末尾），而非头部硬截断。
+    build_prompt 要求收尾 2-5 句总结；旧实现 txt[:cap] 取开头会截不到它、还截在句中。"""
+    cfg._p.setdefault("ingress", {}).update(resume_digest_chars=120)
+    body = "开头是冗长的取数过程与中间分析。\n" * 20      # 头部噪声，远超 cap
+    result = body + "\n## 总结\n改了 a.py、b.py，完成 X 与 Y。\n"
+    d = av._chain_digest({"id": 1, "result": result})
+    assert "完成 X 与 Y" in d                            # 命中末尾自总结
+    assert "开头是冗长" not in d                          # 不再取头部
+    assert d.endswith("…（已截断）")
+
+
+def test_chain_digest_tail_window_when_no_summary_heading(av, cfg, shared):
+    """无显式总结标题时回落末尾窗口（总结通常在结尾），不再头部硬截断。"""
+    cfg._p.setdefault("ingress", {}).update(resume_digest_chars=60)
+    result = "头部噪声不应进入摘要。" + "甲" * 300 + "末尾结论句。"
+    d = av._chain_digest({"id": 1, "result": result})
+    assert "末尾结论句。" in d                            # 取末尾窗口
+    assert "头部噪声" not in d                            # 不再取头部
+    assert d.endswith("…（已截断）")
+
+
 def test_finish_accumulates_chain_budget(av, cfg, shared):
     s = sess_of(av)
     av._finish(s, {"id": 11, "status": "done", "result": "第一轮结论",
@@ -1534,6 +1556,40 @@ def test_flush_no_digest_when_resuming(av, cfg, shared):
     sub = av.exec_relay.submitted[-1]
     assert sub["resume_from"] == 1
     assert "上下文接续" not in sub["desc"]
+
+
+def test_relay_marker_rules_brief_on_resume(av, cfg, shared):
+    """resume 精简铁律：上一轮 desc 已带完整版且在重放的 transcript 里，再发一遍
+    纯属重复（每轮多 ~4KB≈1.5K token，链尾随深度翻倍）。精简版仍须含身份+核心禁令
+    +两个标记入口+指向上文，但不重发 plan JSON 示例（防 agent 凭记忆改写格式）。"""
+    s = sess_of(av)
+    s["reply"] = {"is_group": False, "open_dingtalk_id": "x", "sender": "王洪彬"}
+    full = av._relay_marker_rules(s)
+    brief = av._relay_marker_rules(s, brief=True)
+    assert len(brief) < len(full) / 3                 # 显著更短
+    assert "王洪彬" in brief                           # 动态身份保留
+    assert "禁止自行跑 dws" in brief                   # 核心禁令保留
+    assert "send_file" in brief and "plan" in brief   # 两个标记入口仍点名
+    assert "上文" in brief                             # 指向已重放的完整铁律
+    assert '"op": "list"' not in brief                # 完整版 JSON 示例不重发
+
+
+def test_flush_uses_brief_marker_on_resume(av, cfg, shared):
+    """端到端：fresh 轮 desc 带完整铁律（含 plan JSON 示例）；resume 轮只带精简版。"""
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    first = av.exec_relay.submitted[-1]["desc"]
+    assert '"op": "list"' in first                    # 首轮完整铁律
+    av._finish(s, {"id": 1, "status": "done", "result": "上一轮结论",
+                   "tokens": 100})
+    s["buffer"] = ["继续"]
+    s["state"] = "BUFFERING"
+    av._flush(s, uid="200")
+    sub = av.exec_relay.submitted[-1]
+    assert sub["resume_from"] == 1                    # 确为 resume
+    assert '"op": "list"' not in sub["desc"]          # 精简版不重发 JSON 示例
+    assert "接续会话" in sub["desc"]                   # 精简版标识
+    assert "张三" in sub["desc"]                       # 发起人身份仍在
 
 
 def test_flush_no_digest_on_ttl_break(av, cfg, shared):
