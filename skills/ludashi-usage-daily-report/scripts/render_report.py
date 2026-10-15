@@ -524,8 +524,9 @@ def render_summary(f: dict) -> str:
 
     if not pg.get("ok"):
         return (f"**{name}用户日度使用分析（{date} {wk}）**\n\n"
-                f"**[降级]** {(f.get('degraded') or ['PG 不可用'])[0]}\n"
-                f"当日仅有机日志口径：入站消息 {lg.get('inbound_msgs', 0)} 条、"
+                f"> **[降级]** {(f.get('degraded') or ['PG 不可用'])[0]}\n"
+                f">\n"
+                f"> 当日仅有机日志口径：入站消息 {lg.get('inbound_msgs', 0)} 条、"
                 f"审计异常 {len(lg.get('anomalies') or [])} 项。任务级与用户级指标缺失，"
                 f"不可用于经营判断，请查 /var/log/ludashi-usage-collect.log。")
 
@@ -548,21 +549,21 @@ def render_summary(f: dict) -> str:
     L = [
         f"**{name}用户日度使用分析（{date} {wk}·{trade}）**",
         "",
-        f"**用量**：人工提问 **{t.get('questions', 0)}** 条（环比 {d_(t.get('questions'), p.get('questions'))}）"
+        f"- **用量**：人工提问 **{t.get('questions', 0)}** 条（环比 {d_(t.get('questions'), p.get('questions'))}）"
         f"｜活跃 **{t.get('active_users', 0)}** 人｜人均 {per} 条",
-        f"**重点用户**：{k.get('active', 0)}/{k.get('roster_size', 0)} 活跃"
+        f"- **重点用户**：{k.get('active', 0)}/{k.get('roster_size', 0)} 活跃"
         f"（{k.get('active_rate', '-')}%）｜静默 {len([s for s in (k.get('silence') or []) if not s.get('active_today')])} 人",
-        f"**渠道**：{chan or '-'}（任务行 {t.get('task_rows', 0)}，影子执行去重后 {t.get('questions', 0)} 条提问）",
-        f"**交付**：提问级成功率 **{t.get('q_success_rate', '-')}%**"
-        f"（失败 {t.get('q_failed', 0)}、中断 {t.get('q_cancelled', 0)}、待复核 {t.get('q_review', 0)}）",
-        f"**Top 用户**：{' · '.join(f'{w} {c}' for w, c in top) or '当日无人工提问'}",
-        f"**入站消息**：{lg.get('inbound_msgs', 0)} 条"
+        f"- **渠道**：{chan or '-'}（任务行 {t.get('task_rows', 0)}，影子执行去重后 {t.get('questions', 0)} 条提问）",
+        f"- **交付**：提问级成功率 **{t.get('q_success_rate', '-')}%**"
+        f"（失败 {t.get('q_failed', 0)}｜中断 {t.get('q_cancelled', 0)}｜待复核 {t.get('q_review', 0)}）",
+        f"- **Top 用户**：{' · '.join(f'{w} {c}' for w, c in top) or '当日无人工提问'}",
+        f"- **入站消息**：{lg.get('inbound_msgs', 0)} 条"
         f"（{'、'.join(f'{a}{b}' for a, b in (lg.get('inbound_kinds') or {}).items())}）"
         f"｜多轮会话 {lg.get('multi_round_sessions', 0)} 个",
-        f"**异常/提示**：{anom_txt}",
+        f"- **异常/提示**：{anom_txt}",
         "",
-        "完整件见附件——按数据最小化要求，**文件不留存用户提问原文与交付正文**，"
-        "只记需求类型、时效、状态与用量；需追溯具体内容可用卡片里的任务行号查 relay 台账。",
+        "> 完整件见附件。按数据最小化要求，文件不留存提问原文与交付正文，只记需求类型/时效/状态/用量；"
+        "需追溯具体内容用卡片里的任务行号查 relay 台账。",
     ]
     return "\n".join(L)
 
