@@ -343,7 +343,7 @@ class Avatar:
                 and not planning.parse_plan_cmd(quick)
                 and not any(self._kw(quick, k) for k in
                             ("submit", "cancel", "confirm", "deny",
-                             "conflict"))):
+                             "conflict", "progress"))):
             self._ack_receive(s)
         self._mark_read(s)
         text = self._extract_text(ev, content, uid, sender)
@@ -582,6 +582,11 @@ class Avatar:
         if ap and self.policy.level_of(uid, sid, sender) == "super":
             self._dm(uid or sid, self._do_approval(ap, uid))
             return
+        # 「进度」在 IDLE 也要答（回"没有进行中的任务"），否则落到下面的暂存笔记
+        # 分支被当速记存起来——用户问状态却收到"已记到暂存笔记"。
+        if self._kw(t, "progress"):
+            self._progress_reply(s, uid)
+            return
         # 会话进行中 → 交会话流（提交/取消/门禁关键词与聚合）
         if s["state"] != "IDLE":
             self._on_message("", s, t, uid)
@@ -683,6 +688,12 @@ class Avatar:
         return t in self.cfg.get("ingress", "noise_ignore", [])
 
     def _on_message(self, key: str, s: dict, text: str, uid: str):
+        # 「进度」优先于所有状态分支：查询类指令不该进聚合缓冲。RUNNING 时它原先
+        # 被当追问吞进 followups（首条只贴表情、其后全静默），用户实测「没响应，
+        # 再回复就不响应了」——而长任务提示恰恰承诺了「发进度看状态」。
+        if self._kw(text, "progress"):
+            self._progress_reply(s, uid)
+            return
         st = s["state"]
         if st == "WAIT_APPROVAL" and s.get("task_id"):
             if self._kw(text, "confirm"):
@@ -1293,6 +1304,48 @@ class Avatar:
             # 进度」时根本无从判断是没发、发失败、还是发了但不显眼（#147 三种都要排）。
             s["card_fail_logged"] = True
             log(f"card beat not accepted (task #{tid})", err or "")
+
+    def _progress_reply(self, s: dict, uid: str) -> None:
+        """「进度」→ 立即回一条独立消息报当前状态（不动卡片、不进聚合缓冲）。
+
+        为什么必须有：长任务提示三处都承诺了「发进度看状态」，但 keywords 里原先
+        没有 progress 意图——RUNNING 时被当追问吞进 followups（首条只贴表情、其后
+        全静默），IDLE 时被当暂存笔记存起来。承诺一个不存在的命令＝提示说谎，比不
+        提示更糟：用户会判定分身死了。#149 实测复现（15:33 提示发出后连问无应答）。
+
+        状态全部取自 relay 现有 row（poll 一次），不新增 API；lane 不在 row 里，
+        故不报 lane——宁可少说，不编。
+        """
+        tid = s.get("task_id")
+        if not tid:
+            last = s.get("last_task_id")
+            self._notify_session(
+                s, "当前没有进行中的任务。"
+                   + (f"上一个任务 #{last} 已结束，结果已发你。" if last else ""))
+            return
+        row = self.exec_relay.poll(tid)
+        if "_error" in row:
+            self._notify_session(s, f"⚠️ 查 #{tid} 状态失败：{row['_error']}")
+            return
+        status = str(row.get("status") or "?")
+        zh = {"queued": "排队中", "running": "执行中",
+              "pending_approval": "卡在门禁·等你放行", "pending_confirm":
+              "等你确认", "done": "已完成", "failed": "已失败",
+              "cancelled": "已取消"}.get(status, status)
+        lines = [f"#{tid} · {zh}"]
+        started = row.get("started_at")
+        if status in ("queued", "running") and started:
+            used = int(time.time() - float(started))
+            lines.append(f"本段已用 {used // 60} 分 {used % 60} 秒")
+        seg = _seg_of(row.get("resume_hint") or "")
+        if seg:
+            lines.append(f"正在跑第 {seg + 1} 段（前 {seg} 段产出已保留，不重做）")
+        fu = s.get("followups") or []
+        if fu:
+            lines.append(f"你追加的 {len(fu)} 条已并入本轮，跑完一并处理")
+        if status in ("queued", "running"):
+            lines.append("发「取消」可随时中止")
+        self._notify_session(s, "⏳ " + "\n· ".join(lines))
 
     def _long_task_notice(self, s: dict, tid, row: dict, status: str) -> bool:
         """长任务升级／分段续跑的进度告知。返回 True＝本轮已发帧（心跳可跳过）。

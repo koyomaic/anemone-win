@@ -297,3 +297,91 @@ def test_notice_then_heartbeat_both_carry_state(av, cfg):
     # 首帧是升级告知，其后每帧心跳都持续带长任务态
     assert "比一般任务大" in av.dws.sent[0][1]
     assert all("长任务后台执行中" in c for _, c in av.dws.sent[1:]), av.dws.sent[1:]
+
+
+# ── 「进度」查询指令 ──────────────────────────────────────────────
+# 长任务提示承诺了「发进度看状态」，故 progress 必须是真命令：RUNNING 时不得被
+# 当追问吞进 followups，IDLE 时不得被当暂存笔记存起来。#149 实测复现过两者。
+class MiniRelay:
+    def __init__(self, row):
+        self._row = row
+        self.calls = 0
+
+    def poll(self, tid):
+        self.calls += 1
+        return dict(self._row)
+
+
+@pytest.fixture
+def pav(av, cfg):
+    """带 poll 桩的 avatar（默认：#7 执行中、已跑 700s）。"""
+    av.exec_relay = MiniRelay(row(elapsed=700))
+    return av
+
+
+def test_progress_keywords_configured(av, cfg):
+    for w in ("进度", "进展", "状态"):
+        assert av._kw(w, "progress"), w
+
+
+def test_progress_reply_running(pav):
+    s = sess()
+    pav._progress_reply(s, "u1")
+    out = pav.notified[-1]
+    assert "#7 · 执行中" in out
+    assert "11 分" in out          # 700s → 11 分 40 秒
+    assert "取消" in out
+
+
+def test_progress_reply_segment(pav):
+    """段号口径与提示一致：[seg:N] 是已完成段数，正在跑第 N+1 段。"""
+    pav.exec_relay = MiniRelay(row(elapsed=300, hint="xxx [seg:2] yyy"))
+    s = sess()
+    pav._progress_reply(s, "u1")
+    assert "第 3 段" in pav.notified[-1]
+    assert "不重做" in pav.notified[-1]
+
+
+def test_progress_reply_followups_counted(pav):
+    s = sess(followups=["再加个口径", "顺便看下上周"])
+    pav._progress_reply(s, "u1")
+    assert "2 条已并入本轮" in pav.notified[-1]
+
+
+def test_progress_reply_idle_no_task(pav):
+    s = sess(state="IDLE", task_id=None, last_task_id=147)
+    pav._progress_reply(s, "u1")
+    assert "没有进行中的任务" in pav.notified[-1]
+    assert "#147" in pav.notified[-1]
+
+
+def test_progress_reply_poll_error_no_crash(pav):
+    pav.exec_relay = MiniRelay({"_error": "timeout"})
+    pav._progress_reply(sess(), "u1")
+    assert "查 #7 状态失败" in pav.notified[-1]
+
+
+def test_progress_reply_terminal_no_cancel_hint(pav):
+    pav.exec_relay = MiniRelay({"status": "done", "started_at": time.time()})
+    pav._progress_reply(sess(state="IDLE", task_id=7), "u1")
+    out = pav.notified[-1]
+    assert "已完成" in out
+    assert "取消" not in out       # 已结束的任务不该再教用户取消
+
+
+def test_on_message_progress_not_swallowed_by_followups(pav):
+    """RUNNING 时问进度：必须答，且不得进聚合缓冲（否则等于没问）。"""
+    s = sess(followups=[])
+    pav._on_message("", s, "进度", "u1")
+    assert pav.notified and "#7 · 执行中" in pav.notified[-1]
+    assert s["followups"] == []
+
+
+def test_handle_self_progress_idle_not_saved_as_note(pav, cfg):
+    """IDLE 时问进度：必须答，且不得被当暂存笔记存起来。"""
+    notes = []
+    pav.know.save_note = lambda t: notes.append(t)
+    s = sess(state="IDLE", task_id=None, last_task_id=None)
+    pav._handle_self(s, "进度", "u1")
+    assert notes == []
+    assert pav.notified and "没有进行中的任务" in pav.notified[-1]

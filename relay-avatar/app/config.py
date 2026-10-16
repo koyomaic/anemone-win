@@ -51,7 +51,11 @@ DEFAULTS: dict[str, Any] = {
                 "self_poll_interval_sec": 5},
     "keywords": {"submit": ["提交", "开始执行"], "cancel": ["取消"],
                  "confirm": ["确认", "同意"], "deny": ["拒绝", "不同意"],
-                 "conflict": ["冲突"]},
+                 "conflict": ["冲突"],
+                 # 查询类指令：必须与 submit/cancel 同级识别，否则 RUNNING 时会被
+                 # 当追问吞进 followups、IDLE 时被当暂存笔记存起来（#149 实测）。
+                 "progress": ["进度", "进展", "状态", "进度？", "进度?",
+                              "查进度", "看进度"]},
     "group": {"enabled": False},
     "permissions": {"default_mode": "whitelist", "guest_mode": "silent",
                     "superadmin": [],
