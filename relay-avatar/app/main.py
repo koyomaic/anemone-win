@@ -1284,9 +1284,15 @@ class Avatar:
             word = "已排队，马上开始" if status == "queued" else "正在为你办"
             note = f"{word}…（已用 {used}s）"
         try:
-            self.dws.card_update(biz, self._card_frame(s, note), 1)
-        except Exception:
-            pass
+            accepted = bool(self.dws.card_update(biz, self._card_frame(s, note), 1))
+            err = None
+        except Exception as e:                      # 钉钉抽风不能把 poll 循环带崩
+            accepted, err = False, e
+        if not accepted and not s.get("card_fail_logged"):
+            # 每会话只留一次痕：此前 `except: pass` 把失败全吞了，排查「用户看不到
+            # 进度」时根本无从判断是没发、发失败、还是发了但不显眼（#147 三种都要排）。
+            s["card_fail_logged"] = True
+            log(f"card beat not accepted (task #{tid})", err or "")
 
     def _long_task_notice(self, s: dict, tid, row: dict, status: str) -> bool:
         """长任务升级／分段续跑的进度告知。返回 True＝本轮已发帧（心跳可跳过）。
@@ -1327,23 +1333,30 @@ class Avatar:
             f"已用 {used // 60} 分 {used % 60} 秒，比一般任务大。{tail}；"
             "发「进度」看状态，发「取消」随时中止"))
 
-    def _card_note(self, s: dict, note: str) -> bool:
-        """发一帧卡片进度（无卡片时退回会话消息）。同时刷新节流时间戳，
-        避免紧接着的心跳帧把这条重要提示冲掉。"""
+    def _card_note(self, s: dict, note: str, announce: bool = True) -> bool:
+        """发一帧卡片进度；announce=True 时**另发一条独立消息**。
+
+        为什么必须另发一条：卡片是**原地更新**的，不产生新消息、不触发提醒，外观几乎
+        没变（只有 ⏳ 那一行字），用户实测「看不到提示」——#147 排查确认
+        card_update 返回 success=true、long_notified=True、心跳也在按 30s 刷新，
+        但用户两次反馈没看见。重要的状态变化必须落成一条真正的消息才可见。
+        同时刷新节流时间戳，避免紧接着的心跳帧把卡片上的提示冲掉。
+        """
         s["card_upd"] = time.time()
         biz = s.get("card_biz")
-        if not biz:
+        framed = False
+        if biz:
+            try:
+                framed = bool(self.dws.card_update(
+                    biz, self._card_frame(s, note), 1))
+            except Exception as e:
+                log("card long-task frame failed:", e)
+        if announce or not framed:
             try:
                 self._notify_session(s, f"⏳ {note}")
-            except Exception:
-                pass
-            return True
-        try:
-            self.dws.card_update(biz, self._card_frame(s, note), 1)
-            return True
-        except Exception as e:
-            log("card long-task frame failed:", e)
-            return False
+            except Exception as e:
+                log("long-task notify failed:", e)
+        return True
 
     def _card_final(self, s: dict, content: str, status: int = 3) -> bool:
         biz = s.pop("card_biz", None)

@@ -174,14 +174,60 @@ def test_falls_back_to_session_message(av, cfg):
 
 
 def test_card_failure_does_not_raise(av, cfg):
-    """钉钉抽风不能把 poll 循环带崩。"""
+    """钉钉抽风不能把 poll 循环带崩；卡片写不进去时仍要退回独立消息。"""
     setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600)
 
     def boom(*a):
         raise RuntimeError("dingtalk down")
 
     av.dws.card_update = boom
-    assert av._long_task_notice(sess(), 7, row(elapsed=900), "running") is False
+    assert av._long_task_notice(sess(), 7, row(elapsed=900), "running") is True
+    assert len(av.notified) == 1 and "后台长任务" in av.notified[0]
+
+
+# ── 回归 #147：只改卡片等于没提示，必须另发一条独立消息 ────────────────
+# 实测：card_update 返回 success=true、long_notified=True、心跳按 30s 正常刷新，
+# 但用户两次反馈「看不到提示」——卡片是原地更新的，不产生新消息也不触发提醒，
+# 外观几乎没变（只有 ⏳ 那一行）。重要状态变化必须落成一条真正的消息。
+
+def test_escalation_sends_distinct_message(av, cfg):
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600)
+    s = sess()
+    assert av._long_task_notice(s, 7, row(elapsed=900), "running") is True
+    assert len(av.dws.sent) == 1, "卡片帧照旧要写（承载持续状态）"
+    assert len(av.notified) == 1, "必须另发一条独立消息，否则用户看不见"
+    assert "后台长任务" in av.notified[0]
+
+
+def test_segment_boundary_sends_distinct_message(av, cfg):
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600)
+    s = sess()
+    av._long_task_notice(s, 7, row(elapsed=5, hint="[seg:1] x"), "queued")
+    assert len(av.notified) == 1 and "第 2 段" in av.notified[0]
+    assert len(av.dws.sent) == 1
+
+
+def test_heartbeat_does_not_spam_messages(av, cfg):
+    """心跳只改卡片、**不**发独立消息，否则 30s 一条会把用户刷屏。"""
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600,
+           card_progress_sec=0)
+    s = sess(card_upd=0.0, long_notified=True)
+    for _ in range(4):
+        s["card_upd"] = 0.0
+        av._card_beat(s, 7, "running")
+    assert len(av.dws.sent) == 4
+    assert av.notified == []
+
+
+def test_card_beat_logs_unaccepted_once(av, cfg):
+    """card_update 返回 False 要留痕（每会话一次）：此前 except:pass 把失败全吞了，
+    排查「用户看不到进度」时无从判断是没发、发失败、还是发了不显眼。"""
+    setcfg(cfg, "ingress", card_progress_sec=0)
+    av.dws.card_update = lambda *a: False
+    s = sess(card_upd=0.0)
+    av._card_beat(s, 7, "running")
+    av._card_beat(s, 7, "running")
+    assert s.get("card_fail_logged") is True
 
 
 def test_notice_refreshes_throttle_stamp(av, cfg):
