@@ -138,7 +138,12 @@ class Settings:
     task_root: str
     users_root: str
     admin_token: str = "change-me"
-    max_concurrent: int = 3
+    # 3 → 8 的依据（同批 108 任务真实到达序列重放）：mc=3 在 **2 倍流量即崩**
+    # （即使 cap=2，短任务 P90 37m、长任务 P90 215m）；mc=8 + cap=5 在 4 倍流量下
+    # 短任务最坏仅 48s。默认值走 CODE 是为了**机队一致**——relay.env 每台机独立、
+    # provision 只在缺失时创建且绝不覆盖，逐机改 env 传不出去。上限是天花板不是
+    # 地板：现网到达率 0.11 任务/小时，8 槽极少同时占满，小规格机器只在突发时才吃满。
+    max_concurrent: int = 8
     task_timeout: float = 1800.0
     # ── 单轮 LLM 调用保护（claude 引擎专用，透传为 claude-code 环境变量）──
     #
@@ -195,7 +200,9 @@ class Settings:
     # 长度被 marker 铁律样板约 1100 字污染）。而条件概率 P(>15m｜已跑到 T 仍在跑)
     # 在 T=10m 达 **75% 精确率、100% 召回**（历史上没有任何长任务在 10m 前结束过），
     # 只打扰 14.8% 的任务、误报 3.7%。T=3m 会打扰 41.7% 且精确率仅 26.7%，提示沦为噪音。
-    long_task_mode: str = "shadow"          # off | shadow | notify | on
+    # 默认 **on**（用户 2026-10-16 指示：跳过影子期直接启用）。机队一致同样靠 CODE
+    # 默认值——relay.env 不随 git 下发。要退回观察态设 RELAY_LONG_TASK_MODE=shadow。
+    long_task_mode: str = "on"              # off | shadow | notify | on
     long_task_threshold_sec: float = 600.0  # T：单段跑到此时长即判为长任务
     long_task_max_segments: int = 3         # 单任务最多跑几段（含首段）；3 段＝上限 90m
     # long lane：为短任务保留槽位，防长任务吃光并发（移除 30m 上限的必要配套——
@@ -249,7 +256,7 @@ class Settings:
             task_root=os.environ.get("RELAY_TASK_ROOT", f"{root}/tasks"),
             users_root=os.environ.get("RELAY_USERS", f"{root}/users"),
             admin_token=os.environ.get("RELAY_ADMIN_TOKEN", "change-me"),
-            max_concurrent=int(os.environ.get("RELAY_MAX_CONCURRENT", "3")),
+            max_concurrent=int(os.environ.get("RELAY_MAX_CONCURRENT", "8")),
             task_timeout=float(os.environ.get("RELAY_TASK_TIMEOUT", "1800")),
             api_timeout_ms=float(os.environ.get("RELAY_API_TIMEOUT_MS", "180000")),
             api_first_byte_timeout_ms=float(
@@ -265,7 +272,7 @@ class Settings:
             approval_timeout_minutes=float(
                 os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "60")),
             auto_deny_max=int(os.environ.get("RELAY_AUTO_DENY_MAX", "2")),
-            long_task_mode=os.environ.get("RELAY_LONG_TASK_MODE", "shadow").strip().lower(),
+            long_task_mode=os.environ.get("RELAY_LONG_TASK_MODE", "on").strip().lower(),
             long_task_threshold_sec=float(
                 os.environ.get("RELAY_LONG_TASK_THRESHOLD_SEC", "600")),
             long_task_max_segments=int(

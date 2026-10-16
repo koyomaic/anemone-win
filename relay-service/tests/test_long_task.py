@@ -52,9 +52,11 @@ def test_long_lane_cap_ratio_override():
 
 
 def test_long_task_defaults():
-    """默认 shadow：上线即观察，不改任何行为。"""
+    """默认 on（用户 2026-10-16 指示跳过影子期）；并发默认 8。"""
     s = _cfg()
-    assert s.long_task_mode == "shadow"
+    assert s.long_task_mode == "on"
+    assert s.max_concurrent == 8
+    assert s.long_lane_cap == 5
     assert s.long_task_threshold_sec == 600.0
     assert s.long_task_max_segments == 3
     assert s.long_wait_promote_sec == 1200.0
@@ -256,9 +258,10 @@ def test_health_exposes_long_task_fields(relay_factory):
     assert h["active_long"] == 0
 
 
-def test_health_defaults_to_shadow(relay_factory):
-    """默认档必须是 shadow：部署即观察，不悄悄改行为。"""
+def test_health_defaults_to_on(relay_factory):
+    """默认档必须是 on：机队同步靠 CODE 默认值（relay.env 不随 git 下发、
+    provision 只在缺失时创建且绝不覆盖），默认关则机队拿到代码也不会启用。"""
     import httpx
 
     h = httpx.get(relay_factory()["base"] + "/health", timeout=5).json()
-    assert h["long_task_mode"] == "shadow"
+    assert h["long_task_mode"] == "on"

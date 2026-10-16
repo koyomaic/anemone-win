@@ -65,7 +65,7 @@ def test_seg_of_malformed():
 
 @pytest.mark.parametrize("mode", ["shadow", "off", "", "notifyx"])
 def test_silent_unless_notify_or_on(av, cfg, mode):
-    """shadow 是默认档：影子期只观察不改行为，一个帧都不能发。"""
+    """shadow/off 必须完全静默（默认档已是 on，但显式设 shadow 仍可退回观察态）。"""
     setcfg(cfg, "ingress", long_task_mode=mode, long_task_threshold_sec=600)
     s = sess()
     assert av._long_task_notice(s, 7, row(elapsed=900), "running") is False

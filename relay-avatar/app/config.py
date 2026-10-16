@@ -46,7 +46,7 @@ DEFAULTS: dict[str, Any] = {
                  # 分身**自己按 row.started_at 算 elapsed**，不依赖 relay 新增字段——
                  # poll 拿到的 row 里本来就有 started_at/resume_hint，故零新增 HTTP
                  # 请求、零 API 变更。mode: off|shadow|notify|on（shadow 只记日志）。
-                 "long_task_mode": "shadow", "long_task_threshold_sec": 600,
+                 "long_task_mode": "on", "long_task_threshold_sec": 600,
                 "noise_ignore": [], "self_poll": False,
                 "self_poll_interval_sec": 5},
     "keywords": {"submit": ["提交", "开始执行"], "cancel": ["取消"],

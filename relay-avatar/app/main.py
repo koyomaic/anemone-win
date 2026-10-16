@@ -1288,7 +1288,7 @@ class Avatar:
         关键词），要抓 91.7% 召回得给 60% 的任务贴"这是个大活儿"，八成是错的——
         提示一旦经常说谎，用户就不再信它。运行时判据 T=10m 是 75% 精确率、100% 召回。
         """
-        mode = str(self.cfg.get("ingress", "long_task_mode", "shadow")).lower()
+        mode = str(self.cfg.get("ingress", "long_task_mode", "on")).lower()
         thr = float(self.cfg.get("ingress", "long_task_threshold_sec", 600) or 0)
         started = row.get("started_at")
         if mode not in ("notify", "on") or thr <= 0 or not started:
