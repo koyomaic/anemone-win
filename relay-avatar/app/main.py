@@ -90,6 +90,25 @@ def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
 
 
+# relay 把分段续跑的段号编码在 resume_hint 里（`[seg:N]`），刻意不新增 DB 列。
+# 分身只读不写：poll 回来的 row 本来就带 resume_hint，故零新增请求、零 API 变更。
+_SEG_MARK = "[seg:"
+
+
+def _seg_of(hint: str) -> int:
+    """从 resume_hint 读回段号；无标记返回 0（＝首段／非续跑）。"""
+    i = (hint or "").find(_SEG_MARK)
+    if i < 0:
+        return 0
+    j = hint.find("]", i)
+    if j < 0:
+        return 0
+    try:
+        return max(0, int(hint[i + len(_SEG_MARK):j]))
+    except ValueError:
+        return 0
+
+
 class Avatar:
     def __init__(self, cfg, inject: str = "", dry: bool = False):
         self.cfg = cfg
@@ -933,6 +952,9 @@ class Avatar:
         s["uid"] = uid
         s["state"] = "RUNNING"
         s["notified_followup"] = False
+        # 长任务告知状态随新任务清零，否则上一个任务的标记会压掉本次提示
+        s["long_notified"] = False
+        s["seg_seen"] = 0
         # 留在途原文，供同一需求从别的会话再发一次时做去重比对
         s["inflight_desc"] = desc
         if followup:
@@ -1255,6 +1277,62 @@ class Avatar:
         except Exception:
             pass
 
+    def _long_task_notice(self, s: dict, tid, row: dict, status: str) -> bool:
+        """长任务升级／分段续跑的进度告知。返回 True＝本轮已发帧（心跳可跳过）。
+
+        判据在**分身侧自算**：elapsed = now − row.started_at，段号从 resume_hint 的
+        [seg:N] 标记读回。relay 的 row 本来就带这两个字段，故**零新增 HTTP 请求、
+        零 API 变更**；每轮只多两次浮点/字符串比较。
+
+        为什么不在提交时预测：静态特征精确率仅 16.9%（desc≥1000 字）／15.9%（长活
+        关键词），要抓 91.7% 召回得给 60% 的任务贴"这是个大活儿"，八成是错的——
+        提示一旦经常说谎，用户就不再信它。运行时判据 T=10m 是 75% 精确率、100% 召回。
+        """
+        mode = str(self.cfg.get("ingress", "long_task_mode", "shadow")).lower()
+        thr = float(self.cfg.get("ingress", "long_task_threshold_sec", 600) or 0)
+        started = row.get("started_at")
+        if mode not in ("notify", "on") or thr <= 0 or not started:
+            return False
+        seg = _seg_of(row.get("resume_hint") or "")
+        # 分段边界优先：用户最想知道的是"没死，还在接着干"。
+        # started_at 每段会被 relay 重置，故 elapsed 是**本段**耗时，不会重复触发。
+        if seg > 0 and seg != s.get("seg_seen"):
+            s["seg_seen"] = seg
+            s["long_notified"] = True
+            return self._card_note(s, (
+                f"这个活儿比较大，正在跑第 {seg} 段，已产出的部分不会重做。"
+                "跑完我主动通知你；发「进度」看状态，发「取消」随时中止"))
+        if float(time.time()) - float(started) < thr or s.get("long_notified"):
+            return False
+        s["long_notified"] = True
+        used = int(time.time() - s.get("card_start", time.time()))
+        # mode=on 才承诺"分段接续不掐断"；notify 阶段 relay 仍会在单段上限处停，
+        # 不能许下做不到的话。
+        tail = ("已转**后台长任务**，会自动分段接续、不再被中途掐断，跑完主动通知你"
+                if mode == "on" else
+                "还在继续跑，跑完我主动通知你")
+        return self._card_note(s, (
+            f"已用 {used // 60} 分 {used % 60} 秒，比一般任务大。{tail}；"
+            "发「进度」看状态，发「取消」随时中止"))
+
+    def _card_note(self, s: dict, note: str) -> bool:
+        """发一帧卡片进度（无卡片时退回会话消息）。同时刷新节流时间戳，
+        避免紧接着的心跳帧把这条重要提示冲掉。"""
+        s["card_upd"] = time.time()
+        biz = s.get("card_biz")
+        if not biz:
+            try:
+                self._notify_session(s, f"⏳ {note}")
+            except Exception:
+                pass
+            return True
+        try:
+            self.dws.card_update(biz, self._card_frame(s, note), 1)
+            return True
+        except Exception as e:
+            log("card long-task frame failed:", e)
+            return False
+
     def _card_final(self, s: dict, content: str, status: int = 3) -> bool:
         biz = s.pop("card_biz", None)
         if not biz:
@@ -1282,7 +1360,10 @@ class Avatar:
             if status in ("queued", "running"):
                 if s["state"] != "RUNNING":
                     s["state"] = "RUNNING"
-                self._card_beat(s, tid, status)
+                # 长任务提示优先于心跳：升级／分段这类"状态变了"的告知每任务只发一次，
+                # 发过就跳过本轮心跳，免得 30s 节流帧紧跟着把它冲掉。
+                if not self._long_task_notice(s, tid, row, status):
+                    self._card_beat(s, tid, status)
                 continue
             if status == "pending_approval" and s["state"] != "WAIT_APPROVAL":
                 s["state"] = "WAIT_APPROVAL"

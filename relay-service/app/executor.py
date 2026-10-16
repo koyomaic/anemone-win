@@ -44,6 +44,13 @@ class AgentResult:
     # 「删共享区/对外发送」——只能一律 pending_approval 去问人。分类靠比对已知字符串
     # 即可（O(1) 集合查找），**不新增任何正则**，故这里把已经算出来的值带上去。
     block_reason: str = ""
+    # ── 长任务异步化：单段实际耗时与升级标记 ──
+    # elapsed 用于审计与分段续跑决策（"这一段跑满了多久"）。
+    # timed_out 用**独立布尔**而不是让上层去 startswith("timeout after")：错误串是
+    # 给人看的文案，拿它当控制流一旦改字就静默失效。
+    elapsed: float = 0.0
+    long_flagged: bool = False
+    timed_out: bool = False
 
 
 def _parse_opencode(line: str) -> dict | None:
@@ -259,7 +266,8 @@ class Executor:
     async def run(self, *, task_id: int, workdir: str, prompt: str,
                   resume_session: str | None, data_dir: str | None,
                   cancel: asyncio.Event, publish,
-                  exempt_cmd: str | None = None, user: str = "") -> AgentResult:
+                  exempt_cmd: str | None = None, user: str = "",
+                  on_long=None) -> AgentResult:
         xdg = shared_knowledge.prepare_run(workdir, self.cfg)
         cmd = self.build_cmd(workdir, prompt, resume_session)
         env = self.build_env(workdir, xdg, user)
@@ -290,10 +298,28 @@ class Executor:
                     res.error = "cancelled"
                     return res
                 remaining = deadline - time.monotonic()
+                # elapsed 每轮刷新（1 次减法），保证任何 return 路径上都带着真实耗时。
+                res.elapsed = self.cfg.task_timeout - remaining
                 if remaining <= 0:
                     self._kill(proc)
                     res.error = f"timeout after {self.cfg.task_timeout:.0f}s"
+                    res.timed_out = True
                     return res
+                # ── 长任务升级判据（运行时，不是提交时预测）──
+                # 依据：P(>15m｜已跑到 10m 仍在跑)=75% 精确率、**100% 召回**（历史上
+                # 没有任何长任务在 10m 前结束过），只打扰 14.8% 的任务。提交时静态特征
+                # 精确率仅 16.9%，要抓 91.7% 召回得标记 60% 的任务，不可用。
+                # 热路径成本：每轮 1 次浮点比较 + 1 次 bool 判断，相对同轮 readline()
+                # 的 IO 等待（上限 1s）占比 <0.001%；每任务只触发一次回调。
+                if (not res.long_flagged
+                        and res.elapsed >= self.cfg.long_task_threshold_sec > 0):
+                    res.long_flagged = True
+                    publish(task_id, t="long", elapsed=round(res.elapsed, 1))
+                    if on_long:
+                        try:
+                            on_long(task_id, res.elapsed)
+                        except Exception:
+                            pass        # 判据失败绝不能拖垮任务本身
                 try:
                     line = await asyncio.wait_for(proc.stdout.readline(), timeout=min(1.0, remaining))
                 except asyncio.TimeoutError:

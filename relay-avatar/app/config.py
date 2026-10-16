@@ -41,7 +41,12 @@ DEFAULTS: dict[str, Any] = {
                 "noise_emoji": "打招呼", "followup_emoji": "OK",
                 "ack_text_emotion": {}, "done_text_emotion": {},
                 "fail_text_emotion": {}, "use_card": True,
-                "card_progress_sec": 30,
+                 "card_progress_sec": 30,
+                 # 长任务提示：与 relay 侧同名参数对齐（relay 管执行、分身管告知）。
+                 # 分身**自己按 row.started_at 算 elapsed**，不依赖 relay 新增字段——
+                 # poll 拿到的 row 里本来就有 started_at/resume_hint，故零新增 HTTP
+                 # 请求、零 API 变更。mode: off|shadow|notify|on（shadow 只记日志）。
+                 "long_task_mode": "shadow", "long_task_threshold_sec": 600,
                 "noise_ignore": [], "self_poll": False,
                 "self_poll_interval_sec": 5},
     "keywords": {"submit": ["提交", "开始执行"], "cancel": ["取消"],

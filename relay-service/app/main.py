@@ -26,6 +26,37 @@ from .events import TERMINAL, EventBus
 
 # 执行结束即关闭 SSE 流（review 表示执行完成、待人工确认）
 STREAM_END = TERMINAL | {"review"}
+
+# ── 长任务分段续跑：段号编码进 resume_hint，不新增 DB 列 ──
+# 为什么不加列：加列要迁移 schema（PG + SQLite 双后端各一套），而段号是**执行期状态**，
+# 与 resume_hint 同生命周期（续跑时读、终态时清）。编码进文本即零迁移，且进程重启后
+# 仍能还原长任务归类——进程内的 mark_long 标记会丢，hint 不会。
+SEG_MARK = "[seg:"
+
+
+def _segment_of(hint: str) -> int:
+    """从 resume_hint 读回段号；无标记返回 0（＝首段／非续跑）。"""
+    i = (hint or "").find(SEG_MARK)
+    if i < 0:
+        return 0
+    j = hint.find("]", i)
+    if j < 0:
+        return 0
+    try:
+        return max(0, int(hint[i + len(SEG_MARK):j]))
+    except ValueError:
+        return 0
+
+
+def _with_segment(hint: str, seg: int) -> str:
+    """把段号写进 hint（先剥旧标记，防多次续跑叠加成一串）。"""
+    i = (hint or "").find(SEG_MARK)
+    if i >= 0:
+        j = hint.find("]", i)
+        if j >= 0:
+            hint = (hint[:i] + hint[j + 1:]).strip()
+    return f"{SEG_MARK}{seg}]\n{hint}".strip()
+
 DASH_COOKIE = "relay_dash"
 DASH_TTL = 12 * 3600
 MAX_FILE_BYTES = 10 * 1024 * 1024     # 文件上传/下载通道单文件上限 10MB
@@ -898,6 +929,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     # 多给两次机会，且任务总时限（1800s）本身就是硬上界。用 dict 而非 DB 列是为了
     # 零迁移、零额外查询——热路径上不碰数据库。
     auto_deny_counts: dict[int, int] = {}
+    # 分段续跑的**进展签名**（task_id → 上一段结束时的产出签名）。同样是进程内 dict：
+    # 热路径不碰 DB，重启丢签名最坏只是 fail-open 多给一段（段号在 resume_hint 里，
+    # 重启不丢，硬上界仍然生效）。
+    seg_progress: dict[int, tuple] = {}
     sched: Scheduler | None = None  # set in lifespan
     started_at = time.monotonic()
 
@@ -925,6 +960,19 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         db.set(task_id, status="running", started_at=time.time())
         audit.line(task_id, row["user"], "start", workdir)
         bus.publish(task_id, t="status", s="running")
+        seg = _segment_of(row.get("resume_hint") or "")
+
+        def _on_long(tid: int, elapsed: float) -> None:
+            """executor 在单段跑到 T（默认 600s）时回调，每任务每段最多一次。
+
+            shadow 模式**只记审计不改行为**——影子期的意义就是量出"若启用会怎样"的
+            精确率/召回，一旦让它动调度，测出来的数就被自己的改动污染了。
+            """
+            audit.line(tid, row["user"], "long_task",
+                       f"elapsed={elapsed:.0f}s seg={seg} mode={cfg.long_task_mode}")
+            if cfg.long_task_mode == "on" and sched is not None:
+                sched.mark_long(tid)
+
         res = await ex.run(
             task_id=task_id,
             workdir=workdir,
@@ -935,6 +983,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             publish=bus.publish,
             exempt_cmd=exempt_cmd,
             user=row["user"],
+            on_long=_on_long,
         )
         finished = time.time()
         db.set(task_id,
@@ -1007,6 +1056,47 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                          if ro_overwritten else
                          "任务声明只读（read_only）但新建了文件（未覆盖既有内容），请人工核查"),
             })
+        # ── 长任务分段续跑：单段跑满不再「斩立决」，改为带进展门控地接续 ──
+        # 依据：3/108 任务死在 30.0m 整、产出全丢、tokens 记 0；#108 被砍后重跑为
+        # #111，同样工作 24.3m 就完成——差的是时间预算不是能力。复用已在生产验证的
+        # self_resume 机制（Tier 2 侦察类自动拒绝续跑走的就是这条路），零 DB 迁移。
+        sig = (tuple(sorted(scan["all"])), tuple(sorted(scan["modified"])),
+               tuple(sorted(scan["deleted"])), len(res.text or ""))
+        if (res.timed_out and res.long_flagged and sched is not None
+                and cfg.long_task_mode == "on"
+                and seg + 1 < cfg.long_task_max_segments):
+            prev_sig = seg_progress.get(task_id)
+            # 进展门：本段相对上一段有新产出才续。签名未知（首段／进程重启后丢失）→
+            # fail-open 放行一段，硬上界仍由 resume_hint 里的段号兜住（重启不丢）。
+            # 专治 #112 那类丢上下文的糊涂指令白烧满 90 分钟。
+            progressed = (prev_sig is None or sig[:3] != prev_sig[:3]
+                          or sig[3] - prev_sig[3] >= 200)
+            seg_progress[task_id] = sig
+            if progressed:
+                nxt = seg + 1
+                hint = _with_segment(
+                    f"上一段跑满 {cfg.task_timeout / 60:.0f} 分钟被系统中断（**不是失败**，"
+                    f"这是第 {nxt}/{cfg.long_task_max_segments} 段）。请**从中断处继续**："
+                    "先快速确认已产出的文件与已有结论，再补齐剩余工作，"
+                    "**不要重做已完成的部分**。\n"
+                    "若其实已接近完成，直接产出最终交付件并收尾，不要为填满时间而扩大范围。\n"
+                    f"（已续跑 {nxt - 1} 次，最多 {cfg.long_task_max_segments} 段。"
+                    "若确实无法在预算内完成，如实说明已完成到哪一步、还差什么，"
+                    "不要静默降级糊弄。）", nxt)
+                db.set(task_id, status="queued", error="", resume_hint=hint,
+                       blocked_cmd="")
+                bus.publish(task_id, t="status", s="queued", segment=nxt)
+                audit.line(task_id, row["user"], "segment_continue",
+                           f"{nxt}/{cfg.long_task_max_segments} "
+                           f"elapsed={res.elapsed:.0f}s files={len(scan['all'])} "
+                           f"text={len(res.text or '')}")
+                # 续跑段降级排队（prio=2）并归入 long lane：它已产出过一部分，边际
+                # 紧迫度低于用户刚发来的新活；降级同时把「续跑放大 3 倍耗时」摊开。
+                await sched.submit(task_id, "continuation", long=True)
+                return
+            audit.line(task_id, row["user"], "segment_stop",
+                       f"本段无进展，不续跑（seg={seg} elapsed={res.elapsed:.0f}s）")
+        seg_progress.pop(task_id, None)
         if res.error == "cancelled":
             status, err = "cancelled", "cancelled by user"
         elif res.error:
@@ -1111,7 +1201,12 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         nonlocal sched
-        sched = Scheduler(cfg.max_concurrent, run_fn=run_task, on_error=_on_run_error)
+        # long lane 只在 mode=on 时生效：shadow/notify 阶段必须**零行为变化**，
+        # 否则影子期测出来的精确率/召回就不是"若启用会怎样"而是被调度改动污染过的。
+        lane_on = cfg.long_task_mode == "on"
+        sched = Scheduler(cfg.max_concurrent, run_fn=run_task, on_error=_on_run_error,
+                          long_lane_cap=cfg.long_lane_cap if lane_on else 0,
+                          long_wait_promote_sec=cfg.long_wait_promote_sec)
         await sched.start()
         # 重启恢复：进程重启后旧子进程必死，DB 里 queued/running 的任务重新入队
         for t in db.active_tasks():
@@ -1119,7 +1214,12 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 db.set(t["id"], status="queued", error="服务重启，任务重新排队")
         for t in db.active_tasks():
             if t["status"] == "queued":
-                await sched.submit(t["id"], t.get("priority") or "normal")
+                # 续跑段带 long=True 重新入队：进程内的长任务标记随重启丢了，
+                # 但段号编码在 resume_hint 里（刻意不新增 DB 列），据此还原归类，
+                # 否则重启后 lane 会漏掉正在续跑的长任务。
+                seg = _segment_of(t.get("resume_hint") or "")
+                await sched.submit(t["id"], t.get("priority") or "normal",
+                                   long=seg > 0)
         stop = asyncio.Event()
 
         async def sweeper():
@@ -1221,6 +1321,11 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             "active": sched.active if sched else 0,
             "queued": sched.pending if sched else 0,
             "max_concurrent": cfg.max_concurrent,
+            # 长任务异步化的可观测面：影子期靠这三个字段对账（模式／lane 上限／
+            # 当前占着长任务名额的数量），机队各机是否一致也一眼可比。
+            "long_task_mode": cfg.long_task_mode,
+            "long_lane_cap": cfg.long_lane_cap,
+            "active_long": sched.active_long if sched else 0,
             "min_client_version": cfg.min_client_version or None,
             "auth_legacy": cfg.auth_legacy,
         }

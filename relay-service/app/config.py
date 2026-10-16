@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -182,6 +183,30 @@ class Settings:
     # 侦察类命令的自动拒绝续跑上限（Tier 2）。超过即转人工审批，防 agent 反复
     # 试探把续跑变成死循环——每次续跑都是一次完整 claude 调用，代价不低。
     auto_deny_max: int = 2
+    # ── 长任务异步化：T 升级 ＋ 分段续跑 ＋ long lane ──
+    #
+    # 依据（现役 PG 台账实测 n=108、跨度 41 天）：P50=1.9m、52% 的任务 2 分钟内就
+    # 结束，但 >15m 的占 11.1% 且吃掉 **49.7%** 的槽位时间；3 个任务死在 30.0m 整
+    # （task_timeout 斩立决），产出全丢、tokens 记 0。#108 被砍后重跑为 #111，同样
+    # 工作 24.3m 就完成——差的不是能力，是时间预算。
+    #
+    # 为什么判据放在**运行时**而不是提交时预测：提交时静态特征可分性差（desc≥1000 字
+    # 精确率仅 16.9%、长活关键词 15.9%；要抓 91.7% 召回得标记 60% 的任务，且 desc
+    # 长度被 marker 铁律样板约 1100 字污染）。而条件概率 P(>15m｜已跑到 T 仍在跑)
+    # 在 T=10m 达 **75% 精确率、100% 召回**（历史上没有任何长任务在 10m 前结束过），
+    # 只打扰 14.8% 的任务、误报 3.7%。T=3m 会打扰 41.7% 且精确率仅 26.7%，提示沦为噪音。
+    long_task_mode: str = "shadow"          # off | shadow | notify | on
+    long_task_threshold_sec: float = 600.0  # T：单段跑到此时长即判为长任务
+    long_task_max_segments: int = 3         # 单任务最多跑几段（含首段）；3 段＝上限 90m
+    # long lane：为短任务保留槽位，防长任务吃光并发（移除 30m 上限的必要配套——
+    # 分段续跑让单个长任务最坏占槽 90m，是原来的 3 倍）。
+    # **比例式而非固定值**：固定 reserve=1 只在 max_concurrent=3 时合适；扩到 8 后
+    # 只占 12.5%、护栏形同虚设（8 倍流量重放下短任务 P90 仍等 39m）。1/3 比例在
+    # 3 槽（cap=2）与 8 槽（cap=5）两个尺度上同为重放拐点，并发怎么扩都不退化成死代码。
+    long_lane_reserve_ratio: float = 1.0 / 3.0
+    # aging 逃生：长任务在 lane 里等待超过此时长即放行，杜绝无界饥饿。
+    # cap=1 的极端情形重放出过 8.5h 等待，aging 是它的上界保险。
+    long_wait_promote_sec: float = 1200.0
     # local 影子记录超期未回报 → 判 failed。默认 15min：avatar 侧 local 硬截止是
     # reply_timeout_sec(600) + 60s 宽限 ≈ 11min，留 4min 余量给回报本身，
     # 既不会抢在 avatar 正常回报前误判，也不会让僵尸行挂太久。
@@ -203,6 +228,16 @@ class Settings:
     backup_max_mb: float = 50.0   # 冲突备份的单文件体积上限；超过则只记 conflicts 不拷贝。
     #                               历史事故：无上限的 copy2 让一个宽 target 任务把 venv/models 整棵树
     #                               备份成 18972 个 .bak、4.92G（单个 model.bin.bak 1.5G 还拷了两份）
+
+    @property
+    def long_lane_cap(self) -> int:
+        """同时可运行的长任务上限＝max_concurrent − 保留给短任务的槽位数。
+
+        保留数按比例算并下限 1：max_concurrent=3 → reserve 1 → cap 2；
+        =8 → reserve 3 → cap 5。cap 再下限 1，防比例配得过大时把长任务全禁掉。
+        """
+        reserve = max(1, math.ceil(self.max_concurrent * self.long_lane_reserve_ratio))
+        return max(1, self.max_concurrent - reserve)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -230,6 +265,15 @@ class Settings:
             approval_timeout_minutes=float(
                 os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "60")),
             auto_deny_max=int(os.environ.get("RELAY_AUTO_DENY_MAX", "2")),
+            long_task_mode=os.environ.get("RELAY_LONG_TASK_MODE", "shadow").strip().lower(),
+            long_task_threshold_sec=float(
+                os.environ.get("RELAY_LONG_TASK_THRESHOLD_SEC", "600")),
+            long_task_max_segments=int(
+                os.environ.get("RELAY_LONG_TASK_MAX_SEGMENTS", "3")),
+            long_lane_reserve_ratio=float(
+                os.environ.get("RELAY_LONG_LANE_RESERVE_RATIO", str(1.0 / 3.0))),
+            long_wait_promote_sec=float(
+                os.environ.get("RELAY_LONG_WAIT_PROMOTE_SEC", "1200")),
             local_stale_minutes=float(os.environ.get("RELAY_LOCAL_STALE_MINUTES", "15")),
             sweep_interval_sec=float(os.environ.get("RELAY_SWEEP_INTERVAL_SEC", "300")),
             blocked_patterns=_blocked_patterns_from_env(),
