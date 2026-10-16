@@ -930,3 +930,46 @@ def test_approval_reprompt_not_capped_by_review_max(avatar):
         avatar._reprompt(s)
     assert sum("待你拍板" in t or "需要管理员确认" in t
                for t in texts(avatar)) == 3
+
+
+# ── 聚合缓冲兜底：控制关键词不是需求 ──────────────────────────────
+# #150 实测：三条被吞进 followups 的「进度」，在上一件任务结束时被刷成
+# desc="进度\n\n进度\n\n进度" 的真任务——白占一个槽位，还回了一段莫名其妙的话。
+# progress 现已在 _on_message 入口拦截；这里锁**最后一道**，防将来新增关键词
+# 忘了配拦截时重演。
+@pytest.mark.parametrize("w", ["进度", "进展", "状态", "取消", "确认", "拒绝",
+                               "冲突", "提交", "开始执行"])
+def test_is_control_kw_positive(avatar, w):
+    assert avatar._is_control_kw(w)
+
+
+@pytest.mark.parametrize("w", ["再做一个报告", "进度怎么样了", "别取消",
+                               "确认一下口径", "", "  "])
+def test_is_control_kw_negative(avatar, w):
+    """精确匹配语义：带上下文的正常需求不得被误判成控制指令而丢弃。"""
+    assert not avatar._is_control_kw(w)
+
+
+def test_flush_drops_pure_control_keywords(avatar):
+    s, tid = _start_review(avatar, "113")
+    # 直接塞进缓冲，模拟"新增关键词但忘了配入口拦截"
+    s["followups"] = ["进度", "进度", "进度"]
+    before = len(avatar.exec_relay.submitted)
+    avatar.on_event(ev("确认", n="116"))
+    s["deadline"] = 1
+    avatar._tick()
+    assert len(avatar.exec_relay.submitted) == before, \
+        avatar.exec_relay.submitted
+    assert s["followups"] == []
+
+
+def test_flush_keeps_substantive_items_mixed_with_control_keywords(avatar):
+    """混着真需求时只丢控制关键词，真需求必须照常提交。"""
+    s, tid = _start_review(avatar, "113")
+    s["followups"] = ["进度", "再做一个门店日销报告"]
+    avatar.on_event(ev("确认", n="116"))
+    s["deadline"] = 1
+    avatar._tick()
+    desc = avatar.exec_relay.submitted[-1]["desc"]
+    assert "再做一个门店日销报告" in desc
+    assert "进度" not in desc

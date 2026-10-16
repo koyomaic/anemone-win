@@ -57,6 +57,23 @@ def _with_segment(hint: str, seg: int) -> str:
             hint = (hint[:i] + hint[j + 1:]).strip()
     return f"{SEG_MARK}{seg}]\n{hint}".strip()
 
+
+def _restart_interrupted(shutting_down: bool, timed_out: bool,
+                         exit_code: int) -> bool:
+    """这个任务是否被**计划内重启**打断（→ 应退回 queued，而不是判 failed）。
+
+    三个条件缺一不可：
+    - shutting_down：只有 lifespan 收尾置位时为真。硬杀（kill -9/OOM）走不到这里，
+      那条路由 lifespan 开头的启动恢复逻辑接回（行留在 running → queued）。
+    - not timed_out：超时也是 SIGTERM(143)，但那是任务自己的预算用尽，重新排队
+      只会再超时一次，属于真失败。
+    - signal_name(exit_code)：确实被信号打死。agent 自己报错退出（code 1 等）
+      与重启无关，必须照常判 failed。
+
+    抽成纯函数是为了可测：这段判定埋在 run_task 闭包深处，起真服务才能碰到。
+    """
+    return bool(shutting_down and not timed_out and signal_name(exit_code))
+
 DASH_COOKIE = "relay_dash"
 DASH_TTL = 12 * 3600
 MAX_FILE_BYTES = 10 * 1024 * 1024     # 文件上传/下载通道单文件上限 10MB
@@ -629,7 +646,7 @@ document.getElementById("btn-pl-new").addEventListener("click",async()=>{
 });
 refresh();setInterval(()=>{refresh();if(document.getElementById("view-tokens").style.display!=="none")refreshTokens();if(document.getElementById("view-plans").style.display!=="none"){refreshPlans();refreshTimers()}},10000);
 </script></body></html>"""
-from .executor import Executor
+from .executor import Executor, signal_name
 from .scheduler import Scheduler
 from .targets import find_conflicts
 
@@ -934,6 +951,12 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     # 重启不丢，硬上界仍然生效）。
     seg_progress: dict[int, tuple] = {}
     sched: Scheduler | None = None  # set in lifespan
+    # 计划内重启标志，lifespan 收尾时置位。run_task 据此把「被 SIGTERM 打断」的任务
+    # 退回 queued 而不是判 failed：否则每次部署都把在跑的任务打成失败、还回用户一句
+    # 「❌ 没办成」（#149 实测——已续到第 2/3 段，被部署杀掉，前 30 分钟产出白费）。
+    # 硬杀（kill -9/OOM）走的是另一条路：行留在 running，由 lifespan 开头的启动恢复
+    # 逻辑接回。两条路此前只有后者能活，计划内重启反而更致命，正好是反的。
+    shutting_down = False
     started_at = time.monotonic()
 
     async def run_task(task_id: int) -> None:
@@ -1109,6 +1132,25 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         seg_progress.pop(task_id, None)
         if res.error == "cancelled":
             status, err = "cancelled", "cancelled by user"
+        elif _restart_interrupted(shutting_down, res.timed_out, res.exit_code):
+            # 计划内重启打断：不是任务的错，退回 queued 让启动恢复逻辑接回去
+            # （lifespan 开头把 queued 重新 submit，段号从 resume_hint 还原，故续跑中
+            # 的长任务重启后仍归 long lane）。**不发 failed 事件**——否则分身会回用户
+            # 一句「❌ 没办成」，而其实几秒后它就接着跑了。
+            # 排除 timed_out：超时也是 SIGTERM(143)，但那是任务自己的预算用尽，
+            # 重新排队只会再超时一次。
+            db.set(task_id, status="queued", error="服务重启，任务重新排队",
+                   blocked_cmd="")
+            bus.publish(task_id, t="status", s="queued", reason="restart")
+            audit.line(task_id, row["user"], "restart_requeue",
+                       f"exit={res.exit_code}({signal_name(res.exit_code)}) "
+                       f"elapsed={res.elapsed:.0f}s seg={seg} "
+                       f"tools={res.tool_calls}")
+            # cancel 事件必须清掉：run_task 用 setdefault 复用同一事件，若关闭瞬间
+            # 恰好有人取消（事件已 set），重新排队的任务会一启动就被自己杀掉。
+            cancel_events.pop(task_id, None)
+            auto_deny_counts.pop(task_id, None)
+            return
         elif res.error:
             status, err = "failed", res.error
         elif real_conflicts or ro_overwritten:
@@ -1210,7 +1252,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal sched
+        nonlocal sched, shutting_down
         # long lane 只在 mode=on 时生效：shadow/notify 阶段必须**零行为变化**，
         # 否则影子期测出来的精确率/召回就不是"若启用会怎样"而是被调度改动污染过的。
         lane_on = cfg.long_task_mode == "on"
@@ -1246,6 +1288,9 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
 
         sweeper_task = asyncio.create_task(sweeper())
         yield
+        # 必须在 sched.stop() **之前**置位：stop() 会 cancel 在跑的任务，被 cancel 的
+        # run_task 随即走到终态判定，那时就要能看出"这是计划内重启，不是任务失败"。
+        shutting_down = True
         stop.set()
         await sweeper_task
         await sched.stop()

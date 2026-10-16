@@ -700,6 +700,13 @@ class Avatar:
     def _kw(self, text: str, name: str) -> bool:
         return text in self.cfg.get("keywords", name, [])
 
+    def _is_control_kw(self, text: str) -> bool:
+        """是否**纯**控制关键词（进度/取消/确认…）。聚合缓冲的兜底过滤用。"""
+        t = (text or "").strip()
+        return any(self._kw(t, k) for k in
+                   ("submit", "cancel", "confirm", "deny", "conflict",
+                    "progress"))
+
     def _is_noise(self, text: str) -> bool:
         t = text.strip()
         if not t or EMOJI_RE.match(t):
@@ -993,6 +1000,19 @@ class Avatar:
     def _flush(self, s: dict, followup: bool = False, uid: str = "",
                force_relay: bool = False):
         items = s["followups"] if followup else s["buffer"]
+        # 兜底过滤：控制关键词不是需求。#150 实测——三条被吞进 followups 的「进度」
+        # 在上一件任务结束时被刷成 desc="进度\n\n进度\n\n进度" 的真任务，白占一个
+        # 槽位，还回了一段莫名其妙的话。progress 现已在 _on_message 入口拦截，这里
+        # 是**最后一道**：将来新增关键词若忘了配拦截，宁可少提交一次，也不要把控制
+        # 指令当需求送进大脑。
+        kept = [x for x in items if not self._is_control_kw(x)]
+        if len(kept) != len(items):
+            log(f"flush 丢弃 {len(items) - len(kept)} 条纯控制关键词，不提交任务")
+            if followup:
+                s["followups"] = kept
+            else:
+                s["buffer"] = kept
+            items = kept
         if not items:
             s["state"] = "IDLE"
             return

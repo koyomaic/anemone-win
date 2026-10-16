@@ -55,6 +55,25 @@ class AgentResult:
     # 故 tokens=0、最终文本也常常是空的（#146 第 1 段实测 files=0 text=0，其实一直在
     # 跑工具查数据）。只看文件与文本会把"正在采集数据"误判成"毫无进展"而停掉续跑。
     tool_calls: int = 0
+    # 子进程退出码，原样保留不字符串化。上层要区分「被信号打断」与「agent 自己
+    # 报错」时靠它——从 error 文案里正则抠数字，一改字就静默失效（与 timed_out
+    # 用独立布尔而非 startswith("timeout after") 同一个理由）。
+    exit_code: int = 0
+
+
+def signal_name(rc: int) -> str:
+    """退出码 → 信号名；非信号退出返回空串。
+
+    兼容两种口径：asyncio 直接子进程给负数（-15），经 shell 包装给 128+signo
+    （143）。#149 实测拿到的是 143。
+    """
+    signo = -rc if rc < 0 else (rc - 128 if rc > 128 else 0)
+    if signo <= 0:
+        return ""
+    try:
+        return signal.Signals(signo).name
+    except ValueError:
+        return f"signal {signo}"
 
 
 def _parse_opencode(line: str) -> dict | None:
@@ -371,10 +390,20 @@ class Executor:
                 self._kill(proc)
             await proc.wait()
             err = (await stderr_task).decode("utf-8", "replace")
+            # 放在 finally 里：timeout/cancelled/blocked 都是**提前 return**，
+            # 写在下面会让这些路径拿不到退出码，上层就无法识别"被信号打断"。
+            res.exit_code = int(proc.returncode or 0)
         res.raw_tail = "\n".join(raw_tail[-5:])
         if res.error is None and proc.returncode != 0:
             tail = (err or res.raw_tail)[-800:]
-            res.error = f"agent exited with code {proc.returncode}: {tail}"
+            # 信号终止时先点名信号。#149 实测：rc=143（SIGTERM，部署重启所杀），
+            # 但 stderr 末行恰好是无关的 [claude-code:unrecognized_model]，被顶成
+            # 错误主因，排查直接跑偏。tail 仍保留（可能藏着真因），只是不再打头阵。
+            sig = signal_name(proc.returncode)
+            head = f"agent exited with code {proc.returncode}"
+            if sig:
+                head += f"（{sig} 终止，非 agent 自身报错）"
+            res.error = f"{head}: {tail}"
         return res
 
     def _is_blocked(self, cmd: str, workdir: str = "",
