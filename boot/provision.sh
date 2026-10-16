@@ -36,6 +36,11 @@ CURRENT_LINK="${CURRENT_LINK:-/opt/team/relay-deploy/current}"
 VENV="${VENV:-/mnt/vol-eltaah12/finaagent/.venv}"
 UNIT="${UNIT:-relay}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8787/health}"
+# 机队期望的**实际生效值**（供 26b 自检比对）。真源是 relay-service/app/config.py 的
+# 代码默认值——relay.env 每台机独立、provision 只在缺失时创建且绝不覆盖，故某机若显式
+# 写了旧值，代码默认值不会覆盖它，夜间同步后该机仍是旧行为且无人察觉。改默认值时两处同步。
+FLEET_MAX_CONCURRENT="${FLEET_MAX_CONCURRENT:-8}"
+FLEET_LONG_TASK_MODE="${FLEET_LONG_TASK_MODE:-on}"
 WORKSPACE="${RELAY_WORKSPACE:-/mnt/vol-eltaah12/workspace}"
 BACKUP_DIR="${BACKUP_DIR:-/mnt/vol-eltaah12/backup}"
 ALERT_TO="${ALERT_TO:-王洪彬}"
@@ -90,6 +95,16 @@ health_version() {
   local u v; for u in "https://127.0.0.1:8788/health" "$HEALTH_URL"; do
     v="$(curl -sfk -m 3 "$u" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null)" || true
     [ -n "$v" ] && { echo "$v"; return 0; }
+  done; echo ""
+}
+
+health_longtask() { # 一次探测输出 "max_concurrent|long_task_mode|long_lane_cap"（取不到输出空）
+  local u v; for u in "https://127.0.0.1:8788/health" "$HEALTH_URL"; do
+    v="$(curl -sfk -m 3 "$u" 2>/dev/null | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("%s|%s|%s" % (d.get("max_concurrent", ""), d.get("long_task_mode", ""),
+                    d.get("long_lane_cap", "")))' 2>/dev/null)" || true
+    [ -n "$v" ] && [ "$v" != "||" ] && { echo "$v"; return 0; }
   done; echo ""
 }
 
@@ -798,6 +813,25 @@ elif heal; then
   systemctl restart "$UNIT" >/dev/null 2>&1
   wait_healthy 30 && ok "重启后健康" || abort "relay 不健康（journalctl -u $UNIT 排查）"
 else bad "未运行或不健康"; fi
+
+# ---------- 26b 并发/长任务实际生效值（机队一致性自检，SOFT） ----------
+# 读**运行中服务**的 /health 而非 relay.env：env 里没写的键会落到代码默认值，只有
+# /health 才是真正生效的那个数。偏离机队期望即 WARN（不是 FAIL——配置漂移不该让
+# install 模式中止），并把最可能的原因写在同一行里，省一次排查往返。
+step "并发/长任务生效"
+_lt="$(health_longtask)"
+if [ -z "$_lt" ]; then
+  _env_mc="$(sed -n 's/^RELAY_MAX_CONCURRENT=//p' "$WORKSPACE/relay.env" 2>/dev/null | tail -1)"
+  _env_lt="$(sed -n 's/^RELAY_LONG_TASK_MODE=//p' "$WORKSPACE/relay.env" 2>/dev/null | tail -1)"
+  warn "服务未响应，读不到生效值（relay.env: MAX_CONCURRENT=${_env_mc:-未设→默认$FLEET_MAX_CONCURRENT} LONG_TASK_MODE=${_env_lt:-未设→默认$FLEET_LONG_TASK_MODE}）"
+else
+  _mc="${_lt%%|*}"; _r="${_lt#*|}"; _mode="${_r%%|*}"; _cap="${_r##*|}"
+  if [ "$_mc" = "$FLEET_MAX_CONCURRENT" ] && [ "$_mode" = "$FLEET_LONG_TASK_MODE" ]; then
+    ok "max_concurrent=$_mc long_task_mode=$_mode long_lane_cap=$_cap"
+  else
+    warn "偏离机队期望($_mc/$_mode ≠ $FLEET_MAX_CONCURRENT/$FLEET_LONG_TASK_MODE) long_lane_cap=$_cap —— 多半是本机 relay.env 显式写了旧值，代码默认值不覆盖已存在的 env；改后需 systemctl restart $UNIT"
+  fi
+fi
 
 # ---------- 27 定时任务 ----------
 step "定时任务(timer)"

@@ -73,6 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 25-26 | claude-proxy / relay-tls-proxy | 缺则装（tls 仅证书存在时） | 软 |
 | 27 | 首装引导（无现役 release → boot.sh boot 完整部署） | 自动 | 硬 |
 | 28 | relay active+healthy | enable/start/restart | 硬 |
+| 28b | 并发/长任务**实际生效值**：读运行中服务 `/health` 的 `max_concurrent`/`long_task_mode`/`long_lane_cap`，与机队期望（`FLEET_MAX_CONCURRENT`=8、`FLEET_LONG_TASK_MODE`=on，可用 env 覆盖）比对。为什么读 /health 而不是 relay.env：env 里没写的键会落到**代码默认值**，只有 /health 才是真正生效的那个数 | 不改配置，只报偏离 → WARN 并指出多半是本机 relay.env 显式写了旧值（代码默认值不覆盖已存在的 env），改后需 `systemctl restart relay`；服务未响应时退回读 relay.env 并标注默认值 | 软(WARN) |
 | 29 | 两个 timer enabled | enable --now | 硬 |
 | 29b | GitHub 访问就绪：SSH（默认）→ config `accept-new` 固化、无密钥自动生成、认证实测；HTTPS（备用）→ 查 `/root/.git-credentials` | config/密钥自愈；认证失败 WARN 附公钥与 Deploy keys 登记指引 | 软 |
 | 30 | GitHub 远端可达且 remote==current | 仅报告 | 软 |
