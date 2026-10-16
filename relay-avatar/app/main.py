@@ -33,7 +33,7 @@ from app.file_inbox import FileInbox, extract_file_from_event, find_media_ids
 from app.group_watch import GroupWatch, parse_watch_cmd
 from app.ingress_dingtalk import (Dws, EventIngress, InboundHealth, SelfMark,
                                   SelfPoller, SentEcho, card_biz_id,
-                                  md_hardbreak, send_accepted)
+                                  md_hardbreak, send_accepted, strip_ctrl)
 from app.ingress_relay import RelayClient
 from app.knowledge import Knowledge, parse_learn_cmd
 from app.monitor import Monitor
@@ -250,7 +250,7 @@ class Avatar:
         if is_group and not self.cfg.get("group", "enabled", False):
             return
         if is_group:
-            ev["content"] = re.sub(r"@\S+\s*", "", str(content)).strip()
+            ev["content"] = self._strip_mentions(str(content))
             content = ev["content"]
             if not content:
                 return
@@ -337,17 +337,17 @@ class Avatar:
                 self._notify(s["reply"], fb)
             return
         # 即时回执前置：先贴「正在疯狂处理中...」，再做已读回标/媒体下载等重活
-        quick = self._quick_text(content)
-        if (s["state"] == "IDLE" and quick.strip()
-                and not self._is_noise(quick)
-                and not planning.parse_plan_cmd(quick)
-                and not any(self._kw(quick, k) for k in
+        cmd_text = self._command_text(content)
+        if (s["state"] == "IDLE" and cmd_text
+                and not self._is_noise(cmd_text)
+                and not planning.parse_plan_cmd(cmd_text)
+                and not any(self._kw(cmd_text, k) for k in
                             ("submit", "cancel", "confirm", "deny",
                              "conflict", "progress"))):
             self._ack_receive(s)
         self._mark_read(s)
         text = self._extract_text(ev, content, uid, sender)
-        self._on_message(key, s, text.strip(), uid)
+        self._on_message(key, s, text.strip(), uid, cmd_text=cmd_text)
         self.sess.save()
 
     def _quick_text(self, content) -> str:
@@ -364,6 +364,25 @@ class Avatar:
                     pass
             return c
         return str(content or "")
+
+    @staticmethod
+    def _strip_mentions(text: str) -> str:
+        """剥掉群聊 @ 提及。
+
+        钉钉事件里通常是 `@名字 正文`，历史也出现过用 `\x07` 分隔 mention 与正文。
+        旧正则 `@\\S+\\s*` 会把 `@名字\x07正文` 整条吞掉（`\x07` 不是空白），
+        因此这里把 BEL 也视为 mention 分隔符，并避免跨到下一个 `@`。
+        """
+        return re.sub(r"@[^\s\x07@]+[\s\x07]*", "", str(text or "")).strip()
+
+    def _command_text(self, content) -> str:
+        """关键词/命令判定专用文本：只取用户本条原始正文，不含引用上下文。
+
+        `_extract_text()` 会把 `quoted_message` 拼成 `[引用] ...` 供模型理解上下文；
+        若用它做精确关键词匹配，用户“引用提醒消息后回复 确认”会变成
+        `[引用] ...\n确认`，永远命中不了 `确认`。命令判定必须与任务正文分离。
+        """
+        return strip_ctrl(self._quick_text(content)).strip()
 
     def _mark_read(self, s: dict):
         if s.get("last_conv_id") and s.get("last_msg_id"):
@@ -687,22 +706,27 @@ class Avatar:
             return True
         return t in self.cfg.get("ingress", "noise_ignore", [])
 
-    def _on_message(self, key: str, s: dict, text: str, uid: str):
+    def _on_message(self, key: str, s: dict, text: str, uid: str,
+                    cmd_text: str | None = None):
+        st = s["state"]
+        # `text` 是带引用/附件上下文的完整任务正文；`cmd` 是用户本条原始指令，
+        # 专供精确关键词与控制命令判定，避免“引用提醒后回复 确认”被引用前缀污染。
+        cmd = (cmd_text if cmd_text is not None else text).strip()
         # 「进度」优先于所有状态分支：查询类指令不该进聚合缓冲。RUNNING 时它原先
         # 被当追问吞进 followups（首条只贴表情、其后全静默），用户实测「没响应，
         # 再回复就不响应了」——而长任务提示恰恰承诺了「发进度看状态」。
-        if self._kw(text, "progress"):
+        # 判 cmd 而非 text：引用长任务提示那条消息再回「进度」同样要认。
+        if self._kw(cmd, "progress"):
             self._progress_reply(s, uid)
             return
-        st = s["state"]
         if st == "WAIT_APPROVAL" and s.get("task_id"):
-            if self._kw(text, "confirm"):
+            if self._kw(cmd, "confirm"):
                 r = self.exec_relay.approve(s["task_id"], "approve", uid)
                 self._notify_session(s, "✅ 已放行，继续执行。")
                 s["state"] = "RUNNING"
                 self.st.archive_round(s["task_id"], "approve", r)
                 return
-            if self._kw(text, "deny"):
+            if self._kw(cmd, "deny"):
                 r = self.exec_relay.approve(s["task_id"], "deny", uid)
                 self._notify_session(s, "🚫 已拒绝，任务终止。")
                 s["state"] = "IDLE"
@@ -712,28 +736,36 @@ class Avatar:
             self._reprompt(s)
             return
         if st == "WAIT_REVIEW" and s.get("task_id"):
-            if self._kw(text, "confirm"):
-                r = self.exec_relay.confirm(s["task_id"], "done", uid)
-                self._notify_session(s, "✅ 已确认完成。")
-                s["state"] = "IDLE"
-                self.st.archive_round(s["task_id"], "confirm-done", r)
+            if self._kw(cmd, "confirm"):
+                self._confirm_review(s, "done", uid)
                 return
-            if self._kw(text, "conflict") or self._kw(text, "deny"):
-                r = self.exec_relay.confirm(s["task_id"], "conflict", uid)
-                self._notify_session(s, "已标记文件冲突，请人工复核。")
-                s["state"] = "IDLE"
-                self.st.archive_round(s["task_id"], "confirm-conflict", r)
+            if self._kw(cmd, "conflict") or self._kw(cmd, "deny"):
+                self._confirm_review(s, "conflict", uid)
+                return
+            if self._is_noise(cmd):
+                self._react(s, "noise_emoji")
+                return
+            if cmd:
+                # review 期间的新需求不再每条都 reprompt：先排队，等用户确认上一件
+                # 后由 FOLLOWUP 窗口统一 flush。review 本身不自动确认，保留人工核查。
+                s.setdefault("followups", []).append(text)
+                if not s.get("review_followup_notified"):
+                    s["review_followup_notified"] = True
+                    self._react(s, "followup_emoji")
+                    self._notify_session(
+                        s, "👀 上一件仍待确认：回复「确认」完成，或「冲突」标记文件冲突。"
+                           "新需求已记录，确认后会继续处理。")
                 return
             self._reprompt(s)
             return
-        if self._is_noise(text):
+        if self._is_noise(cmd):
             self._react(s, "noise_emoji")
             return
         if st == "BUFFERING":
-            if self._kw(text, "submit"):
+            if self._kw(cmd, "submit"):
                 self._flush(s, uid=uid)
                 return
-            if self._kw(text, "cancel"):
+            if self._kw(cmd, "cancel"):
                 s["buffer"] = []
                 s["state"] = "IDLE"
                 self._swap_ack(s, "")
@@ -745,7 +777,7 @@ class Avatar:
             return
         if st in ("RUNNING", "WAIT_APPROVAL", "WAIT_REVIEW", "FOLLOWUP",
                   "LOCAL"):
-            if self._kw(text, "cancel"):
+            if self._kw(cmd, "cancel"):
                 if st == "LOCAL":
                     # local 通路无 task_id、claude 子进程不可中途撤回；若在此重置
                     # 会话态，_drain_local 会跳过收尾，卡片将永远停在「处理中」
@@ -773,24 +805,56 @@ class Avatar:
                 self._react(s, "followup_emoji")
             return
         # IDLE
-        if any(self._kw(text, k) for k in
+        if any(self._kw(cmd, k) for k in
                ("submit", "cancel", "confirm", "deny", "conflict")):
             return
         # 计划（定时任务）：以 定时/计划 前缀就地拦截，进大脑前处理（大脑不会去"当场执行"）
-        pc = planning.parse_plan_cmd(text)
+        pc = planning.parse_plan_cmd(cmd or text)
         if pc:
             self._handle_plan(pc, s, uid)
             return
         # 同一需求已在别的会话在办 → 绑成额外投递目标，不再起一个任务。
         # 放在计划拦截之后（计划是登记动作，不该被去重吞掉）、缓冲之前
         # （一旦进 BUFFERING 就会在 debounce 到期后真的提交）。
-        dup = self._find_inflight_duplicate(s, text, uid)
+        dup = self._find_inflight_duplicate(s, cmd or text, uid)
         if dup is not None:
             self._bind_duplicate(dup, s)
             return
         if s.get("ack_mid") != s.get("last_msg_id"):
             self._ack_receive(s)   # 即时回执已贴过则不重复
         self.sess.start_buffering(s, text)
+
+    def _confirm_review(self, s: dict, outcome: str, uid: str):
+        """用户直接确认/标记冲突 review 任务。
+
+        与 relay 侧自动 done 不同：这里不重复发送结果，只结束 review 并处理
+        review 期间排队的新需求。followups 必须在此启动 FOLLOWUP 窗口，否则
+        状态直接回 IDLE 后 `_tick()` 永远不会 flush，排队需求会卡死。
+        """
+        tid = s.get("task_id")
+        r = self.exec_relay.confirm(tid, outcome, uid)
+        if isinstance(r, dict) and "_error" in r:
+            self._notify_session(
+                s, f"⚠️ 确认失败了：{r['_error']} "
+                   f"{str(r.get('_detail', ''))[:120]}，请稍后再试或联系管理员。")
+            return
+        if outcome == "done":
+            self._notify_session(s, "✅ 已确认完成。")
+        else:
+            self._notify_session(s, "已标记文件冲突，请人工复核。")
+        self.st.archive_round(tid, f"confirm-{outcome}", r)
+        self._swap_ack(s, "done_text_emotion" if outcome == "done" else "")
+        if isinstance(r, dict) and r.get("id"):
+            self.sess.note_chain(s, r.get("tokens"), self._chain_digest(r))
+        s["task_id"] = None
+        s["last_task_id"] = tid
+        s.pop("review_followup_notified", None)
+        s.pop("review_reprompt_count", None)
+        if s.get("followups"):
+            self.sess.start_followup_window(s)
+            log(f"{len(s['followups'])} followup(s) queued after review {outcome}")
+        else:
+            s["state"] = "IDLE"
 
     # ── 重复请求去重 + 多渠道投递绑定 ──
     @staticmethod
@@ -1470,6 +1534,8 @@ class Avatar:
                 continue
             if status == "review" and s["state"] != "WAIT_REVIEW":
                 s["state"] = "WAIT_REVIEW"
+                s["review_followup_notified"] = False
+                s["review_reprompt_count"] = 0
                 self._send_result(s, row, prefix="👀 办完了，等你过目"
                                                  "（回复「确认」完成 /「冲突」标记文件冲突）")
                 self.st.archive_round(tid, "review",
@@ -2346,6 +2412,8 @@ class Avatar:
                 self._notify_session(s, "🚫 已取消。")
             self._swap_ack(s, "")
         s["task_id"] = None
+        s.pop("review_followup_notified", None)
+        s.pop("review_reprompt_count", None)
         if s.get("followups"):
             self.sess.start_followup_window(s)
             log(f"{len(s['followups'])} followup(s) queued")
@@ -2375,13 +2443,25 @@ class Avatar:
 
     def _reprompt(self, s: dict):
         now = time.time()
-        cooldown = int(self.cfg.get("security", "reprompt_cooldown_sec", 60))
+        approval = s.get("state") == "WAIT_APPROVAL"
+        if approval:
+            cooldown = int(self.cfg.get("security", "reprompt_cooldown_sec", 60))
+            max_n = 0
+            count = 0
+        else:
+            cooldown = int(self.cfg.get("security",
+                                        "review_reprompt_cooldown_sec", 1800))
+            max_n = int(self.cfg.get("security", "review_reprompt_max", 2))
+            count = int(s.get("review_reprompt_count", 0))
+            if max_n > 0 and count >= max_n:
+                return
         if now - s.get("last_reprompt", 0) < cooldown:
             return
         s["last_reprompt"] = now
-        if s["state"] == "WAIT_APPROVAL":
+        if approval:
             self._notify_session(s, self._approval_text(s))
         else:
+            s["review_reprompt_count"] = count + 1
             self._notify_session(s, "👀 办完了待你确认：回复「确认」完成，"
                                     "「冲突」标记文件冲突。")
 

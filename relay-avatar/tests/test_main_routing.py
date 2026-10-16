@@ -775,3 +775,158 @@ def test_card_create_keeps_numeric_receiver(real_dws, monkeypatch):
     real_dws.card_create({"user_id": "18434"})
     assert "--receiver" in seen[0] and "18434" in seen[0]
     assert "--receiver-open-dingtalk-id" not in seen[0]
+
+
+# ── review 确认 / 引用回复 / 群@ / followup 排队 / 提醒限频 ──
+
+def quoted_ev(text, n, sid="sid200", sender="张三", group=False,
+              conv=None, quoted="👀 办完了待你确认：回复「确认」完成"):
+    e = ev(text, sid=sid, sender=sender, n=n, group=group)
+    if conv:
+        e["conversation_id"] = conv
+    e["quoted_message"] = {
+        "message_id": f"q{n}",
+        "conversation_id": e["conversation_id"],
+        "sender": "鲁大师",
+        "content": quoted,
+        "text": quoted,
+    }
+    return e
+
+
+def _start_review(avatar, n, text="跑个任务", sid="sid200", group=False,
+                  conv=None):
+    if group:
+        avatar.cfg._p.setdefault("group", {})["enabled"] = True
+    e = ev(text, sid=sid, n=n, group=group)
+    if conv:
+        e["conversation_id"] = conv
+    avatar.on_event(e)
+    key = (f"g:{conv or e['conversation_id']}:{sid}" if group
+           else f"o:{sid}")
+    s = avatar.sess.sessions[key]
+    avatar._flush(s, uid="200")
+    tid = s["task_id"]
+    avatar.exec_relay.tasks[tid] = {"id": tid, "status": "review",
+                                    "result": "复核结果", "tokens": 10}
+    avatar.dws.sent.clear()
+    avatar._poll_sessions()
+    assert s["state"] == "WAIT_REVIEW"
+    return s, tid
+
+
+def test_quoted_confirm_single_chat(avatar):
+    s, tid = _start_review(avatar, "100")
+    avatar.dws.sent.clear()
+    avatar.on_event(quoted_ev("确认", "101"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "done"
+    assert s["state"] == "IDLE"
+    assert s["task_id"] is None and s["last_task_id"] == tid
+    assert any("已确认完成" in t for t in texts(avatar))
+    assert not any("办完了待你确认" in t for t in texts(avatar))
+
+
+def test_group_mention_quoted_confirm(avatar):
+    s, tid = _start_review(avatar, "102", text="@鲁大师 跑个任务",
+                           group=True, conv="cg1")
+    avatar.dws.sent.clear()
+    avatar.on_event(quoted_ev("@鲁大师 确认", "103", group=True, conv="cg1"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "done"
+    assert s["state"] == "IDLE"
+    assert any("已确认完成" in t for t in texts(avatar))
+
+
+def test_group_mention_bel_confirm(avatar):
+    s, tid = _start_review(avatar, "104", text="@鲁大师\x07跑个任务",
+                           group=True, conv="cg2")
+    avatar.dws.sent.clear()
+    avatar.on_event(quoted_ev("@鲁大师\x07确认", "105", group=True, conv="cg2"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "done"
+    assert s["state"] == "IDLE"
+
+
+def test_quoted_cancel_running(avatar):
+    avatar.on_event(ev("跑个任务", n="106"))
+    s = avatar.sess.sessions["o:sid200"]
+    avatar._flush(s, uid="200")
+    tid = s["task_id"]
+    avatar.dws.sent.clear()
+    avatar.on_event(quoted_ev("取消", "107"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "cancelled"
+    assert s["state"] == "IDLE" and s["task_id"] is None
+    assert any("已取消任务" in t for t in texts(avatar))
+
+
+def test_wait_review_queues_new_request_once(avatar):
+    s, tid = _start_review(avatar, "108")
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("再做一个报告", n="109"))
+    assert s["state"] == "WAIT_REVIEW"
+    assert avatar.exec_relay.tasks[tid]["status"] == "review"
+    assert len(s["followups"]) == 1 and "再做一个报告" in s["followups"][0]
+    assert any("新需求已记录" in t for t in texts(avatar))
+    assert not any("办完了待你确认" in t for t in texts(avatar))
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("还有一个报告", n="110"))
+    assert len(s["followups"]) == 2
+    assert not avatar.dws.sent
+
+
+def test_wait_review_noise_does_not_reprompt(avatar):
+    s, tid = _start_review(avatar, "111")
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("[微笑]", n="112"))
+    assert s["state"] == "WAIT_REVIEW"
+    assert not s["followups"]
+    assert not avatar.dws.sent
+
+
+def test_confirm_after_review_followups_flushes(avatar):
+    s, tid = _start_review(avatar, "113")
+    avatar.on_event(ev("再做一个报告", n="114"))
+    avatar.on_event(ev("还有一个报告", n="115"))
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("确认", n="116"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "done"
+    assert s["state"] == "FOLLOWUP" and s["deadline"] > 0
+    before = len(avatar.exec_relay.submitted)
+    s["deadline"] = 1
+    avatar._tick()
+    assert len(avatar.exec_relay.submitted) == before + 1
+    desc = avatar.exec_relay.submitted[-1]["desc"]
+    assert "再做一个报告" in desc and "还有一个报告" in desc
+
+
+def test_review_reprompt_max_and_cooldown(avatar):
+    s, tid = _start_review(avatar, "117")
+    avatar.dws.sent.clear()
+    s["last_reprompt"] = 0
+    avatar._reprompt(s)
+    assert sum("办完了待你确认" in t for t in texts(avatar)) == 1
+    avatar.dws.sent.clear()
+    s["last_reprompt"] = 0
+    avatar._reprompt(s)
+    assert sum("办完了待你确认" in t for t in texts(avatar)) == 1
+    avatar.dws.sent.clear()
+    s["last_reprompt"] = 0
+    avatar._reprompt(s)
+    assert not avatar.dws.sent
+    assert s["review_reprompt_count"] == 2
+
+
+def test_approval_reprompt_not_capped_by_review_max(avatar):
+    avatar.on_event(ev("删库跑路", n="118"))
+    s = avatar.sess.sessions["o:sid200"]
+    avatar._flush(s, uid="200")
+    tid = s["task_id"]
+    avatar.exec_relay.tasks[tid] = {"id": tid, "status": "pending_approval",
+                                    "blocked_cmd": "rm -rf /",
+                                    "error": "blocked:rm: rm -rf /"}
+    avatar._poll_sessions()
+    assert s["state"] == "WAIT_APPROVAL"
+    avatar.dws.sent.clear()
+    for i in range(3):
+        s["last_reprompt"] = 0
+        avatar._reprompt(s)
+    assert sum("待你拍板" in t or "需要管理员确认" in t
+               for t in texts(avatar)) == 3

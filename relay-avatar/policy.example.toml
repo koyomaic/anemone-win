@@ -296,7 +296,9 @@ plan_protected = []            # 受保护计划名单（按 plan.name 精确匹
                                # 检查形同虚设 → 任何 L2 都能删掉核心业务计划。已定不动
                                # relay schema（不加 owner_uid），故在分身侧用名单止血。
                                # 例：["每日原油价格预测调取", "每日成品油价格预测调取"]
-reprompt_cooldown_sec = 60     # 门禁无关消息重提示冷却
+reprompt_cooldown_sec = 60     # 门禁（pending_approval）无关消息重提示冷却
+review_reprompt_cooldown_sec = 1800  # 待复核（review）重提示冷却；review 结果已发过，默认 30 分钟
+review_reprompt_max = 2              # 待复核最多主动重提示次数；0＝不限
 bot_blocklist = ["D6HiivKJyPkiSb9viioeCjdOYw7qeNMb75Gt",   # 「AI助理」（曾与分身互刷死循环）
                  "D8YACgStfKBdniisB5xLrLu2EyEI8kX7NU",   # 「原油AI研究院」bot（2026-09-23 互刷事故）
                  "D8YACgStfKBfFEEsPWgvYYtiSa1ViiXKETw"]  # 「预警提醒」系统号（只进不出）
