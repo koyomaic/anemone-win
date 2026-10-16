@@ -166,7 +166,7 @@ def test_read_only_violation_and_clean(relay_factory, tmp_path):
                            timeout=30)
     tok = admin_c.post("/users", json={"name": "reader"}).json()["token"]
 
-    # 描述带「只读」标记 → read_only 落库；仅新建文件（无覆盖风险）→ review + 违规说明
+    # 描述带「只读」标记 → read_only 落库；仅新建**非低风险目录**文件 → review + 违规说明
     tid = submit(base, tok, "只读核查（实际写入验证）：回复 done",
                  targets=["shared/knowledge"])["task_id"]
     t = wait_task(base, tok, tid, timeout=60)

@@ -643,6 +643,51 @@ def _declares_read_only(description: str) -> bool:
     return any(m in d for m in READ_ONLY_MARKERS)
 
 
+def _prefix_match(rel: str, prefixes: list[str]) -> bool:
+    rel = (rel or "").replace(os.sep, "/")
+    for p in prefixes or []:
+        p = (p or "").replace(os.sep, "/").strip()
+        if not p:
+            continue
+        if not p.endswith("/"):
+            p += "/"
+        if rel.startswith(p):
+            return True
+    return False
+
+
+def auto_done_reason(cfg: Settings, row: dict, scan: dict, result_text: str,
+                     real_conflicts: list[dict], ro_overwritten: list[str]) -> str:
+    """低风险新建产出 → 自动 done，不再进 review。
+
+    旧策略把“任何实质文件变更”都置 review，导致大量只是生成报告/临时数据/系统
+    盘点文件的任务等人确认。新策略只放行**新增**且全部落在低风险前缀下的产出；
+    修改/删除既有文件、跨任务冲突、只读覆盖、越界任务号、批量过大、无结果文本
+    仍保留人工核查。
+    """
+    if getattr(cfg, "auto_done_mode", "off") != "on":
+        return ""
+    if real_conflicts or ro_overwritten:
+        return ""
+    if scan.get("modified") or scan.get("deleted"):
+        return ""
+    if scan.get("foreign"):
+        return ""
+    created = scan.get("created") or []
+    if not created:
+        return ""
+    max_files = int(getattr(cfg, "auto_done_max_files", 0) or 0)
+    if max_files > 0 and len(created) > max_files:
+        return ""
+    if not (result_text or "").strip():
+        return ""
+    prefixes = getattr(cfg, "auto_done_prefixes", []) or []
+    if not all(_prefix_match(rel, prefixes) for rel in created):
+        return ""
+    kind = "只读任务新建低风险产出" if row.get("read_only") else "低风险新建产出"
+    return f"自动done（{kind} {len(created)} 个，无需人工确认）"
+
+
 def _session_if_same_engine(task_row: dict | None, engine: str) -> str | None:
     """仅当历史任务由当前引擎执行时才复用其 session_id（会话格式不跨引擎）。
 
@@ -1043,7 +1088,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         real_conflicts = _check_conflicts(row, scan, finished)
         conflicts = list(real_conflicts)
         # 只读声明的事后兜底按风险分级：覆盖/删除既有文件 → conflict（有数据损失风险）；
-        # 仅新建文件 → review（无覆盖风险，按正常产出走人工确认，不再误报冲突）。
+        # 仅新建文件 → 保留核查说明，低风险前缀下可自动 done，其余仍 review。
         ro_overwritten = sorted(set(scan["modified"]) | set(scan["deleted"])) \
             if row.get("read_only") else []
         if row.get("read_only") and scan["all"]:
@@ -1107,6 +1152,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                        f"files={len(scan['all'])} text={len(res.text or '')} "
                        f"tools={res.tool_calls}）")
         seg_progress.pop(task_id, None)
+        low_risk_done = auto_done_reason(cfg, row, scan, res.text,
+                                         real_conflicts, ro_overwritten)
         if res.error == "cancelled":
             status, err = "cancelled", "cancelled by user"
         elif res.error:
@@ -1116,6 +1163,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         elif not scan["all"]:
             status, err = "done", ("自动done（仅工具缓存变动，无实质产出）"
                                    if scan.get("volatile") else "自动done（只读，无文件改动）")
+        elif low_risk_done:
+            status, err = "done", low_risk_done
         else:
             status, err = "review", ""
         db.set(task_id, status=status, error=err, finished_at=finished,
@@ -1123,6 +1172,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         bus.publish(task_id, t="status", s=status,
                     changed=scan["all"][:200], conflicts=conflicts)
         audit.line(task_id, row["user"], "stop", status)
+        if low_risk_done and status == "done":
+            audit.line(task_id, row["user"], "auto_done_low_risk",
+                       f"{len(scan.get('created') or [])} files: "
+                       + ", ".join((scan.get("created") or [])[:5]))
         cancel_events.pop(task_id, None)
         auto_deny_counts.pop(task_id, None)   # 终态即清，防计数表随任务数无界增长
         if status in TERMINAL:
