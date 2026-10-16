@@ -147,3 +147,68 @@ def test_signal_exit_error_names_signal_not_stderr_noise(tmp_path):
     # 噪声仍保留（可能藏着真因），只是不再打头阵
     assert "unrecognized_model" in res.error
     assert res.error.index("SIGTERM") < res.error.index("unrecognized_model")
+
+
+# ── 收尾竞态兜底：启动时把"被重启误判成 failed"的行接回 ────────────
+# systemd KillMode=control-group 把 SIGTERM **同时**发给整个 cgroup，agent 子进程
+# 可能在 lifespan 置 shutting_down 之前就死了 → 上一轮进程判它 failed。#151 实测
+# 命中：status=failed 而 error 明写「SIGTERM 终止」。故不能只靠关闭时置标志。
+from app.db import DB                                    # noqa: E402
+from app.main import RESTART_RECOVER_WINDOW_SEC, _exit_code_of   # noqa: E402
+
+
+def test_exit_code_of_parses_both_conventions():
+    assert _exit_code_of(
+        "agent exited with code 143（SIGTERM 终止，非 agent 自身报错）: x") == 143
+    assert _exit_code_of(
+        "agent exited with code -15（SIGTERM 终止，非 agent 自身报错）: x") == -15
+
+
+@pytest.mark.parametrize("err", [
+    "", "timeout after 1800s", "cancelled",
+    "blocked:send: dws chat +dm --content x", "internal error: RuntimeError()",
+])
+def test_exit_code_of_zero_when_not_an_agent_exit(err):
+    """超时/取消/门禁不含退出码模式 → 0 → 不会被启动恢复捞回来重跑。
+
+    超时尤其关键：它也是 SIGTERM，但那是任务自己的预算用尽，重排只会再超时。
+    """
+    assert _exit_code_of(err) == 0
+
+
+def test_boot_recovery_only_requeues_signal_killed(tmp_path):
+    db = DB(str(tmp_path / "r.db"))
+    try:
+        now = time.time()
+        sig = "agent exited with code 143（SIGTERM 终止，非 agent 自身报错）: x"
+        t1 = db.create_task(user="u", description="d")          # 信号打死·窗口内
+        db.set(t1, status="failed", finished_at=now - 5, error=sig)
+        t2 = db.create_task(user="u", description="d")          # 超时
+        db.set(t2, status="failed", finished_at=now - 5,
+               error="timeout after 1800s")
+        t3 = db.create_task(user="u", description="d")          # agent 自己报错
+        db.set(t3, status="failed", finished_at=now - 5,
+               error="agent exited with code 1: real bug")
+        t4 = db.create_task(user="u", description="d")          # 信号打死·窗口外
+        db.set(t4, status="failed", finished_at=now - 9999, error=sig)
+        t5 = db.create_task(user="u", description="d")          # 非 failed
+        db.set(t5, status="done", finished_at=now - 5)
+
+        got = db.failed_since(now - RESTART_RECOVER_WINDOW_SEC)
+        assert [t["id"] for t in got] == [t1, t2, t3]     # t4 超窗、t5 非 failed
+        recover = [t["id"] for t in got
+                   if signal_name(_exit_code_of(t.get("error") or ""))]
+        assert recover == [t1]                            # 只有信号打死的接回
+    finally:
+        db.close()
+
+
+def test_failed_since_empty_when_no_recent_failure(tmp_path):
+    db = DB(str(tmp_path / "r.db"))
+    try:
+        t1 = db.create_task(user="u", description="d")
+        db.set(t1, status="failed", finished_at=time.time() - 9999,
+               error="agent exited with code 143: x")
+        assert db.failed_since(time.time() - RESTART_RECOVER_WINDOW_SEC) == []
+    finally:
+        db.close()

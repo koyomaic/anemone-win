@@ -471,6 +471,19 @@ class DB:
                        (*states, cutoff))
         return [_row_to_task(r) for r in rows]
 
+    def failed_since(self, cutoff: float) -> list[dict]:
+        """finished_at 晚于 cutoff 的 failed 任务（启动时甄别"重启误伤"用）。
+
+        与 stale_tasks 的分工：那个按 created_at 捞**仍未终结**的行做超时清扫；
+        这个按 finished_at 捞**刚终结**的行。计划内重启存在收尾竞态——systemd
+        KillMode=control-group 把 SIGTERM 同时发给整个 cgroup，agent 子进程可能在
+        lifespan 置 shutting_down 之前就死了，于是被上一轮进程判成 failed
+        （#151 实测：status=failed 而 error 明写 SIGTERM）。
+        """
+        rows = self._q("SELECT * FROM tasks WHERE status = 'failed'"
+                       " AND finished_at >= ? ORDER BY created_at", (cutoff,))
+        return [_row_to_task(r) for r in rows]
+
     def stale_local_tasks(self, cutoff: float) -> list[dict]:
         """engine='local' 且仍 running、created_at 早于 cutoff 的影子记录。
 

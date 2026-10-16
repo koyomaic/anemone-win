@@ -74,6 +74,24 @@ def _restart_interrupted(shutting_down: bool, timed_out: bool,
     """
     return bool(shutting_down and not timed_out and signal_name(exit_code))
 
+
+# 启动时往回看多久，甄别"上一轮进程因重启把任务误判成 failed"。窗口只需覆盖
+# 「旧进程写 failed」到「新进程 lifespan 跑恢复」这几秒，给到 120s 是留足慢盘/
+# 慢启动余量；太长会把无关的历史信号失败（如 agent 被 OOM 杀）也捞回来重跑。
+RESTART_RECOVER_WINDOW_SEC = 120.0
+_EXIT_CODE_RE = re.compile(r"agent exited with code (-?\d+)")
+
+
+def _exit_code_of(err: str) -> int:
+    """从 error 文案里抠回退出码；抠不到返回 0。
+
+    只在**启动恢复**这条冷路径上用（热路径走 AgentResult.exit_code，不解析字符串）。
+    超时错误是 "timeout after Ns"、不含本模式，故天然被排除——超时是预算用尽，
+    重新排队只会再超时一次。
+    """
+    m = _EXIT_CODE_RE.search(err or "")
+    return int(m.group(1)) if m else 0
+
 DASH_COOKIE = "relay_dash"
 DASH_TTL = 12 * 3600
 MAX_FILE_BYTES = 10 * 1024 * 1024     # 文件上传/下载通道单文件上限 10MB
@@ -1317,6 +1335,20 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         for t in db.active_tasks():
             if t["status"] == "running":
                 db.set(t["id"], status="queued", error="服务重启，任务重新排队")
+        # 收尾竞态兜底：systemd KillMode=control-group 把 SIGTERM **同时**发给整个
+        # cgroup，agent 子进程可能在 lifespan 置 shutting_down 之前就死了，于是被
+        # 上一轮进程判成 failed（#151 实测：status=failed，error 却明写 SIGTERM）。
+        # 故按 finished_at 把刚因信号终止的行接回 queued。只认信号打死：agent 自己
+        # 报错退出（code 1 等）与超时（error 不含退出码模式）都不在此列。
+        for t in db.failed_since(time.time() - RESTART_RECOVER_WINDOW_SEC):
+            code = _exit_code_of(t.get("error") or "")
+            if not signal_name(code):
+                continue
+            db.set(t["id"], status="queued", error="服务重启，任务重新排队",
+                   finished_at=None, blocked_cmd="")
+            audit.line(t["id"], t["user"], "restart_requeue_boot",
+                       f"exit={code}({signal_name(code)}) "
+                       f"prev_error={(t.get('error') or '')[:120]}")
         for t in db.active_tasks():
             if t["status"] == "queued":
                 # 续跑段带 long=True 重新入队：进程内的长任务标记随重启丢了，
