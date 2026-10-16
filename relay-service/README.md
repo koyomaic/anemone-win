@@ -47,7 +47,11 @@ systemd 按序加载，**后者覆盖前者**：
 | RELAY_MODEL | 空 | 覆盖 agent 模型（opencode -m） |
 | RELAY_XDG_CONFIG_HOME | ~/.config | 共享 agent 配置目录（provider/技能全员共用） |
 | RELAY_DASHBOARD_PASSWORD | 空 | 监控页面口令（空=禁用） |
-| RELAY_STALE_TIMEOUT_HOURS | 24 | review/待审批 停留超时 → 自动 done 并标记 |
+| RELAY_STALE_TIMEOUT_HOURS | 24 | review 停留超时 → 自动 done；待审批超时由 RELAY_APPROVAL_TIMEOUT_MINUTES 单独控制 |
+| RELAY_APPROVAL_TIMEOUT_MINUTES | 60 | pending_approval 停留超时 → 自动 failed |
+| RELAY_AUTO_DONE_MODE | on | 低风险新建产出自动 done（off 恢复“有产出即 review”） |
+| RELAY_AUTO_DONE_PREFIXES | shared/report/,shared/tmp/,shared/data/,shared/_sync/,shared/_migrate/,shared/_inventory/,shared/_upgrade-backup/ | 允许自动 done 的新建文件前缀（逗号分隔） |
+| RELAY_AUTO_DONE_MAX_FILES | 200 | 单任务新建文件数超过该值仍走 review |
 | RELAY_SWEEP_INTERVAL_SEC | 300 | 超时清扫周期（秒） |
 | RELAY_BLOCKED_PATTERNS | 核心清单(见下) | 高危命令拦截正则（逗号分隔，覆盖默认） |
 | RELAY_RM_SAFE_PREFIXES | /tmp,/var/tmp | 递归 rm 在这些前缀下放行，其余拦截 |
@@ -141,11 +145,12 @@ team_agent.py approve 42 --decision approve   # pending_approval（高危拦截�
 | GET /files?path= | 下载共享区文件（≤10MB；二进制直传） |
 | GET /health | 健康检查（免认证） |
 
-任务生命周期：`queued → running → review → done`，分支 `failed / conflict / cancelled`。
+任务生命周期：`queued → running → review/done → done`，分支 `failed / conflict / cancelled`。
 
-**两类自动 done（减少人工待办）**：
+**三类自动 done（减少人工待办）**：
 - **只读自动 done**：执行完且**无任何共享文件改动** → 直接 `done`（备注"自动done（只读，无文件改动）"），不落 review；
-- **超时自动 done**：`review`/`pending_approval` 停留超过 `RELAY_STALE_TIMEOUT_HOURS`（默认 24h）→ 后台清扫置 `done` 并备注"超时自动done"。
+- **低风险新建产出自动 done**：执行完**仅新建**文件、无修改/删除、无跨任务冲突、无越界任务号、有结果文本，且全部新建文件落在 `RELAY_AUTO_DONE_PREFIXES` 下 → 直接 `done`（备注"自动done（低风险新建产出 N 个，无需人工确认）"）；
+- **超时自动 done**：`review` 停留超过 `RELAY_STALE_TIMEOUT_HOURS`（默认 24h）→ 后台清扫置 `done` 并备注"超时自动done"。`pending_approval` 停留超过 `RELAY_APPROVAL_TIMEOUT_MINUTES`（默认 60min）→ 置 `failed`，不会误标完成。
 
 ## 并行不打架（无 git 版）
 

@@ -101,6 +101,22 @@ DEFAULT_VOLATILE_PATTERNS = [
     "*.pyc",
 ]
 
+# 低风险自动完成前缀：任务**仅新建**这些目录下的文件时，不再进入 review。
+# 为什么需要：现役 review 的主要来源不是冲突，而是“任何实质文件产出都要人确认”。
+# 2026-10-16 现役 PG 抽样显示，当前 9 个 review 任务的产出全部落在报告/临时/系统
+# 盘点目录，且 conflicts 基本为空；逐条确认没有增加安全性，只增加等待。
+# 保守边界：只放新建、不放修改/删除；只放报告、临时、数据与系统盘点目录，
+# 不放 knowledge/memory/skills/mcp/tools/secrets 等会影响后续行为或权限的目录。
+DEFAULT_AUTO_DONE_PREFIXES = [
+    "shared/report/",
+    "shared/tmp/",
+    "shared/data/",
+    "shared/_sync/",
+    "shared/_migrate/",
+    "shared/_inventory/",
+    "shared/_upgrade-backup/",
+]
+
 
 def _blocked_patterns_from_env() -> list[str]:
     raw = os.environ.get("RELAY_BLOCKED_PATTERNS", "").strip()
@@ -128,6 +144,19 @@ def _volatile_patterns_from_env() -> list[str]:
     if not raw:
         return list(DEFAULT_VOLATILE_PATTERNS)
     return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _auto_done_prefixes_from_env() -> list[str]:
+    raw = os.environ.get("RELAY_AUTO_DONE_PREFIXES", "").strip()
+    if not raw:
+        return list(DEFAULT_AUTO_DONE_PREFIXES)
+    out = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        out.append(p if p.endswith("/") else p + "/")
+    return out
 
 
 @dataclass
@@ -228,6 +257,11 @@ class Settings:
     rm_safe_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_RM_SAFE_PREFIXES))
     confirm_recipients: list[str] = field(default_factory=lambda: list(DEFAULT_CONFIRM_RECIPIENTS))
     volatile_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_VOLATILE_PATTERNS))
+    # 低风险产出自动 done：on/off。off 时恢复旧行为——任何实质文件产出都进 review。
+    auto_done_mode: str = "on"
+    auto_done_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_AUTO_DONE_PREFIXES))
+    # 单任务新建文件数上限。超过即认为批量写入风险上升，仍走人工 review。
+    auto_done_max_files: int = 200
     conflict_window_hours: float = 24.0  # 同文件冲突判定的时间窗；窗外的先后写入属正常演进，不算冲突
     relay_exclude_providers: list[str] = field(default_factory=list)  # 任务配置中剔除的 provider（本地专用模型不进任务环境）
     boot_cmd: str = "/opt/team/relay-boot/boot.sh"  # bootloader 入口（POST /admin/update 触发）
@@ -294,6 +328,9 @@ class Settings:
             rm_safe_prefixes=_rm_safe_prefixes_from_env(),
             confirm_recipients=_confirm_recipients_from_env(),
             volatile_patterns=_volatile_patterns_from_env(),
+            auto_done_mode=os.environ.get("RELAY_AUTO_DONE_MODE", "on").strip().lower(),
+            auto_done_prefixes=_auto_done_prefixes_from_env(),
+            auto_done_max_files=int(os.environ.get("RELAY_AUTO_DONE_MAX_FILES", "200")),
             conflict_window_hours=float(os.environ.get("RELAY_CONFLICT_WINDOW_HOURS", "24")),
             relay_exclude_providers=[p.strip() for p in os.environ.get("RELAY_EXCLUDE_PROVIDERS", "").split(",") if p.strip()],
             boot_cmd=os.environ.get("RELAY_BOOT_CMD", "/opt/team/relay-boot/boot.sh"),
