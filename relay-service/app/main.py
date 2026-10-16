@@ -1061,16 +1061,21 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         # #111，同样工作 24.3m 就完成——差的是时间预算不是能力。复用已在生产验证的
         # self_resume 机制（Tier 2 侦察类自动拒绝续跑走的就是这条路），零 DB 迁移。
         sig = (tuple(sorted(scan["all"])), tuple(sorted(scan["modified"])),
-               tuple(sorted(scan["deleted"])), len(res.text or ""))
+               tuple(sorted(scan["deleted"])), len(res.text or ""),
+               res.tool_calls)
         if (res.timed_out and res.long_flagged and sched is not None
                 and cfg.long_task_mode == "on"
                 and seg + 1 < cfg.long_task_max_segments):
             prev_sig = seg_progress.get(task_id)
-            # 进展门：本段相对上一段有新产出才续。签名未知（首段／进程重启后丢失）→
-            # fail-open 放行一段，硬上界仍由 resume_hint 里的段号兜住（重启不丢）。
-            # 专治 #112 那类丢上下文的糊涂指令白烧满 90 分钟。
+            # 进展门：本段相对上一段有新产出、或本段确实在干活（工具调用达阈值）才续。
+            # 为什么必须有工具调用这一路：被砍的段拿不到 result 事件，tokens=0、最终
+            # 文本也常是空的——#146 第 1 段实测 files=0 text=0，其实一直在跑工具查数据。
+            # 只看文件与文本会把"正在采集数据"误判成"毫无进展"而停掉续跑。
+            # 签名未知（首段／进程重启后丢失）→ fail-open 放行一段，硬上界仍由
+            # resume_hint 里的段号兜住（重启不丢）。专治 #112 那类丢上下文的糊涂指令。
             progressed = (prev_sig is None or sig[:3] != prev_sig[:3]
-                          or sig[3] - prev_sig[3] >= 200)
+                          or sig[3] - prev_sig[3] >= 200
+                          or sig[4] >= cfg.long_task_min_tool_calls)
             seg_progress[task_id] = sig
             if progressed:
                 nxt = seg + 1
@@ -1089,13 +1094,15 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 audit.line(task_id, row["user"], "segment_continue",
                            f"{nxt}/{cfg.long_task_max_segments} "
                            f"elapsed={res.elapsed:.0f}s files={len(scan['all'])} "
-                           f"text={len(res.text or '')}")
+                           f"text={len(res.text or '')} tools={res.tool_calls}")
                 # 续跑段降级排队（prio=2）并归入 long lane：它已产出过一部分，边际
                 # 紧迫度低于用户刚发来的新活；降级同时把「续跑放大 3 倍耗时」摊开。
                 await sched.submit(task_id, "continuation", long=True)
                 return
             audit.line(task_id, row["user"], "segment_stop",
-                       f"本段无进展，不续跑（seg={seg} elapsed={res.elapsed:.0f}s）")
+                       f"本段无进展，不续跑（seg={seg} elapsed={res.elapsed:.0f}s "
+                       f"files={len(scan['all'])} text={len(res.text or '')} "
+                       f"tools={res.tool_calls}）")
         seg_progress.pop(task_id, None)
         if res.error == "cancelled":
             status, err = "cancelled", "cancelled by user"

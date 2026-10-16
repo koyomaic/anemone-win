@@ -205,6 +205,11 @@ class Settings:
     long_task_mode: str = "on"              # off | shadow | notify | on
     long_task_threshold_sec: float = 600.0  # T：单段跑到此时长即判为长任务
     long_task_max_segments: int = 3         # 单任务最多跑几段（含首段）；3 段＝上限 90m
+    # 进展门的"活动量"阈值：本段工具调用数达到即视为有进展。为什么需要这一路——
+    # 被砍的段拿不到 result 事件，tokens=0、最终文本也常是空的（#146 第 1 段实测
+    # files=0 text=0，其实一直在跑工具查数据）。只看文件与文本会把"正在采集数据"
+    # 误判成"毫无进展"而停掉续跑。设 5 而非 1：单次工具调用可能只是探路/重试。
+    long_task_min_tool_calls: int = 5
     # long lane：为短任务保留槽位，防长任务吃光并发（移除 30m 上限的必要配套——
     # 分段续跑让单个长任务最坏占槽 90m，是原来的 3 倍）。
     # **比例式而非固定值**：固定 reserve=1 只在 max_concurrent=3 时合适；扩到 8 后
@@ -277,6 +282,8 @@ class Settings:
                 os.environ.get("RELAY_LONG_TASK_THRESHOLD_SEC", "600")),
             long_task_max_segments=int(
                 os.environ.get("RELAY_LONG_TASK_MAX_SEGMENTS", "3")),
+            long_task_min_tool_calls=int(
+                os.environ.get("RELAY_LONG_TASK_MIN_TOOL_CALLS", "5")),
             long_lane_reserve_ratio=float(
                 os.environ.get("RELAY_LONG_LANE_RESERVE_RATIO", str(1.0 / 3.0))),
             long_wait_promote_sec=float(

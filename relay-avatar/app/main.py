@@ -1270,10 +1270,19 @@ class Avatar:
             return
         s["card_upd"] = now
         used = int(now - s.get("card_start", now))
-        word = "已排队，马上开始" if status == "queued" else "正在为你办"
+        if s.get("long_notified"):
+            # 长任务态必须**持续**写在心跳帧里。一次性提示帧撑不过 30s——下一次心跳
+            # 就把整张卡片覆盖成"正在为你办"，用户回头看等于没提示（#146 实测踩到：
+            # 14:03:44 提示已发、long_notified=True，但 14:04 起卡片全是心跳文案）。
+            seg = int(s.get("seg_seen") or 0)
+            word = f"长任务后台执行中（第 {seg} 段）" if seg > 1 else "长任务后台执行中"
+            note = (f"{word}…（已用 {used}s）会自动分段接续、跑完主动通知你；"
+                    "发「进度」看状态、「取消」随时中止")
+        else:
+            word = "已排队，马上开始" if status == "queued" else "正在为你办"
+            note = f"{word}…（已用 {used}s）"
         try:
-            self.dws.card_update(
-                biz, self._card_frame(s, f"{word}…（已用 {used}s）"), 1)
+            self.dws.card_update(biz, self._card_frame(s, note), 1)
         except Exception:
             pass
 

@@ -265,3 +265,40 @@ def test_health_defaults_to_on(relay_factory):
 
     h = httpx.get(relay_factory()["base"] + "/health", timeout=5).json()
     assert h["long_task_mode"] == "on"
+
+
+# ── 进展门的活动量信号（回归 #146 第 1 段 files=0 text=0）──────────────
+
+def test_min_tool_calls_default():
+    """被砍的段拿不到 result 事件 → tokens=0、文本常为空；只看文件与文本会把
+    "正在采集数据"误判成"毫无进展"而停掉续跑，故必须有工具调用这一路信号。"""
+    s = _cfg()
+    assert s.long_task_min_tool_calls == 5
+
+
+def test_min_tool_calls_env(monkeypatch):
+    monkeypatch.setenv("RELAY_LONG_TASK_MIN_TOOL_CALLS", "12")
+    assert Settings.from_env().long_task_min_tool_calls == 12
+
+
+def test_agent_result_carries_progress_signals():
+    from app.executor import AgentResult
+
+    r = AgentResult()
+    assert r.tool_calls == 0 and r.elapsed == 0.0
+    assert r.long_flagged is False and r.timed_out is False
+
+
+def test_parse_claude_tool_event_counted():
+    """工具事件必须能被识别出来，否则 tool_calls 恒为 0、进展门形同虚设。"""
+    import json
+
+    from app.executor import _parse_claude
+
+    line = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}})
+    ev = _parse_claude(line)
+    assert ev and ev["agent_event"]["kind"] == "tool"
+    text_line = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "思考中"}]}})
+    assert _parse_claude(text_line)["agent_event"]["kind"] == "text"

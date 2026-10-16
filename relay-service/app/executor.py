@@ -51,6 +51,10 @@ class AgentResult:
     elapsed: float = 0.0
     long_flagged: bool = False
     timed_out: bool = False
+    # 本段工具调用次数。**分段续跑的进展门需要它**：被砍的段拿不到 result 事件，
+    # 故 tokens=0、最终文本也常常是空的（#146 第 1 段实测 files=0 text=0，其实一直在
+    # 跑工具查数据）。只看文件与文本会把"正在采集数据"误判成"毫无进展"而停掉续跑。
+    tool_calls: int = 0
 
 
 def _parse_opencode(line: str) -> dict | None:
@@ -343,8 +347,11 @@ class Executor:
                     res.text += parsed.get("text", "")
                 res.tokens += parsed.get("tokens", 0)
                 res.cost += parsed.get("cost", 0.0)
-                if parsed.get("agent_event"):
-                    publish(task_id, t="agent", **parsed["agent_event"])
+                aev = parsed.get("agent_event")
+                if aev:
+                    if aev.get("kind") == "tool":
+                        res.tool_calls += 1   # 进展门的活动量信号（见 AgentResult 注释）
+                    publish(task_id, t="agent", **aev)
                 cmd = parsed.get("tool_cmd")
                 if cmd:
                     # 单次调用，原因与判定同源（此前原因被丢弃，见 AgentResult.block_reason）

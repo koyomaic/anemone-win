@@ -190,3 +190,61 @@ def test_notice_refreshes_throttle_stamp(av, cfg):
     s = sess(card_upd=0.0)
     av._long_task_notice(s, 7, row(elapsed=900), "running")
     assert time.time() - s["card_upd"] < 5
+
+
+# ── 回归 #146：长任务态必须**持续**写在心跳帧里 ──────────────────────
+# 实测事故：2026-10-16 #146 于 14:03:44 触发升级、long_notified=True、提示帧确实发出，
+# 但 _card_beat 每 30s 用「正在为你办…（已用 Xs）」把整张卡片覆盖掉——提示只活了 30 秒，
+# 用户 20 分钟后看卡片只见心跳文案，等于没提示。一次性帧对抗不了持续心跳。
+
+def test_heartbeat_keeps_long_task_state(av, cfg):
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600,
+           card_progress_sec=0)
+    s = sess(card_upd=0.0, long_notified=True)
+    av._card_beat(s, 7, "running")
+    body = av.dws.sent[-1][1]
+    assert "长任务后台执行中" in body
+    assert "正在为你办" not in body          # 不能再被通用心跳文案覆盖
+    assert "分段接续" in body and "取消" in body
+
+
+def test_heartbeat_shows_segment_number(av, cfg):
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600,
+           card_progress_sec=0)
+    s = sess(card_upd=0.0, long_notified=True, seg_seen=2)
+    av._card_beat(s, 7, "running")
+    assert "第 2 段" in av.dws.sent[-1][1]
+
+
+def test_heartbeat_first_segment_no_number(av, cfg):
+    """首段（seg_seen=0/1）不显示段号，避免用户以为任务被拆过。"""
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600,
+           card_progress_sec=0)
+    for seg in (0, 1):
+        av.dws.sent.clear()
+        av._card_beat(sess(card_upd=0.0, long_notified=True, seg_seen=seg), 7, "running")
+        assert "段）" not in av.dws.sent[-1][1]
+
+
+def test_heartbeat_normal_task_unchanged(av, cfg):
+    """未升级任务的心跳文案一字不变（既有测试依赖「正在为你办…（已用 31s）」）。"""
+    setcfg(cfg, "ingress", card_progress_sec=0)
+    s = sess(card_upd=0.0, card_start=time.time() - 31)
+    av._card_beat(s, 7, "running")
+    assert "正在为你办…（已用 31s）" in av.dws.sent[-1][1]
+    assert "长任务" not in av.dws.sent[-1][1]
+
+
+def test_notice_then_heartbeat_both_carry_state(av, cfg):
+    """端到端：升级帧发出后，后续每一帧心跳都仍带长任务态。"""
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600,
+           card_progress_sec=0)
+    s = sess(card_upd=0.0)
+    assert av._long_task_notice(s, 7, row(elapsed=700), "running") is True
+    for _ in range(3):
+        s["card_upd"] = 0.0
+        av._card_beat(s, 7, "running")
+    assert all("长任务" in c for _, c in av.dws.sent), av.dws.sent
+    # 首帧是升级告知，其后每帧心跳都持续带长任务态
+    assert "比一般任务大" in av.dws.sent[0][1]
+    assert all("长任务后台执行中" in c for _, c in av.dws.sent[1:]), av.dws.sent[1:]
