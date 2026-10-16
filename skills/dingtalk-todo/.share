@@ -1,0 +1,1 @@
+# .share 标记：provision 21b2 把本技能安装位软链进 shared/skills，供 relay 任务沙箱发现（内容不读，存在即生效）

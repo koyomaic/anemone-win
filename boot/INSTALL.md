@@ -66,6 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 22 | opencode.jsonc | 落模板 → 提示填 apiKey | 软 |
 | 23-24 | workspace AGENTS.md / opencode.json | 仓库模板安装 / 提示拷贝 | 软 |
 | 24b | 基础技能：仅仓库 `skills/` 内人为标记入库的（机队共享，git 为真源），逐文件比对安装位同名技能（安装位由技能内 `.dest` 指定：钉钉套件→`/root/.agents/skills`、dws→`/opt/team/skills`，缺省 `shared/skills/`） | 缺失/漂移 → 本地旧版备份 `*.bak-provision-*` 后同步仓库版；未入库的本地/实验技能不碰 | 软 |
+| 24b2 | 技能共享链接：仓库技能目录内带 `.share` 标记的（存在即生效、内容不读），把其安装位目录软链进 `shared/skills/`，供 relay 任务沙箱（只挂载 shared/skills）发现系统级技能；链接恒指安装位现役版，24b 刷新后自动跟新 | 缺失/错链 → 自动建链；shared/skills 已有同名**实目录** → 不覆盖，WARN 留人工裁决 | 软 |
 | 24c | opencode 全局语境 `/root/.config/opencode/AGENTS.md`（模板 `boot/opencode-global-AGENTS.md`，git 为真源；所有会话默认加载 GitHub 项目指向等语境） | 缺失/漂移 → 备份后同步模板 | 软 |
 | 24d | team-agent-relay 安装位 `ca.pem`（公开 CA 证书，不入 git；统一从 `RELAY_CA_SRC`（缺省 `127.0.0.1:8788`，即所在服务器本机 TLS 链）TLS 链提取，自签校验后写入） | 缺失/漂移 → 备份后提取写入；源不可达且已有现存 → 沿用 | 软 |
 | 24e | store 台账 CLI（`boot/store/store`，业务存储统一索引）：装 `/opt/team/store/store` + 软链 `/usr/local/bin/store`；建目录骨架与 `index/` 配置（纯文件系统、幂等）；`store ping` 探活 DB 与 5 张 `store_*` 表。**建表（`store init`）属有副作用操作，install 不自动执行**，首次需人工跑 | CLI 同步 / 骨架自建 / 探活：缺表 WARN、**DB 不可达 FAIL（触发钉钉预警）** | 软（DB 不可达时硬） |
@@ -165,8 +166,13 @@ store sync tags|scan|push|verify|backfill    # jingboWiki 同步
 - `dws` → `/opt/team/skills`
 - `jingbowiki-api`、`dingtalk-chat-digest`、`dingtalk-group-remark`、`dingtalk-send`、`dingtalk-toolbar` → 默认 shared/skills
 
+**共享链接（.share）**：relay 的 claude 任务沙箱只挂载 `shared/skills/*`（项目级技能位），系统级安装位的技能对任务不可见。
+仓库技能目录内放 `.share` 标记文件（存在即生效、内容不读、不下发、不参与比对），provision 清单 24b2 会把其安装位目录软链进
+`shared/skills/`：链接恒指安装位现役版，24b 夜间刷新后自动跟新，无拷贝无漂移；断链时任务挂载逻辑静默跳过，不影响起任务。
+shared/skills 已有同名**实目录**（本地内容）不覆盖，WARN 留人工裁决。当前已标记：`dingtalk-calendar/chat/contact/todo`、`dws`。
+
 标记新基础技能（管理员操作）：把技能目录拷入仓库 `skills/`（剔除 `*.bak*`、zip、`__pycache__`、运行时状态文件；
-**严禁入库任何密钥**，凭据一律放 `shared/secrets/`）→ 非默认安装位则加 `.dest` 文件 → commit + push；各机夜间轮次自动同步。
+**严禁入库任何密钥**，凭据一律放 `shared/secrets/`）→ 非默认安装位则加 `.dest` 文件；需对 relay 任务沙箱可见再加 `.share` 标记 → commit + push；各机夜间轮次自动同步。
 修改基础技能：改仓库（或改本机后提交回仓库）；只改本机不提交，夜间自愈会以仓库版覆盖（有备份）。
 
 ## opencode 全局语境（~/.config/opencode/AGENTS.md）

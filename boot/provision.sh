@@ -436,7 +436,7 @@ else warn "缺失且无模板（claude 引擎将不注入系统提示词）"; fi
 # 只有仓库 skills/ 里存在的技能才检查/同步（入库即标记）；各安装位下其余本地/实验技能不碰。
 # 安装位：技能目录内 .dest 文件（单行绝对路径）指定目标父目录；无 .dest → 默认 $WORKSPACE/shared/skills。
 #   例：钉钉套件 .dest=/root/.agents/skills，dws .dest=/opt/team/skills。
-# 逐文件比对（.dest 为元数据，不参与比对/下发），漂移/缺失 → 本地旧版备份 *.bak-provision-* 后同步仓库版。
+# 逐文件比对（.dest/.share 为元数据，不参与比对/下发），漂移/缺失 → 本地旧版备份 *.bak-provision-* 后同步仓库版。
 step "基础技能(git)"
 SK_DST_DEFAULT="$WORKSPACE/shared/skills"
 if ! ls -d "$RES_ROOT"/skills/*/ >/dev/null 2>&1; then
@@ -450,11 +450,11 @@ else
     fi
     printf '%s\n' "$SK_DST_DEFAULT"
   }
-  sk_drift_files() { # $1=repo技能目录 $2=目标技能目录；输出缺失/漂移的相对文件列表（排除 .dest）
+  sk_drift_files() { # $1=repo技能目录 $2=目标技能目录；输出缺失/漂移的相对文件列表（排除 .dest/.share 元数据）
     local f rel
     while IFS= read -r f; do
       rel="${f#"$1"}"
-      [ "$rel" = ".dest" ] && continue
+      case "$rel" in .dest|.share) continue ;; esac
       cmp -s "$f" "$2/$rel" || printf '%s\n' "$rel"
     done < <(find "$1" -type f)
   }
@@ -480,6 +480,40 @@ else
       done < <(sk_drift_files "$src" "$dst/$name")
     done
     ok "$SK_N 个技能，同步 $n_sync 文件（本地旧版备份 *.bak-provision-$stamp）"
+  fi
+fi
+
+# ---------- 21b2 技能共享链接（仓库带 .share 标记的技能 → 软链进 shared/skills） ----------
+# relay 的 claude 任务沙箱只把 shared/skills/* 挂进项目级技能位（.claude/skills），系统级安装位
+# （/root/.agents/skills、/opt/team/skills）对任务不可见。仓库技能目录内放 .share 标记文件（内容不读、
+# 存在即生效），本步把其安装位目录软链进 shared/skills：链接恒指安装位现役版，夜间 21b 刷新后自动
+# 跟新，无拷贝无漂移；断链时任务挂载逻辑静默跳过，不影响起任务。
+# shared/skills 已有同名**实目录**（本地内容）→ 不覆盖，报 WARN 留人工裁决。
+step "技能共享链接"
+if ! ls -d "$RES_ROOT"/skills/*/ >/dev/null 2>&1; then warn "仓库无基础技能，跳过"
+else
+  SHL_MISS=""; SHL_N=0
+  for src in "$RES_ROOT"/skills/*/; do
+    name="$(basename "$src")"
+    [ -f "$src/.share" ] || continue
+    SHL_N=$((SHL_N+1))
+    tgt="$(sk_dest "$src")/$name"; lnk="$SK_DST_DEFAULT/$name"
+    if [ -L "$lnk" ] && [ "$(readlink -f "$lnk" 2>/dev/null)" = "$(readlink -f "$tgt" 2>/dev/null)" ]; then continue; fi
+    SHL_MISS="$SHL_MISS $name"
+  done
+  if [ "$SHL_N" = 0 ]; then ok "无 .share 标记技能"
+  elif [ -z "$SHL_MISS" ]; then ok "$SHL_N 个 .share 技能链接在位"
+  elif ! heal; then warn "缺失/错链:${SHL_MISS}（install 模式自动建链）"
+  else
+    miss "建链${SHL_MISS}"
+    mkdir -p "$SK_DST_DEFAULT"; n_link=0
+    for name in $SHL_MISS; do
+      tgt="$(sk_dest "$RES_ROOT/skills/$name")/$name"; lnk="$SK_DST_DEFAULT/$name"
+      if [ ! -d "$tgt" ]; then warn "安装位 $tgt 不存在（基础技能未同步？），跳过 $name"; continue; fi
+      if [ -d "$lnk" ] && [ ! -L "$lnk" ]; then warn "$lnk 为本地实目录，不覆盖，跳过 $name"; continue; fi
+      ln -sfn "$tgt" "$lnk" && n_link=$((n_link+1))
+    done
+    ok "$SHL_N 个 .share 技能，本次建链 $n_link"
   fi
 fi
 
