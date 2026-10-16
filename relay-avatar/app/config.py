@@ -97,6 +97,8 @@ DEFAULTS: dict[str, Any] = {
                  "plan_protected": [],
                  "profile_enforce": "strict", "sanitize": "on",
                  "rate_limit_daily_tasks": 100, "reprompt_cooldown_sec": 60,
+                 "review_reprompt_cooldown_sec": 1800,
+                 "review_reprompt_max": 2,
                  "bot_blocklist": [], "media_max_size_mb": 20,
                  "media_allowed_ext": []},
     "store": {"root": f"{DEFAULT_WORKSPACE}/shared",
