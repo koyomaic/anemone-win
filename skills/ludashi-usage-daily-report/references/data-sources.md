@@ -215,8 +215,12 @@ D-17 成品油价格预测自 2026-09-23 断供，是**上游数据源问题**�
 ## 8. 输出与台账
 
 ```
-shared/report/自检报告/<YYYY-MM>/<YYYYMMDD>_T<任务号>_鲁大师用户日度使用分析_<报告日>_v1.md
+shared/report/自检报告/<YYYY-MM>/<YYYYMMDD>_T<任务号>_<分身名>用户日度使用分析_<报告日>_v1.md
 ```
+
+`<分身名>` **必须**取 `render_report.py --facts <facts> --print-name`（即 `facts.display_name`，
+宿主机按机解析），与报告抬头同源一致；**严禁写死任何分身名（含「鲁大师」）**——本技能机队共享，
+写死会让非鲁大师机产出错名文件。
 
 落盘后必须 `store add <path> --kind report --task <任务号> --topic 用户日度使用分析`。
 

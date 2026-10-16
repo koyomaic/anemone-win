@@ -66,10 +66,21 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 所以沙箱内的计划任务读不到 `RELAY_DB` → 采集器必然降级 `logs_only` → 日报只剩入站消息数，
 任务级/用户级全空。**直接在计划里跑采集会每天静默产出废报告。**
 
+**参考编排（新能源机实例，2026-10-16 起生效）**——三段各自按机开关，其他机未启用即无此链路，
+技能本体（采集器/渲染器）仍可手工单跑：
+
 | 段 | 触发 | 跑什么 | 凭据 | 产物 |
 |---|---|---|---|---|
-| ① 采集 | 宿主机 systemd `ludashi-usage-collect.timer`，每日 **08:30** | `boot/usage-collect.sh` → `usage_collect.py` | 需要 `RELAY_DB`（宿主机可读） | `shared/tmp/usage/facts-<日>.json` |
-| ② 渲染投递 | relay 计划 **#12「每日鲁大师用户日度使用分析报告」**，每日 **08:45** | `render_report.py` ＋ 补叙述 ＋ 落盘 ＋ 台账 ＋ DM | 不需要（纯标准库，系统 python3 即可） | `shared/report/自检报告/<YYYY-MM>/…md` |
+| ① 采集 | 宿主机 systemd `ludashi-usage-collect.timer`，每日 **07:45**（drop-in 覆盖，含 60s 抖动）；**机队默认停用**，仅 `boot.env` 设 `USAGE_REPORT_TIMER=1` 的机器启用 | `boot/usage-collect.sh` → `usage_collect.py` | 需要 `RELAY_DB`（宿主机可读） | `shared/tmp/usage/facts-<日>.json`（含 `display_name`） |
+| ② 渲染落盘 | 本机 relay 计划（新能源机为 **#6「ludashi-usage-daily-report-group」**，每日 **08:00**；计划号/时刻按机自定） | `render_report.py` ＋ 补叙述 ＋ 落盘 ＋ 台账（**不做任何 dws 发送**） | 不需要（纯标准库，系统 python3 即可） | `shared/report/自检报告/<YYYY-MM>/…md` |
+| ③ 群推送 | 宿主机 systemd `usage-report-send.timer`，每日 **08:30:00** 准点（**本机私有单元，不在仓库 `boot/`**，其他机无） | `usage-report-send.sh`：轮询落盘报告 → 生成摘要 → 发钉钉群 | 宿主机 dws 凭据（不经沙箱门禁） | 群消息（摘要＋报告文件） |
+
+> ②③ 拆分原因：沙箱内**所有** dws 发送命令被门禁拦成 `pending_approval`（群发必拦），
+> 故渲染留在沙箱、发送移到宿主机。计划 action 必须明令禁止 agent 自行发送。
+>
+> 报告抬头与文件名的 `<分身名>` 一律取 `facts.display_name`（`--print-name`）；无 facts 时回落
+> `self_name.py` 按机解析（bot 自称鲁大师的机器→鲁大师，其余→各自 `policy.toml` 的 `avatar_name`）。
+> **严禁在抬头或文件名写死任何分身名。**
 
 衔接点 `shared/tmp/usage/` 的可达性已实测：
 
