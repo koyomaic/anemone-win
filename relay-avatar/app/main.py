@@ -1275,7 +1275,9 @@ class Avatar:
             # 就把整张卡片覆盖成"正在为你办"，用户回头看等于没提示（#146 实测踩到：
             # 14:03:44 提示已发、long_notified=True，但 14:04 起卡片全是心跳文案）。
             seg = int(s.get("seg_seen") or 0)
-            word = f"长任务后台执行中（第 {seg} 段）" if seg > 1 else "长任务后台执行中"
+            # seg_seen 是"已完成段数"：≥1 才说明任务被拆过，显示正在跑的第 seg+1 段
+            word = (f"长任务后台执行中（第 {seg + 1} 段）" if seg >= 1
+                    else "长任务后台执行中")
             note = (f"{word}…（已用 {used}s）会自动分段接续、跑完主动通知你；"
                     "发「进度」看状态、「取消」随时中止")
         else:
@@ -1308,8 +1310,9 @@ class Avatar:
         if seg > 0 and seg != s.get("seg_seen"):
             s["seg_seen"] = seg
             s["long_notified"] = True
+            # seg 是 relay 写的"已完成段数"，正在跑的是第 seg+1 段（人读序号）
             return self._card_note(s, (
-                f"这个活儿比较大，正在跑第 {seg} 段，已产出的部分不会重做。"
+                f"这个活儿比较大，正在跑第 {seg + 1} 段，已产出的部分不会重做。"
                 "跑完我主动通知你；发「进度」看状态，发「取消」随时中止"))
         if float(time.time()) - float(started) < thr or s.get("long_notified"):
             return False

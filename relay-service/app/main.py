@@ -1079,9 +1079,12 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             seg_progress[task_id] = sig
             if progressed:
                 nxt = seg + 1
+                # 段号按**人读的序号**写：nxt 是"已完成段数"，正在跑的是第 nxt+1 段。
+                # 直接写 nxt 会让第一次续跑显示"第 1/3 段"（实际是第 2 段），用户以为
+                # 任务没被拆过。续跑总次数仍由 nxt 控制（nxt+1 < max ⇒ 最多 3 段）。
                 hint = _with_segment(
                     f"上一段跑满 {cfg.task_timeout / 60:.0f} 分钟被系统中断（**不是失败**，"
-                    f"这是第 {nxt}/{cfg.long_task_max_segments} 段）。请**从中断处继续**："
+                    f"这是第 {nxt + 1}/{cfg.long_task_max_segments} 段）。请**从中断处继续**："
                     "先快速确认已产出的文件与已有结论，再补齐剩余工作，"
                     "**不要重做已完成的部分**。\n"
                     "若其实已接近完成，直接产出最终交付件并收尾，不要为填满时间而扩大范围。\n"

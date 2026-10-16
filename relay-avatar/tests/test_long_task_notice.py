@@ -138,7 +138,8 @@ def test_segment_boundary_notice(av, cfg):
     r = row(elapsed=5, hint="[seg:2]\n上一段跑满 30 分钟被系统中断")
     assert av._long_task_notice(s, 7, r, "queued") is True
     body = av.dws.sent[0][1]
-    assert "第 2 段" in body and "不会重做" in body
+    # [seg:2] 意为"已完成 2 段"，正在跑的是第 3 段（人读序号，不是标记值）
+    assert "第 3 段" in body and "不会重做" in body
     assert s["seg_seen"] == 2
 
 
@@ -151,7 +152,7 @@ def test_segment_notice_once_per_segment(av, cfg):
     r3 = row(elapsed=5, hint="[seg:3] y")
     assert av._long_task_notice(s, 7, r3, "queued") is True     # 新段再报一次
     assert len(av.dws.sent) == 2
-    assert "第 3 段" in av.dws.sent[1][1]
+    assert "第 4 段" in av.dws.sent[1][1]   # [seg:3] → 正在跑第 4 段
 
 
 def test_segment_notice_precedes_threshold(av, cfg):
@@ -159,7 +160,7 @@ def test_segment_notice_precedes_threshold(av, cfg):
     setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600)
     s = sess()
     assert av._long_task_notice(s, 7, row(elapsed=3, hint="[seg:2] x"), "running") is True
-    assert "第 2 段" in av.dws.sent[0][1]
+    assert "第 3 段" in av.dws.sent[0][1]
 
 
 # ── 无卡片时退回会话消息 ──────────────────────────────────────────────
@@ -213,17 +214,19 @@ def test_heartbeat_shows_segment_number(av, cfg):
            card_progress_sec=0)
     s = sess(card_upd=0.0, long_notified=True, seg_seen=2)
     av._card_beat(s, 7, "running")
-    assert "第 2 段" in av.dws.sent[-1][1]
+    assert "第 3 段" in av.dws.sent[-1][1]   # seg_seen=2 → 正在跑第 3 段
 
 
 def test_heartbeat_first_segment_no_number(av, cfg):
-    """首段（seg_seen=0/1）不显示段号，避免用户以为任务被拆过。"""
+    """seg_seen=0（还没被拆过）不显示段号，避免用户以为任务被拆过；
+    seg_seen=1 起显示"第 2 段"。"""
     setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600,
            card_progress_sec=0)
-    for seg in (0, 1):
-        av.dws.sent.clear()
-        av._card_beat(sess(card_upd=0.0, long_notified=True, seg_seen=seg), 7, "running")
-        assert "段）" not in av.dws.sent[-1][1]
+    av._card_beat(sess(card_upd=0.0, long_notified=True, seg_seen=0), 7, "running")
+    assert "段）" not in av.dws.sent[-1][1]
+    av.dws.sent.clear()
+    av._card_beat(sess(card_upd=0.0, long_notified=True, seg_seen=1), 7, "running")
+    assert "第 2 段" in av.dws.sent[-1][1]
 
 
 def test_heartbeat_normal_task_unchanged(av, cfg):
