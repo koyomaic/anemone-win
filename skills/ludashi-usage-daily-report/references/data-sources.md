@@ -96,7 +96,7 @@ audit 里能归属的 action：`local_shadow`(325) + `task_submit`(113) + 零星
 
 `actor` 形态：userId（数字，如 `18377`）或 openId（`D…` 开头，如赵兴峰
 `DJTDWXe5Omkca6fEkz0vxWVZZG4c4SxTc`，跨组织无本 corp userId）。
-统一用 `key_users.toml` 的 `name_by_id` 反查姓名。
+统一用运行时名单缓存（`shared/tmp/usage/key-users.toml`，旧 `config/key_users.toml` 兜底）的 `name_by_id` 反查姓名。
 
 audit actor 分布（442 个 task_id）：18377 毕倩 183、18434 王洪彬 55、赵兴峰(openId) 49、
 20102 崔成东 45、40125 孙瑞昱 36、12139 孔德光 27、23518 王思义 20、34718 闫路英 15、
@@ -136,8 +136,9 @@ plan_create 11、gate_confirm 11、plan_op 7。
 
 ## 6. 姓名/公司/部门反查
 
-`employee.db` **全盘不存在**（`/` 与 `/mnt/vol-eltaah12` 全量 find 无果）。
+`employee.db` 是原模板假设的本地人员映射库，从未部署（`/` 与 `/mnt/vol-eltaah12` 全量 find 无果）。
 relay 的 `users` 表只有 `token/name/created_at/consumed_at`，无公司部门。
+2026-10-16 用户确认：日报不再输出 `employee.db` 缺档提示，姓名/公司/部门统一由运行时名单缓存提供。
 
 ### 名单必须运行时派生，不能入库固定
 
@@ -150,7 +151,7 @@ relay 的 `users` 表只有 `token/name/created_at/consumed_at`，无公司部�
 | `whitelist` | 5 人 | `[]` |
 
 固定名单进 git → 夜间 provision 把它同步给其他 7 台 → 活跃率/静默追踪全错。
-故 `build_roster.py` 每次从**本机**真源派生，`key_users.toml` 只是缓存。
+故 `build_roster.py` 每次从**本机**真源派生，运行时缓存写 `shared/tmp/usage/key-users.toml`；每日预采集前会 best-effort 重派生。
 
 派生输入：
 
@@ -183,18 +184,18 @@ relay 的 `users` 表只有 `token/name/created_at/consumed_at`，无公司部�
 
 | 人 | 通讯录 | 姓名来源 |
 |---|---|---|
-| 靳光传(12223) | 返回全 None（离职/无权限/id 变更） | **只有 whitelist_dynamic.json 有** |
+| 靳光传(12223) | 返回全 None（离职/无权限/id 变更） | **历史案例：曾只有 whitelist_dynamic.json 有；2026-10-16 已撤销动态授权并从名单移除** |
 | 赵兴峰 | 跨组织无本 corp userId，不可反查 | events 的 sender ＋ policy.toml 注释 |
 
 回退链：`通讯录 → whitelist_dynamic → events(openId) → 旧缓存 → id 占位`。
-漏掉 whitelist_dynamic 这一环，靳光传就会退化成用「12223」当姓名。
+漏掉 whitelist_dynamic 这一环，类似靳光传这种通讯录无返回的人就会退化成用「12223」当姓名。
 查不到的 org/dept 标 `[缺档] 通讯录无返回`，**不要猜**。
 
-企业邮箱（`orgAuthEmail`）对报告无用且属 PII，**不写入 key_users.toml**。
+企业邮箱（`orgAuthEmail`）对报告无用且属 PII，**不写入运行时名单缓存**。
 
 ### 服务账号
 
-`key_users.toml` 的 `[[service_account]]` 段人工维护（中鲁运营/__admin__/canary 等），
+运行时名单缓存的 `[[service_account]]` 段人工维护（中鲁运营/__admin__/canary 等），
 但**分身本体名各机不同**（provision 29b 让 `avatar_name` 跟随本机 dws 认证名），
 故 `usage_collect.py` 还会自动把 PG `plans.owner_name` 并入服务账号判别，不依赖名单里写死「鲁大师」。
 
@@ -202,11 +203,11 @@ relay 的 `users` 表只有 `token/name/created_at/consumed_at`，无公司部�
 
 | 模板项 | 实情 | 处置 |
 |---|---|---|
-| `employee.db` | 全盘不存在 | 用 `key_users.toml`（dws contact 反查生成） |
+| `employee.db` | 原模板假设的本地人员库，从未部署 | 已由 `shared/tmp/usage/key-users.toml`（dws contact 动态派生）替代；日报不再输出缺档提示 |
 | `prediction_log` | 全盘不存在（无文件/表/目录） | 标 [缺档]，需业务方给路径 |
 | `--source all` / `--source "dingtalk,api_server"` CLI | 不存在此聚合命令 | `usage_collect.py` 即替代实现 |
 | `acp` / `飞书` 渠道 | 本机无独立日志 | 恒为 0，标 [缺档] |
-| 重点用户「17 人」清单 | 全盘 grep `17人\|17 人\|重点用户` 无定义性命中 | 运行时从本机 policy.toml＋whitelist_dynamic 派生（本机 12 人），活跃率按实际人数算，见 §6 |
+| 重点用户「17 人」清单 | 全盘 grep `17人\|17 人\|重点用户` 无定义性命中 | 运行时从本机 policy.toml＋whitelist_dynamic 派生（2026-10-16 重派生后本机 13 人），活跃率按实际人数算，见 §6 |
 | 法定节假日日历 | 未接 | 交易日判定只按周末，调休日会误判，需手工纠正 |
 
 D-17 成品油价格预测自 2026-09-23 断供，是**上游数据源问题**（P-01 孙瑞昱），非代码缺陷；

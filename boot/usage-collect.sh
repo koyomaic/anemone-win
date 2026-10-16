@@ -64,6 +64,7 @@ done
 
 PY="$VENV/bin/python"
 COLLECT="$SKILL/scripts/usage_collect.py"
+BUILD_ROSTER="$SKILL/scripts/build_roster.py"
 DATE="${REPORT_DATE:-$(date -d 'yesterday' +%F)}"
 
 # ---- 前置检查：缺任一项都硬失败并预警，不静默产出残缺 facts ----
@@ -78,6 +79,20 @@ fi
 
 mkdir -p "$OUTDIR" 2>/dev/null
 OUT="$OUTDIR/facts-$DATE.json"
+
+# ---- 动态重点用户名单：每日采集前 best-effort 重派生 ----
+# 真源＝本机 policy.toml ＋ run/whitelist_dynamic.json（含过期剔除）。失败不阻断日报，
+# 沿用现有运行时缓存；build_roster 自身拒绝写空名单，避免授权源异常时误清缓存。
+if [ -f "$BUILD_ROSTER" ]; then
+  if build_out="$("$PY" "$BUILD_ROSTER" 2>&1)"; then
+    log "OK 重点用户名单已重派生（$(printf '%s\n' "$build_out" | sed -n '1p')）"
+  else
+    build_rc=$?
+    log "WARN build_roster 失败 rc=$build_rc，沿用现有名单缓存：$(printf '%s\n' "$build_out" | tail -1)"
+  fi
+else
+  log "WARN build_roster.py 不存在: $BUILD_ROSTER，沿用现有名单缓存"
+fi
 
 # ---- 采集 ----
 # 采集器自己会 load relay.env 取 RELAY_DB；这里不导出、不回显任何凭据。

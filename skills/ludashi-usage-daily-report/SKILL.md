@@ -26,8 +26,8 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
    经营敏感信息，不该随使用度量一起持久化。采集器已把原文压成**需求类型类别**，
    facts.json 与报告文件里都不出现原文——**不要想办法把原文捞回来**
    （`--keep-content` 只供排障，开了就别外发 facts）。
-7. **推送一律「摘要＋文件」**：摘要用 `render_report.py --summary` 生成（聚焦用户使用量，
-   ~430 字符），完整件作附件发。不要把整份报告塞进消息正文。
+7. **推送一律「摘要＋文件」**：摘要用 `render_report.py --summary` 生成（人员使用置顶，
+    ~400 字符），完整件作附件发。不要把整份报告塞进消息正文。
 8. **收件人不许写死**（2026-10-12 用户指示：机队各机推送对象不同，并不都是王洪彬和崔成东）。
    一律用 `recipients.py` 从本机配置解析，并**逐个收件人各发一遍**：
 
@@ -50,14 +50,21 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 
    | 机器 | policy 派生结果 | 本机实际配置 |
    |---|---|---|
-   | 本机 i-ll733rsj（owner=20102） | 崔成东、毕倩 | **王洪彬、崔成东**（用户指定） |
+    | 本机 i-ll733rsj（owner=20102） | 崔成东、毕倩 | **王洪彬、崔成东、邹雄、舒瀚**（用户指定） |
    | 机队模板（owner=18434） | 王洪彬 | 各机自定 |
 
    > 反例：`dingtalk-chat-digest/local.config.json` 把本机路径提交进了 git，
    > 会被 provision 推给其他机器。本技能的收件人配置刻意不入库就是为了避开这个坑。
 
-   `boot/usage-collect.sh` 的失败预警同样走 `recipients.py --kind alert`，
-   不再写死人名；`USAGE_ALERT_USER` 环境变量可临时覆盖（排障时定向发给自己）。
+    `boot/usage-collect.sh` 的失败预警同样走 `recipients.py --kind alert`，
+    不再写死人名；`USAGE_ALERT_USER` 环境变量可临时覆盖（排障时定向发给自己）。
+
+9. **完整件按 2026-10-16 精简版口径渲染**：用户明确要求「把人的使用情况放到最上面；
+   一些汇总可以简单点；两页长度能讲清楚，就不需要更多了」。`render_report.py` 已固化为：
+   ① 人员使用情况（活跃人员表＋当日无活动重点用户表）置顶；② 核心汇总用 5 行要点；
+   ③ 异常与建议最多 5 条数据发现＋1 处待填建议；④ 口径与缺口压缩为 2–3 行。
+   **不再输出逐会话卡片、渠道长表、cron 明细表和附录长表**；如需排障，查 facts.json
+   或 relay 台账，不要把完整件重新拉长。
 
 ## 每日自动化：两段式（宿主机采集 → 沙箱渲染）
 
@@ -215,7 +222,7 @@ requester（PG，权威）→ audit.log 的 task_id→actor（覆盖历史，实
 
 | 模板项 | 实情 | 替代 |
 |---|---|---|
-| `employee.db` 反查姓名/公司/部门 | 全盘不存在 | `config/key_users.toml`（由 `dws contact user get` 反查生成） |
+| `employee.db` 反查姓名/公司/部门 | 原模板假设的本地人员库，从未部署 | 已由 `shared/tmp/usage/key-users.toml`（`dws contact user get` 动态派生）替代；日报不再输出 employee.db 缺档提示 |
 | `prediction_log` 预测质量追溯 | 全盘不存在 | 无；需业务方给落盘路径 |
 | `--source all` / `--source "dingtalk,api_server"` CLI | 不存在此命令 | `usage_collect.py` 即其替代实现 |
 | `acp` / `飞书` 渠道 | 本机无独立日志 | 恒为 0，标 `[缺档]` |
@@ -227,12 +234,18 @@ requester（PG，权威）→ audit.log 的 task_id→actor（覆盖历史，实
 而机队模板 `policy.example.toml` 是 `owner_userid=18434`＋`whitelist=[]`。
 把某一台的名单提交进 git，夜间 provision 会把它强加给其他 7 台 → 活跃率与静默追踪全错。
 
-所以：**成员＝运行时从本机授权真源派生**，`config/key_users.toml` 只是派生结果的
-**缓存**（存 dws 反查来的 org/dept/title，省得每次跑报告都打通讯录）。
+所以：**成员＝运行时从本机授权真源派生**，运行时缓存写在
+`shared/tmp/usage/key-users.toml`（存 dws 反查来的 org/dept/title，省得每次跑报告都打通讯录）。
+该缓存**不在技能目录内**，provision 不会用仓库版覆盖；旧 `config/key_users.toml`
+仅作首次迁移/兼容兜底。
+
+`boot/usage-collect.sh` 每日预采集前会 best-effort 跑一次 `build_roster.py`：
+动态授权新增/撤销/过期后，次日日报名单自动跟随；重派生失败时沿用现有缓存，不阻断日报。
+`build_roster.py` 拒绝写空名单，避免 policy/动态授权读取异常时误清缓存。
 
 ```bash
 $PY $S/build_roster.py --dry-run              # 先看派生结果
-$PY $S/build_roster.py                        # 写入 config/key_users.toml
+$PY $S/build_roster.py                        # 写入 shared/tmp/usage/key-users.toml
 $PY $S/build_roster.py --include-historical   # 把 audit 历史活跃发起人也纳入
 $PY $S/build_roster.py --no-dws               # 离线：跳过通讯录，沿用缓存里的 org/dept
 ```
@@ -245,11 +258,11 @@ $PY $S/build_roster.py --no-dws               # 离线：跳过通讯录，沿�
 | `superadmin` | policy.toml `superadmin` | 1（毕倩） |
 | `static_whitelist` | policy.toml `whitelist` | 5（王洪彬、邹雄、孙瑞昱、邵磊、赵兴峰） |
 | `file_uploader` | policy.toml `file_uploaders` | 0 |
-| `dynamic_grant` | `run/whitelist_dynamic.json` **且未过期** | 5（舒瀚、孔德光、闫路英、靳光传、王思义） |
+| `dynamic_grant` | `run/whitelist_dynamic.json` **且未过期** | 6（舒瀚、孔德光、闫路英、王思义、顾芳芳、张帅） |
 | `historical_active` | audit.log 历史活跃发起人 | 需 `--include-historical` |
 
-本机合计 **12 人**。活跃率按**实际人数**算（N/12），不写死 17；换台机器自动变成那台的数。
-业务方若给出原始名单，往 `key_users.toml` 追加 `[[user]]` 块即可（重跑派生会保留人工 `note`）。
+本机合计 **13 人**（2026-10-16 重派生：撤销靳光传动态授权，纳入顾芳芳、张帅）。活跃率按**实际人数**算（N/13），不写死 17；换台机器自动变成那台的数。
+业务方若另有原始名单，应把它落到本机授权真源（`policy.toml` 或动态授权），不要手改运行时缓存——每日重派生会按真源覆盖成员，只保留人工 `note`。
 
 ### 姓名/部门反查的三个坑
 
@@ -259,34 +272,28 @@ $PY $S/build_roster.py --no-dws               # 离线：跳过通讯录，沿�
    否则取 `deptPathName` 最短者、同级按名排序。
 2. **多部门高管显示岗位而非部门**：`dept_count > 3` 时报告改显示 `orgTitle`
    （邹雄 → 「京博控股集团／总经理(主岗)（兼 34 部门，取岗位）」），比随机挑一个董事会名有意义。
-3. **通讯录查不到的人**：靳光传(12223) 返回全空（离职/无权限/id 变更），
-   赵兴峰跨组织无本 corp userId。姓名回退链必须含 `whitelist_dynamic.json`——
-   靳光传的名字**只有那里有**，漏掉这一环就会退化成用 id 当姓名。
-   查不到的 org/dept 标 `[缺档] 通讯录无返回`，**不要猜**。
+3. **通讯录查不到的人**：历史案例靳光传(12223) 返回全空（离职/无权限/id 变更），
+    赵兴峰跨组织无本 corp userId。姓名回退链必须含 `whitelist_dynamic.json`——
+    动态授权表可能是唯一姓名源，漏掉这一环就会退化成用 id 当姓名。
+    靳光传已于 2026-10-16 撤销动态授权并从重派生名单移除。
+    查不到的 org/dept 标 `[缺档] 通讯录无返回`，**不要猜**。
 
 `dws` 的 profile 各机不同，`build_roster.py` 从 `dws auth status` 动态取
 （`corp_id:user_id`），不写死。企业邮箱对报告无用且属 PII，**不写入文件**。
 
-## 你要补的 5 处叙述位
+## 你要补的 1 处叙述位
 
-渲染器只填数字，判断类的留给你：
+精简版渲染器已把数字、人员表、异常发现全部填好，只留一个判断位：
 
 | 位置 | 要写什么 |
 |---|---|
-| 1 节 一句话结论 | 主体渠道＋提问数＋重点用户活跃＋最活跃的人＋有无异常，一句话 |
-| 2.1 填写说明 | 点明当天主体（如「周日，人工提问为主体，22 条」） |
-| 2.2 填写说明 | 1–2 句解释主要渠道变化 |
-| 3.1 追问结构 | 与前日对比多轮会话增减 |
-| 5 节 观察与建议 | 从渲染器给的「候选观察」里挑，补上建议动作/优先级/归属 |
+| 3 节 建议 | 针对渲染器列出的异常，给不超过 3 条可执行建议；每条写清动作、优先级、责任/归属；无异常填「无」 |
 
-第 5 节的候选观察是渲染器**从数据直接算出来的**（台账登记失败次数、算力放大倍数、
-超 30 天静默人数、归属缺口等），可直接取用，但**建议动作要你自己写**。
+渲染器 stderr 会报「1 处待填叙述位」；补齐后必须为 0。不要把旧版的 5 处叙述位或逐会话卡片加回来。
 
-3.3 卡片的「需求类型」由采集器自动归类（`usage_collect.TOPIC_RULES`），不再留待填；
-归类明显不对就去改规则，别在报告里手改单条。
+需求类型由采集器自动归类（`usage_collect.TOPIC_RULES`），渲染器只展示类别；归类明显不对就去改规则，别在报告里手改单条。
 
-> 模板原文 3.3 要求每张卡片有「需求」和「交付」两个字段填用户原文/结论——
-> 按铁律 6 已取消，改为「提问规模（字数）＋需求类型」。模板与实现的这处差异是**有意的**。
+> 原模板 3.3 要求逐会话卡片与「需求/交付」原文——按铁律 6（不留存原文）和铁律 9（两页精简）已取消。
 
 ## 交付：落盘 → 台账 → 摘要＋文件推送
 
@@ -306,7 +313,7 @@ mkdir -p $OUT && cp /tmp/report-$D.md "$F"
 # 2) 登记台账（必须，否则算未完成）。注意是 --domain 不是 --topic；同 path 重复 add 是幂等 upsert
 store add "$F" --kind report --domain 自检报告 --task <任务号> --note "报告日 $D"
 
-# 3) 生成推送摘要（聚焦用户使用量，~430 字符，不含任务原文）
+# 3) 生成推送摘要（人员使用置顶，~400 字符，不含任务原文）
 $PY $S/render_report.py --facts /tmp/facts-$D.json --summary --out /tmp/summary-$D.md
 ```
 
@@ -358,12 +365,13 @@ $DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --f
 
 | 路径 | 作用 | 入库 |
 |---|---|---|
-| `scripts/build_roster.py` | 从本机 policy.toml＋whitelist_dynamic＋events＋通讯录派生重点用户名单 | ✓ |
-| `scripts/usage_collect.py` | 采集器：PG＋audit＋events＋rounds → facts.json（宿主机跑，需凭据） | ✓ |
-| `scripts/render_report.py` | 渲染器：facts.json → 报告 MD；`--summary` 出推送摘要；`--print-name` 出本机展示名（纯标准库） | ✓ |
+| `scripts/build_roster.py` | 从本机 policy.toml＋whitelist_dynamic＋events＋通讯录派生重点用户名单，写 `shared/tmp/usage/key-users.toml` | ✓ |
+| `scripts/usage_collect.py` | 采集器：PG＋audit＋events＋rounds → facts.json（宿主机跑，需凭据；优先读运行时名单缓存） | ✓ |
+| `scripts/render_report.py` | 渲染器：facts.json → 精简版报告 MD（人员使用置顶、两页内）；`--summary` 出推送摘要；`--print-name` 出本机展示名（纯标准库） | ✓ |
 | `scripts/self_name.py` | 解析**本机**分身展示名：bot 自称鲁大师→鲁大师，否则 policy.toml `avatar_name`（标题/摘要/文件名用） | ✓ |
 | `scripts/recipients.py` | 解析**本机**收件人（report / alert 两类） | ✓ |
-| `config/key_users.toml` | 名单**缓存**（派生结果＋org/dept/title），换机自动重派生 | ✓ |
+| `shared/tmp/usage/key-users.toml` | 名单**运行时缓存**（派生结果＋org/dept/title），各机不同、不入库、provision 不同步 | ✗ |
+| `config/key_users.toml` | 旧名单缓存/首次迁移兜底；运行时缓存存在后不再作为主源 | ✓ |
 | `config/recipients.example.json` | 收件人配置模板与说明 | ✓ |
 
 本机收件人配置**不在技能目录里**，在 `avatar/usage-report-recipients.json`（各机不同、
@@ -372,5 +380,5 @@ $DWS chat +chat-messages --conversation-id '<cid>' --limit 5 --profile $PROF --f
 | `references/template.md` | 用户给的报告模板原文 | ✓ |
 | `references/data-sources.md` | 真实数据源映射、字段含义、已知缺口 | ✓ |
 
-**换机器 / 人员变动后先跑 `build_roster.py`**，否则名单是上一台的。
+**换机器 / 人员变动后先跑 `build_roster.py`**；本机每日 08:30 预采集前也会自动 best-effort 重派生。
 **换机器后检查 `avatar/usage-report-recipients.json`**，否则会按本机 policy 派生（可能不是你想发的人）。

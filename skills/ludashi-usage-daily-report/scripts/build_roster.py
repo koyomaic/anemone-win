@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""从**本机**授权真源派生重点用户名单 → config/key_users.toml。
+"""从**本机**授权真源派生重点用户名单 → shared/tmp/usage/key-users.toml（运行时缓存）。
 
 为什么必须派生而不能入库固定：机队各机的 policy.toml 完全不同
 （本机 owner_userid=20102/whitelist 5 人；机队模板 policy.example.toml 是
 owner_userid=18434/whitelist=[]）。把某一台的名单提交进 git，夜间 provision
 会把它强加给其他 7 台 → 活跃率、静默追踪全错。
 
-故：**名单成员＝运行时从本机派生**；key_users.toml 只是派生结果的缓存
-（含 dws 反查来的 org/dept/title，避免每次跑报告都打通讯录）。
+故：**名单成员＝运行时从本机派生**；运行时缓存含 dws 反查来的 org/dept/title，
+避免每次跑报告都打通讯录。缓存主位置在 `shared/tmp/usage/key-users.toml`，
+不在技能目录内，provision 不会覆盖；旧 `config/key_users.toml` 仅作首次迁移兜底。
 
 用法：
-    build_roster.py                 # 派生 + dws 反查 + 写 config/key_users.toml
+    build_roster.py                 # 派生 + dws 反查 + 写运行时缓存
     build_roster.py --dry-run       # 只看派生结果，不写文件
     build_roster.py --no-dws        # 跳过通讯录反查（离线/无网时用缓存里的旧值）
     build_roster.py --include-historical   # 把 audit 里的历史活跃发起人也纳入名单
@@ -40,9 +41,14 @@ import tomllib
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-AVATAR = "/mnt/vol-eltaah12/workspace/avatar"
+WORKSPACE = os.environ.get("RELAY_WORKSPACE", "/mnt/vol-eltaah12/workspace")
+AVATAR = os.path.join(WORKSPACE, "avatar")
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(SKILL_DIR, "config", "key_users.toml")
+# 运行时名单缓存放 shared/tmp/usage/：预采集 systemd 单元已有该目录写权限，
+# 沙箱渲染任务也可读；不放技能目录，避免 provision 21b 按仓库版覆盖动态派生结果。
+RUNTIME_DIR = os.path.join(WORKSPACE, "shared", "tmp", "usage")
+OUT = os.path.join(RUNTIME_DIR, "key-users.toml")
+LEGACY_OUT = os.path.join(SKILL_DIR, "config", "key_users.toml")
 DWS_CANDIDATES = ["/root/fenshen-ludashi/bin/dws", "/opt/team/bin/dws", "dws"]
 
 # 明显是机器人/服务号的名字，不纳入"重点用户"（人）
@@ -232,7 +238,7 @@ def dws_lookup(dws: str, profile: str | None, ids: list[str]) -> dict:
 
 
 def load_existing(path: str) -> dict:
-    """读旧 key_users.toml → {id: 字段字典}，用于保留人工 note 与部门选定结果。"""
+    """读旧名单缓存 → {id: 字段字典}，用于保留人工 note 与部门选定结果。"""
     out: dict[str, dict] = {}
     if not os.path.exists(path):
         return out
@@ -273,7 +279,8 @@ def build(args) -> tuple[list[dict], list[str]]:
     dyn = parse_dynamic(args.dynamic)
     ev = names_from_events()
     oid2uid = names_from_contacts_cache()
-    old = load_existing(args.out)
+    existing = args.out if os.path.exists(args.out) else LEGACY_OUT
+    old = load_existing(existing)
 
     # ① 收集成员：id → (source, tier)
     members: dict[str, tuple[str, str]] = {}
@@ -344,12 +351,13 @@ def build(args) -> tuple[list[dict], list[str]]:
 def write_toml(rows: list[dict], notes: list[str], path: str, svc: list[tuple[str, str]]) -> None:
     host = os.environ.get("AVATAR_NAME") or ""
     L = [
-        "# 鲁大师重点用户名单 —— 由 build_roster.py 从**本机**授权真源派生，勿手改成员。",
+        "# 鲁大师重点用户名单（运行时缓存）—— 由 build_roster.py 从**本机**授权真源派生，勿手改成员。",
         "#",
         "# 为什么不入库固定：机队各机 policy.toml 完全不同（本机 owner/whitelist 与",
         "# 机队模板 policy.example.toml 就不一样）。固定名单会被夜间 provision 强加给",
         "# 其他机器 → 活跃率与静默追踪全错。故成员运行时派生，本文件只是缓存",
         "# （存 dws 反查来的 org/dept/title，省得每次跑报告都打通讯录）。",
+        "# 主位置在 shared/tmp/usage/，不在技能目录内，provision 不会覆盖。",
         "#",
         f"# 生成时间：{dt.datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"# 本机人数：{len(rows)}（报告按实际人数算活跃率 N/{len(rows)}，不写死任何数字）",
@@ -389,20 +397,25 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="从本机授权真源派生重点用户名单")
     ap.add_argument("--policy", default=os.path.join(AVATAR, "policy.toml"))
     ap.add_argument("--dynamic", default=os.path.join(AVATAR, "run", "whitelist_dynamic.json"))
-    ap.add_argument("--out", default=OUT)
+    ap.add_argument("--out", default=OUT,
+                    help=f"运行时名单缓存路径（默认 {OUT}；旧 config/key_users.toml 仅作迁移兜底）")
     ap.add_argument("--profile", help="dws profile（默认从 dws auth status 动态取）")
     ap.add_argument("--no-dws", action="store_true", help="跳过通讯录反查")
     ap.add_argument("--include-historical", action="store_true",
                     help="把 audit 里的历史活跃发起人也纳入名单")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="允许写出空名单（默认拒绝，避免 policy/动态授权读取异常时误清缓存）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     rows, notes = build(args)
-    # 保留旧文件里的服务账号段（人工维护），并入默认项
+    # 保留旧文件里的服务账号段（人工维护），并入默认项。运行时缓存不存在时，
+    # 从旧技能目录缓存迁移，避免首次切换丢失人工维护的 service_account。
+    old_path = args.out if os.path.exists(args.out) else LEGACY_OUT
     old_svc = []
-    if os.path.exists(args.out):
+    if os.path.exists(old_path):
         cur = None
-        for raw in open(args.out, encoding="utf-8", errors="replace"):
+        for raw in open(old_path, encoding="utf-8", errors="replace"):
             s = raw.strip()
             if s.startswith("[[service_account]]"):
                 cur = {}
@@ -433,6 +446,11 @@ def main() -> int:
     if args.dry_run:
         print("\n[--dry-run] 未写文件")
         return 0
+    if not rows and not args.allow_empty:
+        print("\n[FAIL] 派生结果为空，拒绝覆盖运行时名单缓存；"
+              "请检查 policy.toml / whitelist_dynamic.json，或确需清空时加 --allow-empty",
+              file=sys.stderr)
+        return 1
     write_toml(rows, notes, args.out, svc)
     print(f"\n写入 {args.out}")
     return 0

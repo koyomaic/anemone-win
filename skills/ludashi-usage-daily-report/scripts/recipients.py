@@ -13,7 +13,7 @@
     recipients.py --init --force         # 覆盖已有 local 配置
 
 缺省行为：local 配置不存在时，从本机 policy.toml 派生（owner_userid + superadmin），
-姓名经 config/key_users.toml 的 name_by_id 反查；派生结果会自动写出 local 文件，
+姓名经运行时名单缓存（`shared/tmp/usage/key-users.toml`，旧 `config/key_users.toml` 兜底）的 name_by_id 反查；派生结果会自动写出 local 文件，
 使配置显式化、下次可直接改。故新机器零配置也能跑，且推给的是**本机**负责人。
 """
 from __future__ import annotations
@@ -27,7 +27,9 @@ import tomllib
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXAMPLE = os.path.join(SKILL_DIR, "config", "recipients.example.json")
-ROSTER = os.path.join(SKILL_DIR, "config", "key_users.toml")
+WORKSPACE = os.environ.get("RELAY_WORKSPACE", "/mnt/vol-eltaah12/workspace")
+RUNTIME_ROSTER = os.path.join(WORKSPACE, "shared", "tmp", "usage", "key-users.toml")
+LEGACY_ROSTER = os.path.join(SKILL_DIR, "config", "key_users.toml")
 POLICY_CANDIDATES = [
     "/mnt/vol-eltaah12/workspace/avatar/policy.toml",
     "/root/fenshen-ludashi/avatar/policy.toml",
@@ -38,7 +40,6 @@ POLICY_CANDIDATES = [
 #   一次「rm -rf 安装位 + cp -r」式的全量重同步就会把本机配置抹掉（实测踩过：安装位丢了
 #   local 配置 → 解析器静默回退成 policy 派生值，收件人从王洪彬+崔成东变成崔成东+毕倩，
 #   报告发错人且无人察觉）。avatar/ 是 policy.toml 所在的本机配置区，永不被同步。
-WORKSPACE = os.environ.get("RELAY_WORKSPACE", "/mnt/vol-eltaah12/workspace")
 LOCAL_CANDIDATES = [
     os.environ.get("USAGE_RECIPIENTS", ""),                      # ① 显式指定
     os.path.join(WORKSPACE, "avatar", "usage-report-recipients.json"),  # ② 本机配置区（主）
@@ -61,13 +62,21 @@ def local_path() -> str | None:
     return None
 
 
+def roster_path() -> str:
+    for p in (os.environ.get("USAGE_ROSTER", ""), RUNTIME_ROSTER, LEGACY_ROSTER):
+        if p and os.path.exists(p):
+            return p
+    return RUNTIME_ROSTER
+
+
 def name_by_id() -> dict:
-    """从 key_users.toml 取 id→姓名（该文件由 build_roster.py 从本机真源派生）。"""
+    """从运行时名单缓存取 id→姓名（该文件由 build_roster.py 从本机真源派生）。"""
     out = {}
-    if not os.path.exists(ROSTER):
+    path = roster_path()
+    if not os.path.exists(path):
         return out
     cur = None
-    for raw in open(ROSTER, encoding="utf-8", errors="replace"):
+    for raw in open(path, encoding="utf-8", errors="replace"):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -126,7 +135,7 @@ def derive_from_policy() -> tuple[list[str], list[str], list[str]]:
         nm = nmap.get(i)
         if not nm:
             # openId 或名单外的人：反查不到姓名，dws --to 也没法用姓名解析
-            notes.append(f"[缺档] policy 里的 {i[:20]}… 在 key_users.toml 反查不到姓名"
+            notes.append(f"[缺档] policy 里的 {i[:20]}… 在运行时名单缓存反查不到姓名"
                          f"（先跑 build_roster.py），已跳过")
             continue
         if nm not in seen:

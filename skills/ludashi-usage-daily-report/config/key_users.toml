@@ -5,16 +5,16 @@
 # 其他机器 → 活跃率与静默追踪全错。故成员运行时派生，本文件只是缓存
 # （存 dws 反查来的 org/dept/title，省得每次跑报告都打通讯录）。
 #
-# 生成时间：2026-10-12 17:02:41 CST
-# 本机人数：12（报告按实际人数算活跃率 N/12，不写死任何数字）
+# 生成时间：2026-10-16 20:55:28 CST
+# 本机人数：13（报告按实际人数算活跃率 N/13，不写死任何数字）
 #
 # 重新派生：python3 scripts/build_roster.py [--include-historical] [--no-dws]
 # 人工可改的只有 note 字段与 [[service_account]] 段，重跑会保留。
 
 # 本次派生备注：
+#   - [多部门] 崔成东(20102) 有 2 个部门，取「ZLRN链利润管理中心」（通讯录返回顺序随机，已按缓存优先+路径最短确定性选定）
 #   - [多部门] 邹雄(40714) 有 34 个部门，取「KG组织薪酬与人力资本管理委员会」（通讯录返回顺序随机，已按缓存优先+路径最短确定性选定）
 #   - [多部门] 舒瀚(19173) 有 2 个部门，取「HSRN高管层」（通讯录返回顺序随机，已按缓存优先+路径最短确定性选定）
-#   - [缺档] 靳光传(12223) 通讯录反查无返回（离职/无权限/id 变更），姓名取自 whitelist_dynamic.json，org/dept/title 缺失
 
 # 服务账号：有 token 但不是自然人，归 cron/api_server 口径，不参与用户级排名。
 # 注：分身本体名各机不同（provision 29b 让 avatar_name 跟随本机 dws 认证名），
@@ -44,8 +44,8 @@ id = "20102"
 name = "崔成东"
 org = "京博控股集团"
 dept = "ZLRN链利润管理中心"
-dept_count = "1"
-title = "中心总经理"
+dept_count = "2"
+title = "中心总经理(主岗)"
 tier = "owner"
 source = "policy_owner"
 note = "policy.toml owner_userid；系统负责人"
@@ -128,6 +128,17 @@ source = "dynamic_grant"
 note = "whitelist_dynamic.json；崔成东授权"
 
 [[user]]
+id = "33537"
+name = "张帅"
+org = "京博控股集团"
+dept = "ZLRN采购交易部"
+dept_count = "1"
+title = "副经理"
+tier = "L2"
+source = "dynamic_grant"
+note = ""
+
+[[user]]
 id = "23518"
 name = "王思义"
 org = "京博控股集团"
@@ -161,12 +172,12 @@ source = "dynamic_grant"
 note = "whitelist_dynamic.json；崔成东授权"
 
 [[user]]
-id = "12223"
-name = "靳光传"
-org = ""
-dept = ""
-dept_count = ""
-title = ""
+id = "22500"
+name = "顾芳芳"
+org = "京博控股集团"
+dept = "ZLRN财务经营部"
+dept_count = "1"
+title = "财务经营经理"
 tier = "L2"
 source = "dynamic_grant"
-note = "whitelist_dynamic.json；通讯录反查返回空（数据缺口）"
+note = ""

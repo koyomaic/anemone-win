@@ -27,7 +27,7 @@ events/rounds 补消息级明细。输出 JSON facts 供渲染报告，不直接
    task_id→actor（覆盖历史，实测 97%）→ unknown。actor 是 userId 或 openId，
    用名单的 name_by_id 反查姓名。
 
-4) 模板要求但本机无源的维度（employee.db / prediction_log / --source all CLI /
+4) 模板要求但本机无源的维度（prediction_log / --source all CLI /
    cli·acp·飞书 独立日志）一律输出 gap 标记，不编造。
 
 红线：绝不回显 RELAY_DB 连接串或任何凭据。
@@ -45,10 +45,24 @@ import sys
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Shanghai")
-AVATAR = "/mnt/vol-eltaah12/workspace/avatar"
-RELAY_ENV = "/mnt/vol-eltaah12/workspace/relay.env"
+WORKSPACE = os.environ.get("RELAY_WORKSPACE", "/mnt/vol-eltaah12/workspace")
+AVATAR = os.path.join(WORKSPACE, "avatar")
+RELAY_ENV = os.path.join(WORKSPACE, "relay.env")
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ROSTER = os.path.join(SKILL_DIR, "config", "key_users.toml")
+# 名单运行时缓存优先放 shared/tmp/usage/：预采集单元可写、沙箱渲染任务可读，
+# 且不在技能目录内，避免 provision 覆盖后名单回退。旧 config/key_users.toml 仅作兜底。
+RUNTIME_ROSTER = os.path.join(WORKSPACE, "shared", "tmp", "usage", "key-users.toml")
+LEGACY_ROSTER = os.path.join(SKILL_DIR, "config", "key_users.toml")
+
+
+def resolve_roster_path() -> str:
+    for p in (os.environ.get("USAGE_ROSTER", ""), RUNTIME_ROSTER, LEGACY_ROSTER):
+        if p and os.path.exists(p):
+            return p
+    return RUNTIME_ROSTER
+
+
+ROSTER = resolve_roster_path()
 
 # 本机分身展示名解析器（同目录 self_name.py）。宿主机采集时解析并写进 facts，
 # 渲染端（沙箱）只读 facts.display_name，避免沙箱读不到 identity.local.json/policy.toml。
@@ -626,7 +640,6 @@ def main() -> int:
     facts["gaps"] += facts["logs"].get("gaps", [])
 
     for name, why in [
-        ("employee.db", "全盘不存在；姓名/公司/部门改由 config/key_users.toml（dws contact 反查生成）"),
         ("prediction_log", "全盘不存在；预测质量追溯需业务方提供落盘路径"),
         ("--source all CLI", "不存在此聚合命令；本 skill 的 usage_collect.py 即其替代实现"),
         ("acp / 飞书 渠道", "本机无独立日志，恒为 0，按 [缺档] 标注"),
