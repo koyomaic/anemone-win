@@ -132,10 +132,12 @@ class Avatar:
         self.q: queue.Queue = queue.Queue()
         self.stop = threading.Event()
         self.contacts = self.st.run / "contacts.json"
+        self.plan_delivery_file = self.st.run / "plan_delivery_state.json"
         self.sign = str(cfg.get("identity", "sign", "") or "")
         self._guide_seen: dict = {}
         self._guest_seen: dict = {}
         self._note_guard: dict = {}
+        self._plan_delivery_next = 0.0
 
     def _guest_silent(self, sid: str, sender: str, content):
         """名单外静默忽略：只留节流审计（同人每小时一条），绝不回话。"""
@@ -1800,6 +1802,9 @@ class Avatar:
             f"`name`（删除/停用须给**完整**计划名，子串不生效）。`on_calendar` 是 "
             f"systemd OnCalendar 表达式（每日 07:35 即 `*-*-* 07:35:00`）。可选 "
             f"`priority`(normal|urgent)、`read_only`(bool)。\n"
+            f"· 在群/单聊里创建计划时，分身会自动把**当前会话**绑定为计划投递目标；"
+            f"标记里不要写 delivery/to/收件人。计划任务到点完成后，结果正文与 "
+            f"```send_file``` 文件会由分身投回该会话。\n"
             f"· `name`/`description` 要填**实义值**，别把 `<计划名>` 这类示例占位符原样"
             f"回显（整段是占位符会被拒建）；但描述里嵌 `<YYYYMMDD>`、`<YYYY-MM>` 这类"
             f"日期模板变量是允许的，生产计划都这么写。\n"
@@ -1882,7 +1887,8 @@ class Avatar:
         notes = []
         for spec in specs:
             try:
-                note = self._exec_plan_op(spec, uid, sid, sender)
+                note = self._exec_plan_op(spec, uid, sid, sender,
+                                          reply=s.get("reply"))
             except Exception as e:
                 note = f"⚠️ 计划操作异常：{e!r}"
             if note:
@@ -2188,7 +2194,7 @@ class Avatar:
                 "未执行。需要的话请找超管加白名单。")
 
     def _exec_plan_op(self, spec: dict, uid: str, sid: str = "",
-                      sender: str = "") -> str | None:
+                      sender: str = "", reply: dict | None = None) -> str | None:
         op = str(spec.get("op") or "create").lower()
         if op == "list":
             return self._plan_list_note(uid)      # 只读且按 uid 限定，不设门禁
@@ -2206,11 +2212,12 @@ class Avatar:
                        f"on_calendar={str(spec.get('on_calendar') or '')[:32]}",
                        backend="relay")
         if op == "create":
-            return self._plan_create_note(spec, uid)
+            return self._plan_create_note(spec, uid, reply=reply)
         return self._plan_by_name_note(op, str(spec.get("name") or ""), uid,
                                        sid, sender)
 
-    def _plan_create_note(self, spec: dict, uid: str) -> str:
+    def _plan_create_note(self, spec: dict, uid: str,
+                          reply: dict | None = None) -> str:
         on_cal = str(spec.get("on_calendar") or "").strip()
         desc = str(spec.get("description") or "").strip()
         if not on_cal or not desc:
@@ -2249,14 +2256,24 @@ class Avatar:
         action = {"type": "task", "description": desc,
                   "priority": spec.get("priority", "normal"),
                   "read_only": bool(spec.get("read_only", False))}
+        delivery = self._plan_delivery_target(reply)
+        if delivery:
+            action["delivery"] = delivery
         r = self.exec_relay.create_plan(name, on_cal, action, uid=uid)
         if "_error" in r:
             return (f"⚠️ 创建计划失败："
                     f"{str(r.get('_detail') or r.get('_error'))[:160]}")
+        if delivery:
+            self._mark_plan_delivery_baseline(r.get("id"), r.get("last_task_id"))
         nr = r.get("next_run")
         nrs = time.strftime("%m-%d %H:%M", time.localtime(nr)) if nr else "?"
+        where = ""
+        if delivery:
+            where = ("\n· 投递：到点结果将自动发回本群"
+                     if delivery.get("is_group") else
+                     "\n· 投递：到点结果将自动单聊发回发起人")
         return (f"✅ 已创建定时计划「{name}」\n"
-                f"· 规则：{on_cal}\n· 下次：{nrs}\n· 内容：{desc[:60]}\n"
+                f"· 规则：{on_cal}\n· 下次：{nrs}\n· 内容：{desc[:60]}{where}\n"
                 f"到点自动执行。想看就说「我的计划」，想取消说「删掉计划 {name}」。")
 
     def _plan_list_note(self, uid: str) -> str:
@@ -2274,13 +2291,169 @@ class Avatar:
                    if nr else "已停用")
             st = "启用" if p.get("enabled") else "停用"
             lock = "🔒" if p["name"] in prot else "　"
-            lines.append(f"· {lock}{p['name']}｜{p['on_calendar']}｜{st}｜下次 {nrs}")
+            d = (p.get("action") or {}).get("delivery")
+            dtxt = ""
+            if isinstance(d, dict) and d:
+                dtxt = "｜投递:群" if d.get("is_group") else "｜投递:单聊"
+            lines.append(f"· {lock}{p['name']}｜{p['on_calendar']}｜{st}｜下次 {nrs}{dtxt}")
         return "\n".join(lines)
 
     def _plan_protected(self) -> set:
         """受保护计划名单（非 super 不得删/停/启）。见 config.DEFAULTS 处注释。"""
         return {str(x).strip() for x in
                 (self.cfg.get("security", "plan_protected", []) or []) if str(x).strip()}
+
+    def _plan_delivery_target(self, reply: dict | None) -> dict | None:
+        """从当前发起会话提取计划投递目标。
+
+        目标只能来自系统锁定的 `reply`，绝不接受 agent 在 ```plan``` 标记里自填
+        收件人；否则一段外部文本就能让定时任务把结果发到任意群/任意人。
+        """
+        r = reply or {}
+        is_group = bool(r.get("is_group"))
+        cid = str(r.get("conversation_id") or "").strip()
+        open_id = str(r.get("open_dingtalk_id") or "").strip()
+        user_id = str(r.get("user_id") or "").strip()
+        sender = sanitize_field(r.get("sender") or "", 40)
+        if is_group:
+            if not cid:
+                return None
+            return {"is_group": True, "conversation_id": cid, "sender": sender}
+        if not (open_id or user_id):
+            return None
+        return {"is_group": False, "conversation_id": cid,
+                "open_dingtalk_id": open_id, "user_id": user_id,
+                "sender": sender}
+
+    def _plan_delivery_state(self) -> dict:
+        return self.st.load_json(self.plan_delivery_file, {})
+
+    def _save_plan_delivery_state(self, state: dict) -> None:
+        self.st.save_json(self.plan_delivery_file, state)
+
+    def _mark_plan_delivery_baseline(self, plan_id, last_task_id) -> None:
+        """新建/补绑计划时，把当前 last_task_id 设为已处理基线。
+
+        否则给一个已有历史任务的计划补 delivery 后，轮询会把旧任务结果追溯投递一遍。
+        """
+        if not plan_id:
+            return
+        state = self._plan_delivery_state()
+        state[str(plan_id)] = {
+            "delivered_task_id": int(last_task_id or 0),
+            "attempts": 0,
+            "baseline_ts": time.time(),
+        }
+        self._save_plan_delivery_state(state)
+
+    def _deliver_plan_task(self, plan: dict, row: dict, delivery: dict) -> bool:
+        """把计划任务结果按绑定目标投递出去。
+
+        复用普通任务的 `_finish/_send_result` 链路，但用合成会话：
+        - `reply` 是创建计划时锁定的目标；
+        - `plan_applied=tid` 让结果里的 ```plan``` 块只被剥离、不被执行，
+          防止定时任务输出再递归建计划；
+        - `send_file` 标记照常由 avatar 代投。
+        """
+        tid = row.get("id")
+        status = row.get("status")
+        plan_id = plan.get("id")
+        plan_name = plan.get("name") or "?"
+        actor = f"plan:{plan_id}"
+        s = {
+            "state": "PLAN_DELIVERY",
+            "reply": dict(delivery),
+            "uid": actor,
+            "task_id": tid,
+            "last_task_id": None,
+            "extra_targets": [],
+            "card_biz": None,
+            "ack_msg": None,
+            "followups": [],
+            "plan_applied": tid,
+            "send_applied": None,
+            "last_activity": time.time(),
+        }
+        where = self._target_sig(delivery)[:48]
+        try:
+            if status == "review":
+                self._send_result(s, row, prefix="👀 定时任务已执行完，待人工过目")
+            else:
+                self._finish(s, row)
+        except Exception as e:
+            self.audit.log("plan_delivery_failed", actor,
+                           f"plan={plan_name} task=#{tid} status={status} "
+                           f"target={where} err={e!r}"[:300],
+                           backend="relay", task_id=tid)
+            return False
+        self.audit.log("plan_delivery", actor,
+                       f"plan={plan_name} task=#{tid} status={status} target={where}",
+                       backend="relay", task_id=tid)
+        return True
+
+    def _poll_plan_deliveries(self):
+        """轮询带 delivery 绑定的计划，投递其最新一次任务结果。"""
+        if not bool(self.cfg.get("execution", "plan_delivery_enabled", True)):
+            return
+        now = time.time()
+        if now < self._plan_delivery_next:
+            return
+        self._plan_delivery_next = now + float(
+            self.cfg.get("execution", "plan_delivery_poll_sec", 15))
+        list_plans = getattr(self.exec_relay, "list_plans", None)
+        if not callable(list_plans):
+            return
+        r = list_plans("__plan_delivery__")
+        if not isinstance(r, dict) or "_error" in r:
+            return
+        plans = r.get("plans") or []
+        state = self._plan_delivery_state()
+        changed = False
+        seen = set()
+        max_attempts = int(self.cfg.get("execution",
+                                        "plan_delivery_max_attempts", 3))
+        for p in plans:
+            pid = p.get("id")
+            if not pid:
+                continue
+            seen.add(str(pid))
+            action = p.get("action") or {}
+            delivery = action.get("delivery")
+            if not isinstance(delivery, dict) or not delivery:
+                continue
+            tid = int(p.get("last_task_id") or 0)
+            key = str(pid)
+            prev = state.get(key)
+            if not isinstance(prev, dict):
+                # 首次见到该计划（含存量计划补绑 delivery）：以当前 last_task_id 为
+                # 基线，绝不追溯投递历史任务。
+                state[key] = {"delivered_task_id": tid, "attempts": 0,
+                              "baseline_ts": now}
+                changed = True
+                continue
+            if tid <= int(prev.get("delivered_task_id") or 0):
+                continue
+            if int(prev.get("attempts") or 0) >= max_attempts:
+                continue
+            row = self.exec_relay.poll(tid)
+            if not isinstance(row, dict) or "_error" in row:
+                continue
+            status = row.get("status")
+            if status not in ("done", "conflict", "failed", "cancelled", "review"):
+                continue
+            if self._deliver_plan_task(p, row, delivery):
+                state[key] = {"delivered_task_id": tid, "attempts": 0,
+                              "status": status, "ts": now}
+            else:
+                state[key] = {**prev, "attempts": int(prev.get("attempts") or 0) + 1,
+                              "last_status": status, "ts": now}
+            changed = True
+        for key in list(state.keys()):
+            if key not in seen:
+                del state[key]
+                changed = True
+        if changed:
+            self._save_plan_delivery_state(state)
 
     def _plan_by_name_note(self, op: str, name: str, uid: str,
                            sid: str = "", sender: str = "") -> str:
@@ -2351,7 +2524,7 @@ class Avatar:
             spec = {"op": "create", "name": pc["name"],
                     "on_calendar": pc["on_calendar"], "description": pc["description"],
                     "priority": "normal", "read_only": False}
-            note = self._plan_create_note(spec, uid)
+            note = self._plan_create_note(spec, uid, reply=s.get("reply"))
         elif cmd == "create_fail":
             note = self._plan_fail_note(pc)
         elif cmd == "list":
@@ -2488,6 +2661,7 @@ class Avatar:
     # ── 定时 ──
     def _tick(self):
         self._drain_local()      # 先收尾本机任务，escalate 的可在本轮直接转 relay
+        self._poll_plan_deliveries()
         for key, s, kind in self.sess.due():
             s["deadline"] = 0
             self._flush(s, followup=(kind == "followup"))

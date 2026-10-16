@@ -23,6 +23,7 @@ _UTC_RE = re.compile(
     r"\(in UTC\):\s+\w+\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC")
 
 _MAX_DESC = 4000
+_MAX_DELIVERY_FIELD = 200
 
 
 def parse_utc_elapse(stdout: str) -> float | None:
@@ -58,6 +59,38 @@ def next_elapse(on_calendar: str) -> tuple[float | None, str | None]:
     return epoch, None
 
 
+def validate_delivery(delivery) -> str | None:
+    """计划投递目标校验。
+
+    delivery 是可选字段，由 relay-avatar 在创建计划时从**当前发起会话**注入，
+    不允许 agent 在 ```plan``` 标记里自行指定收件人。relay 只负责存储与校验，
+    实际投递仍由持有 dws 凭据的 avatar 层执行。
+    """
+    if delivery is None:
+        return None
+    if not isinstance(delivery, dict):
+        return "action.delivery must be an object"
+    is_group = delivery.get("is_group", False)
+    if not isinstance(is_group, bool):
+        return "action.delivery.is_group must be a boolean"
+    cid = delivery.get("conversation_id", "")
+    open_id = delivery.get("open_dingtalk_id", "")
+    user_id = delivery.get("user_id", "")
+    sender = delivery.get("sender", "")
+    for name, val in (("conversation_id", cid), ("open_dingtalk_id", open_id),
+                      ("user_id", user_id), ("sender", sender)):
+        if not isinstance(val, str):
+            return f"action.delivery.{name} must be a string"
+        if len(val) > _MAX_DELIVERY_FIELD:
+            return f"action.delivery.{name} too long (<= {_MAX_DELIVERY_FIELD})"
+    if is_group:
+        if not cid.strip():
+            return "action.delivery.conversation_id required for group delivery"
+    elif not (open_id.strip() or user_id.strip()):
+        return "action.delivery requires open_dingtalk_id or user_id for single-chat delivery"
+    return None
+
+
 def validate_action(action: dict) -> str | None:
     """动作白名单校验。返回错误信息字符串，或 None 表示通过。"""
     if not isinstance(action, dict):
@@ -78,4 +111,7 @@ def validate_action(action: dict) -> str | None:
         return "action.read_only must be a boolean"
     if not isinstance(action.get("project", ""), str):
         return "action.project must be a string"
+    err = validate_delivery(action.get("delivery"))
+    if err:
+        return err
     return None

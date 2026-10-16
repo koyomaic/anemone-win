@@ -62,6 +62,31 @@ def test_validate_action():
     assert plan_util.validate_action("nope") is not None
 
 
+def test_validate_action_delivery():
+    group = {"is_group": True, "conversation_id": "cidABC==", "sender": "闫路英"}
+    single = {"is_group": False, "open_dingtalk_id": "openABC", "sender": "闫路英"}
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x", "delivery": group}) is None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x", "delivery": single}) is None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x", "delivery": None}) is None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x", "delivery": "cid"}) is not None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x",
+         "delivery": {"is_group": True}}) is not None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x",
+         "delivery": {"is_group": False}}) is not None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x",
+         "delivery": {"is_group": "yes", "conversation_id": "cid"}}) is not None
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x",
+         "delivery": {"is_group": True, "conversation_id": "x" * 201}}) is not None
+
+
 def test_name_re():
     assert plan_util.NAME_RE.match("daily-brief")
     assert plan_util.NAME_RE.match("日报_2026.09")
@@ -162,6 +187,29 @@ def test_api_plan_crud_and_validation(relay, admin, member, fake_cal):
     # 删除
     assert member.delete(f"/plans/{pid}").json()["ok"] is True
     assert member.get(f"/plans/{pid}").status_code == 404
+
+
+def test_api_plan_delivery_persisted(relay, admin, member, fake_cal):
+    delivery = {"is_group": True, "conversation_id": "cidGROUP==", "sender": "闫路英"}
+    r = member.post("/plans", json={
+        "name": "group-delivery",
+        "on_calendar": "*-*-* 07:55:00",
+        "action": {"type": "task", "description": "到点发群", "delivery": delivery},
+    })
+    assert r.status_code == 201, r.text
+    p = r.json()
+    assert p["action"]["delivery"] == delivery
+
+    r = member.patch(f"/plans/{p['id']}", json={
+        "action": {"type": "task", "description": "到点发群",
+                   "delivery": {"is_group": True}}})
+    assert r.status_code == 422
+
+    r = member.patch(f"/plans/{p['id']}", json={
+        "action": {"type": "task", "description": "到点发群",
+                   "delivery": {"is_group": False, "open_dingtalk_id": "openX"}}})
+    assert r.status_code == 200
+    assert r.json()["action"]["delivery"]["open_dingtalk_id"] == "openX"
 
 
 # ---- fire：原子认领 + 提交任务（假 agent，非 integration） ----

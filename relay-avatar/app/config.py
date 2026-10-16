@@ -67,8 +67,13 @@ DEFAULTS: dict[str, Any] = {
                   # 仅用于审批通知文案里告知超管"多久没人管会自动终止"。
                   # **必须与 relay 侧 RELAY_APPROVAL_TIMEOUT_MINUTES 保持一致**
                   # （relay 默认 60）；不一致只是文案数字不准，不影响实际清扫
-                  # ——真正执行超时的是 relay 的 sweep_stale。
-                  "approval_timeout_minutes": 60},
+                   # ——真正执行超时的是 relay 的 sweep_stale。
+                   "approval_timeout_minutes": 60,
+                   # 计划投递绑定：创建计划时把当前会话写入 action.delivery，
+                   # 计划任务结束后由 avatar 按绑定目标代投结果/文件。
+                   "plan_delivery_enabled": True,
+                   "plan_delivery_poll_sec": 15,
+                   "plan_delivery_max_attempts": 3},
     "claude": {"permission_mode_super": "bypassPermissions",
                "permission_mode_l2": "default",
                "l2_allowed_tools": ["Read", "Glob", "Grep", "LS"],
