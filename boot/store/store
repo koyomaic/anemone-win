@@ -55,14 +55,15 @@ UNMANAGED = {"secrets", "skills", "mcp", "memory", "tmp",
 # 双写目标（2026-10-19 换绑）：「财务智脑知识库」fdfd899b 对机队账号 403（空间成员
 # 变更，与前靶 8c0e68ab 同模式；MODEL 9990a970、AGENT e7393902 一并消失）。现指向
 # 机队账号名下纯 Wiki 库「聚烯烃经营利润运营大脑知识库」（wiki_enabled，vector/
-# keyword/graph 关）+ 新建 wiki-qa 智能体 + KnowledgeQA 模型 Qwen3.8-27B-FP8-Z
-# （上游 model.chambroad.com:30131，JBJXT-YW-聚烯烃经营项目 key；业务方 2026-10-19
-# 指定。注意与 VLLM 型同名槽位 2b131deb 是不同槽位，问答/合成只认 KnowledgeQA 型）。
+# keyword/graph 关）+ KnowledgeQA 模型 Qwen3.8-27B-FP8-Z（上游 model.chambroad.com
+# :30131，JBJXT-YW-聚烯烃经营项目 key；业务方 2026-10-19 指定。注意与 VLLM 型同名
+# 槽位 2b131deb 是不同槽位，问答/合成只认 KnowledgeQA 型）。不配套自建智能体
+# （业务方 2026-10-19 决定；双写上传只用 KB_ID，问答需要时用库内 builtin 智能体）。
 # 历史（2026-10-12）：旧「纯Wiki资料知识库」8c0e68ab 在 jingboWiki 空间变更后对
 # 机队账号整体 403，双写通道曾静默死亡数周。
 # 单机临时换靶可设 STORE_KB_ID 环境变量覆盖 --kb 缺省（不换 AGENT/MODEL 元数据）。
 KB_ID = "15f54477-5f47-480d-873c-afd1f8d5fbda"
-AGENT_ID = "cd8cc1ee-786e-4491-873a-55f9e3421fea"
+AGENT_ID = ""
 MODEL_ID = "1fe3f219-3214-4c94-940d-910d75d8ada6"
 
 # 方案 B：单库多 tag。一条知识只挂一个 tag（PUT /knowledge/tags 的 updates 是 知识ID→单个标签ID）
