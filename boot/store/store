@@ -52,15 +52,16 @@ UNMANAGED = {"secrets", "skills", "mcp", "memory", "tmp",
              # index/ 是台账自身（manifest.jsonl 由 export 生成，索引它会自我引用）；
              # work/ 是任务中间态，7 天即清，索引只会制造噪声
              "index", "work"}
-# 双写目标（2026-10-12 换绑）：旧「纯Wiki资料知识库」8c0e68ab 在 jingboWiki 空间
-# 变更后对机队账号整体 403（MODEL 823c0ae2 404、AGENT 3a38b83e 消失），双写通道
-# 静默死亡数周（store_wiki_sync 长期 0 行）。现指向执委办空间（tenant 10009）新建
-# 纯 Wiki 库「财务智脑知识库」+ 配套 wiki-qa 智能体 + KnowledgeQA 模型
-# Qwen3.8-27B-FP8-Z（上游 model.chambroad.com:30131，旧 LCBD 名被上游 403 拒绝）。
+# 双写目标（2026-10-19 换绑）：「财务智脑知识库」fdfd899b 对机队账号 403（空间成员
+# 变更，与前靶 8c0e68ab 同模式；MODEL 9990a970、AGENT e7393902 一并消失）。现指向
+# 机队账号名下纯 Wiki 库「聚烯烃经营利润运营大脑知识库」（wiki_enabled，vector/
+# keyword/graph 关）+ 新建 wiki-qa 智能体 + 库内既有 KnowledgeQA 模型
+# Qwen3.8-27B-FP8-LCBD。历史（2026-10-12）：旧「纯Wiki资料知识库」8c0e68ab 在
+# jingboWiki 空间变更后对机队账号整体 403，双写通道曾静默死亡数周。
 # 单机临时换靶可设 STORE_KB_ID 环境变量覆盖 --kb 缺省（不换 AGENT/MODEL 元数据）。
-KB_ID = "fdfd899b-bc54-4ebd-9dee-f1b9853607c1"
-AGENT_ID = "e7393902-0ff8-47fa-a784-1e9532652107"
-MODEL_ID = "9990a970-be89-4a50-a786-e3ca5b8a810f"
+KB_ID = "15f54477-5f47-480d-873c-afd1f8d5fbda"
+AGENT_ID = "cd8cc1ee-786e-4491-873a-55f9e3421fea"
+MODEL_ID = "a5533b0e-6e53-4cdf-bb26-e8a56b861cfb"
 
 # 方案 B：单库多 tag。一条知识只挂一个 tag（PUT /knowledge/tags 的 updates 是 知识ID→单个标签ID）
 WIKI_TAGS = [("口径方法论", "#1890ff", 1), ("经营分析", "#52c41a", 2),
@@ -328,7 +329,7 @@ def write_kbmap(root: str, tags: dict | None = None) -> None:
             cur = json.load(open(p, encoding="utf-8"))
         except Exception:
             cur = {}
-    cur.update({"kb_id": KB_ID, "kb_name": "财务智脑知识库", "agent_id": AGENT_ID,
+    cur.update({"kb_id": KB_ID, "kb_name": "聚烯烃经营利润运营大脑知识库", "agent_id": AGENT_ID,
                 "model_id": MODEL_ID,
                 "knowledge_dir_to_tag": {d: t for d, k, t, *_ in DOMAINS if k == "knowledge" and t}})
     if tags is not None:
