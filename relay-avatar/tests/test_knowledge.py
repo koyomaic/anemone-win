@@ -227,3 +227,23 @@ def test_search_wiki_pure_mocked(cfg, storage, monkeypatch):
     assert hit.count("财务智脑支持钉钉") == 1     # 按 slug 去重
     assert sum("/wiki/search" in c for c in calls) == 2   # 逐词查询
     assert not any("knowledge-search" in c for c in calls)
+
+
+def test_wiki_creds_base_normalization(cfg, storage, tmp_path):
+    """JINGBOWIKI_BASE 允许写服务根或完整 API 前缀，内部统一补 /api/v1。"""
+    env = tmp_path / "jingbowiki.env"
+    cfg._p.setdefault("knowledge", {})["wiki_env"] = str(env)
+    k = Knowledge(cfg, storage)
+
+    env.write_text('export JINGBOWIKI_BASE="http://wiki.test"\n'
+                   'export JINGBOWIKI_EMAIL=e@x\n'
+                   'export JINGBOWIKI_PASSWORD=p\n'
+                   'export JINGBOWIKI_KB_ID=KB1\n', encoding="utf-8")
+    c = k._wiki_creds()
+    assert c["base"] == "http://wiki.test/api/v1" and c["kb"] == "KB1"
+
+    env.write_text('export JINGBOWIKI_BASE="http://wiki.test/api/v1/"\n'
+                   'export JINGBOWIKI_EMAIL=e@x\n'
+                   'export JINGBOWIKI_PASSWORD=p\n'
+                   'export JINGBOWIKI_KB_ID=KB1\n', encoding="utf-8")
+    assert k._wiki_creds()["base"] == "http://wiki.test/api/v1"

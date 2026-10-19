@@ -125,7 +125,10 @@ class Knowledge:
 
     def _wiki_creds(self) -> dict:
         w = load_wiki_env(self.wiki_env_file)
-        return {"base": w.get("JINGBOWIKI_BASE", "").rstrip("/"),
+        base = w.get("JINGBOWIKI_BASE", "").rstrip("/")
+        if base and not base.endswith("/api/v1"):
+            base += "/api/v1"
+        return {"base": base,
                 "email": w.get("JINGBOWIKI_EMAIL", ""),
                 "password": w.get("JINGBOWIKI_PASSWORD", ""),
                 "kb": str(self.cfg.get("knowledge", "wiki_kb_id", "")
