@@ -701,8 +701,9 @@ try:
 except OSError:
     pass
 kb = kb or w.get("JINGBOWIKI_KB_ID") or ""
+model = model or w.get("JINGBOWIKI_MODEL_ID") or ""
 if not kb:
-    raise SystemExit("目标库 ID 缺失（STORE_KB_ID / store KB_ID / JINGBOWIKI_KB_ID 均无）")
+    raise SystemExit("目标库 ID 缺失（STORE_KB_ID / store KB_ID / JINGBOWIKI_KB_ID 均无）——机队各成员靶库每机私有，需在本机 jingbowiki.env 配置")
 try:
     d = call("/knowledge-bases/" + kb, tok)
 except Exception as e:

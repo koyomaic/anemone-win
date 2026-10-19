@@ -52,19 +52,17 @@ UNMANAGED = {"secrets", "skills", "mcp", "memory", "tmp",
              # index/ 是台账自身（manifest.jsonl 由 export 生成，索引它会自我引用）；
              # work/ 是任务中间态，7 天即清，索引只会制造噪声
              "index", "work"}
-# 双写目标（2026-10-19 换绑）：「财务智脑知识库」fdfd899b 对机队账号 403（空间成员
-# 变更，与前靶 8c0e68ab 同模式；MODEL 9990a970、AGENT e7393902 一并消失）。现指向
-# 机队账号名下纯 Wiki 库「聚烯烃经营利润运营大脑知识库」（wiki_enabled，vector/
-# keyword/graph 关）+ KnowledgeQA 模型 Qwen3.8-27B-FP8-Z（上游 model.chambroad.com
-# :30131，JBJXT-YW-聚烯烃经营项目 key；业务方 2026-10-19 指定。注意与 VLLM 型同名
-# 槽位 2b131deb 是不同槽位，问答/合成只认 KnowledgeQA 型）。不配套自建智能体
-# （业务方 2026-10-19 决定；双写上传只用 KB_ID，问答需要时用库内 builtin 智能体）。
-# 历史（2026-10-12）：旧「纯Wiki资料知识库」8c0e68ab 在 jingboWiki 空间变更后对
-# 机队账号整体 403，双写通道曾静默死亡数周。
-# 单机临时换靶可设 STORE_KB_ID 环境变量覆盖 --kb 缺省（不换 AGENT/MODEL 元数据）。
-KB_ID = "15f54477-5f47-480d-873c-afd1f8d5fbda"
+# 双写靶库（2026-10-19 改为每机私有，不进 git）：机队各成员的 wiki 知识库各自申请、
+# 互不共用（此前 10-12 曾把单一靶库写死在这里，导致换绑会波及全机队；且旧靶
+# 「财务智脑知识库」fdfd899b 空间成员变更后对部分机队账号 403，双写静默死亡）。
+# 本机绑定放 jingbowiki.env（600，每机私有）：JINGBOWIKI_KB_ID / JINGBOWIKI_MODEL_ID
+# / JINGBOWIKI_AGENT_ID（可空）/ JINGBOWIKI_KB_NAME；或环境变量 STORE_KB_ID 等覆盖。
+# 解析顺序：env（STORE_*）> jingbowiki.env（JINGBOWIKI_*）> 下方常量（机队无默认，
+# 保持为空）。未配置时 sync 明确报错，绝不静默写入库。
+# 模型槽位注意：问答/合成只认 type=KnowledgeQA 的槽位，与同名 VLLM 型是不同槽位。
+KB_ID = ""
 AGENT_ID = ""
-MODEL_ID = "1fe3f219-3214-4c94-940d-910d75d8ada6"
+MODEL_ID = ""
 
 # 方案 B：单库多 tag。一条知识只挂一个 tag（PUT /knowledge/tags 的 updates 是 知识ID→单个标签ID）
 WIKI_TAGS = [("口径方法论", "#1890ff", 1), ("经营分析", "#52c41a", 2),
@@ -332,8 +330,9 @@ def write_kbmap(root: str, tags: dict | None = None) -> None:
             cur = json.load(open(p, encoding="utf-8"))
         except Exception:
             cur = {}
-    cur.update({"kb_id": KB_ID, "kb_name": "聚烯烃经营利润运营大脑知识库", "agent_id": AGENT_ID,
-                "model_id": MODEL_ID,
+    kb, agent, model, kb_name = resolve_wiki_ids()
+    cur.update({"kb_id": kb, "kb_name": kb_name or cur.get("kb_name", ""),
+                "agent_id": agent, "model_id": model,
                 "knowledge_dir_to_tag": {d: t for d, k, t, *_ in DOMAINS if k == "knowledge" and t}})
     if tags is not None:
         cur["tags"] = tags
@@ -1034,6 +1033,27 @@ def _wiki_creds() -> tuple[str, str]:
             os.environ.get("JINGBOWIKI_PASSWORD") or pw)
 
 
+def _wiki_env_val(key: str) -> str:
+    """读 jingbowiki.env 里的单个键（每机私有配置：靶库/模型/智能体/库名）。"""
+    p = os.environ.get("JINGBOWIKI_ENV", WIKI_ENV)
+    if os.path.isfile(p):
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def resolve_wiki_ids() -> tuple[str, str, str, str]:
+    """(kb, agent, model, kb_name)：env STORE_* > jingbowiki.env JINGBOWIKI_* > 常量。"""
+    return (os.environ.get("STORE_KB_ID") or _wiki_env_val("JINGBOWIKI_KB_ID") or KB_ID,
+            os.environ.get("STORE_AGENT_ID") or _wiki_env_val("JINGBOWIKI_AGENT_ID") or AGENT_ID,
+            os.environ.get("STORE_MODEL_ID") or _wiki_env_val("JINGBOWIKI_MODEL_ID") or MODEL_ID,
+            os.environ.get("STORE_KB_NAME") or _wiki_env_val("JINGBOWIKI_KB_NAME"))
+
+
 def _wiki_login() -> str:
     import urllib.request
     email, pw = _wiki_creds()
@@ -1101,7 +1121,10 @@ def cmd_sync(a) -> None:
     conn = connect()
     cur = conn.cursor()
     tags = _load_tags(a)
-    kb = a.kb
+    kb = a.kb or resolve_wiki_ids()[0]
+    if not kb:
+        raise SystemExit("本机未配置双写靶库：在 jingbowiki.env 设 JINGBOWIKI_KB_ID"
+                         "（或环境变量 STORE_KB_ID）。机队各成员知识库各自申请，无默认值。")
     tok = _wiki_login()
 
     if a.action == "tags":  # 建缺失的 tag 并写回 kb-map.json
@@ -1326,7 +1349,8 @@ def main() -> None:
 
     p = sub.add_parser("sync", help="jingboWiki 同步")
     p.add_argument("action", choices=("tags", "scan", "push", "verify", "backfill"))
-    p.add_argument("--kb", default=os.environ.get("STORE_KB_ID", KB_ID))
+    p.add_argument("--kb", default=None,
+                   help="缺省按机解析：STORE_KB_ID env > jingbowiki.env 的 JINGBOWIKI_KB_ID")
     p.set_defaults(f=cmd_sync)
 
     a = ap.parse_args()
