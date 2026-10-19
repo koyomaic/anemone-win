@@ -162,10 +162,13 @@ def test_backup_version_skips_oversize_and_runtime(tmp_path):
     other = {"id": 9, "workdir": str(tmp_path / "tasks" / "9"),
              "user": "崔成东", "finished_at": time.time()}
 
-    # 1) 小文件 + 业务目录 → 正常备份
+    # 1) 小文件 + 业务目录 → 备份进归档区，不污染正式目录
     _write(tmp_path, "tasks/9/.result/shared/report/a.md", "v1")
     p, why = ws.backup_version(other, "shared/report/a.md")
     assert p and why == "" and os.path.isfile(p)
+    assert "/shared/.archive/bak/conflict/T9/report/a.md.bak-崔成东-" in p
+    prod_dir = tmp_path / "shared" / "report"
+    assert not prod_dir.exists() or not any(f.startswith("a.md.bak-") for f in os.listdir(prod_dir))
 
     # 2) 超过 backup_max_mb → 跳过并给出原因
     big = tmp_path / "tasks/9/.result/shared/report/big.bin"

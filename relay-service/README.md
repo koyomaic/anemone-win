@@ -157,7 +157,7 @@ team_agent.py approve 42 --decision approve   # pending_approval（高危拦截�
 1. **事前防碰**：提交时声明 `targets`，与在途任务目录重叠 → 409 预警，人决定是否 force；
 2. **物理隔离**：每任务独立工作目录 + 独立 XDG 数据目录（会话记录互不污染，支撑 --resume）；
 3. **事后兜底**：完成时扫描共享区基线差异；同一文件被两个任务改动 → 后完成者标记
-   `conflict`，先完成者版本自动备份为 `<文件>.bak-<用户>-HHMM`，绝不静默覆盖。
+   `conflict`，先完成者版本自动备份到 `shared/.archive/bak/conflict/T<任务号>/<原相对路径>.bak-<用户>-HHMM`，绝不静默覆盖，也不污染正式目录。
 
 ## 测试
 

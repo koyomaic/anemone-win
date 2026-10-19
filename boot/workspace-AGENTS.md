@@ -62,6 +62,7 @@ report : <YYYYMMDD>_<taskId>_<topic>[-<variant>]_v<N>.<ext>
 
 - **不要静默覆盖他人文件**；改动已有共享文件前先保留原版本
 - 备份/中间产物写 `shared/work/` 或 `.archive/`，**禁止**在正式目录留 `.bak-*`/`~`/`.tmp`/`旧版备份`
+- store 防御：正式目录的 `.bak`/`.old`/`.tmp` 即使被 `store scan/add` 登记，也会强制标为 `archive/backup/skip`；`store sync` 会再次跳过备份/临时件，绝不上传 jingboWiki
 - **禁止**同一内容出中英双份目录或双份文件（历史上 `20260921能源局座谈会/` 与 `20260921_energy_meeting/`、`jingbo-data-api-能力清单.md` 与 `-capability-list.md` 都是这么来的）；中文为准，需要英文名时在台账记 alias
 - 任务产生的可复用经验写入 `shared/knowledge/<tag域>/` 对应主题目录
 - **知识归档双写（硬性）**：凡归档进 `shared/knowledge/` 的知识文件（报告/文档/摘要/经验，无论任务产出还是用户上传），**必须在同一任务内经 `jingbowiki-api` 同步上传 jingboWiki**（权威源，全员可检索）。双写是归档动作的一部分，任务描述里"只改动 shared/knowledge/ 下文件""不要修改其他文件"之类范围限定**不豁免**本条；仅当任务明确写"不要上传 jingboWiki"时才跳过

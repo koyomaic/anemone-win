@@ -229,7 +229,11 @@ class Workspace:
             return False
 
     def backup_version(self, other_task: dict, rel_file: str) -> tuple[str, str]:
-        """把 other_task 产出的 rel_file 版本备份为 <文件>.bak-<用户>-HHMM，绝不静默覆盖。
+        """把 other_task 产出的 rel_file 版本备份到归档区，绝不静默覆盖。
+
+        备份路径：`shared/.archive/bak/conflict/T<任务号>/<原相对路径>.bak-<用户>-HHMM`。
+        不再落在正式目录：旧 `<文件>.bak-<用户>-HHMM` 会污染 report/knowledge，
+        被 store 台账误当正式产出，甚至进入 jingboWiki 同步候选。
 
         返回 (备份路径, 跳过原因)；路径为空即未备份，原因写进 conflicts 供人核查。
         两道护栏——历史事故：无上限的 copy2 让一个声明宽 target 的任务把 venv/models
@@ -247,9 +251,12 @@ class Workspace:
                         f"{self.cfg.backup_max_mb:g}MB，已跳过拷贝，需人工核查")
         if self._in_runtime_dir(rel_file):
             return "", "位于运行时目录（虚拟环境/模型缓存/台账等），不参与冲突备份"
-        dst_file = os.path.join(self.cfg.workspace_root, rel_file)
-        os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+        inner = rel_file[len("shared/"):] if rel_file.startswith("shared/") else rel_file
+        user = re.sub(r"[^\w.\-]+", "_", str(other_task.get("user") or "")) or "unknown"
         hm = time.strftime("%H%M", time.localtime(other_task["finished_at"] or time.time()))
-        dst = f"{dst_file}.bak-{other_task['user']}-{hm}"
+        dst = os.path.join(self.cfg.workspace_root, "shared", ".archive", "bak",
+                           "conflict", f"T{other_task.get('id', 0)}",
+                           f"{inner}.bak-{user}-{hm}")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
         return dst, ""

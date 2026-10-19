@@ -111,8 +111,13 @@ def test_conflict_keeps_both_versions(relay, member):
     assert "version-two" in disk, "后写入版本必须在磁盘上"
 
     # 先完成者的版本必须有备份（若 agent 恰好追加而非覆盖，磁盘上也可能同时保留，均可接受）
-    baks = [f for f in os.listdir(shared) if re.match(r"conflict\.txt\.bak-tester-\d{4}", f)]
-    v1_in_backup = baks and any("version-one" in open(os.path.join(shared, b)).read() for b in baks)
+    bak_root = os.path.join(shared, ".archive", "bak", "conflict")
+    baks = []
+    for dp, _, fns in os.walk(bak_root):
+        for f in fns:
+            if re.match(r"conflict\.txt\.bak-tester-\d{4}", f):
+                baks.append(os.path.join(dp, f))
+    v1_in_backup = baks and any("version-one" in open(b).read() for b in baks)
     assert v1_in_backup or "version-one" in disk, "version-one 不能丢（磁盘或备份至少一处）"
     if "version-one" not in disk:
         assert v1_in_backup, f"覆盖写入场景下必须有备份: {os.listdir(shared)}"

@@ -72,6 +72,25 @@ WIKI_TAGS = [("口径方法论", "#1890ff", 1), ("经营分析", "#52c41a", 2),
 # 正式目录里出现即视为违规（备份/临时产物必须进 .archive/ 或 work/）
 BAD_NAME = re.compile(r"(\.bak|\.old|\.tmp|~$|\.swp$)", re.I)
 BAD_CHAR = re.compile(r"[ #%&]")
+BACKUP_STATUS = "backup"
+
+
+def is_backup_rel(rel: str) -> bool:
+    """台账路径是否属备份/临时件：.archive/work 或文件名命中 BAD_NAME。"""
+    return rel.startswith((".archive/", "work/")) or bool(BAD_NAME.search(os.path.basename(rel)))
+
+
+def is_production_backup(rel: str) -> bool:
+    """正式目录里的备份/临时件；这类文件不得按 report/knowledge 参与 wiki 同步。"""
+    return not rel.startswith((".archive/", "work/")) and bool(BAD_NAME.search(os.path.basename(rel)))
+
+
+def classify_backup(rel: str, kind: str, status: str, wiki_status: str, note: str):
+    """生产目录备份件强制降级为 archive/backup/skip，防止误入 wiki 同步。"""
+    if not is_production_backup(rel):
+        return kind, status, wiki_status, note
+    return ("archive", BACKUP_STATUS, "skip",
+            note or "生产目录备份件：自动标 archive/backup/skip，待移入 .archive")
 
 DDL = [
     "CREATE EXTENSION IF NOT EXISTS pg_trgm",
@@ -712,19 +731,26 @@ def cmd_scan(a) -> None:
     src = os.path.abspath(a.src or a.root)
     conn = connect()
     cur = conn.cursor()
-    n = skip = 0
+    n = skip = backup_marked = 0
     for abspath, rel in walk_files(src):
         if a.pattern and not re.search(a.pattern, rel):
             skip += 1
             continue
+        # --prefix 用于存量盘点：旧路径带 shared/ 前缀入库，不与迁移后的 store 路径撞 UNIQUE
+        key = f"{a.prefix.rstrip('/')}/{rel}" if a.prefix else rel
         kind = a.kind or infer_kind(rel)
+        status = a.status
+        wiki_status = ""
+        note = ""
+        kind, status, wiki_status, note = classify_backup(key, kind, status, wiki_status, note)
+        if is_production_backup(key):
+            backup_marked += 1
         if a.skip_archive and kind == "archive":
             skip += 1
             continue
-        # --prefix 用于存量盘点：旧路径带 shared/ 前缀入库，不与迁移后的 store 路径撞 UNIQUE
-        key = f"{a.prefix.rstrip('/')}/{rel}" if a.prefix else rel
         try:
-            upsert_file(cur, src, abspath, key, kind, a.status, domain=a.domain or "",
+            upsert_file(cur, src, abspath, key, kind, status, domain=a.domain or "",
+                        note=note, wiki_status=wiki_status,
                         infer_rel=rel, root_name=a.root_name)
             n += 1
         except OSError as e:
@@ -732,7 +758,7 @@ def cmd_scan(a) -> None:
     write_today(a.root)
     conn.close()
     out({"ok": True, "src": src, "prefix": a.prefix or None, "root_name": a.root_name,
-         "indexed": n, "skipped": skip, "status": a.status})
+         "indexed": n, "skipped": skip, "backup_marked": backup_marked, "status": a.status})
 
 
 def cmd_add(a) -> None:
@@ -741,10 +767,14 @@ def cmd_add(a) -> None:
     p = os.path.abspath(a.path)
     rel = os.path.relpath(p, a.root) if p.startswith(a.root) else a.rel
     kind = a.kind or infer_kind(rel)
-    upsert_file(cur, a.root, p, rel, kind, a.status, domain=a.domain or "",
-                note=a.note or "", sender_id=a.sender or "",
+    status = a.status
+    wiki_status = a.wiki_status or ""
+    note = a.note or ""
+    kind, status, wiki_status, note = classify_backup(rel, kind, status, wiki_status, note)
+    upsert_file(cur, a.root, p, rel, kind, status, domain=a.domain or "",
+                note=note, sender_id=a.sender or "",
                 task_id=a.task, sensitivity=a.sensitivity or "",
-                authority=a.authority or "", wiki_status=a.wiki_status or "",
+                authority=a.authority or "", wiki_status=wiki_status,
                 wiki_tag=a.wiki_tag or "")
     cur.execute("SELECT id,path FROM store_files WHERE path=%s", (rel,))
     r = cur.fetchone()
@@ -902,20 +932,42 @@ def cmd_doctor(a) -> None:
 
     rep["db_rows"] = len(dbrows)
     rep["disk_files"] = len(disk)
-    rep["orphan_db"] = sorted(f"{r}:{p}" for (r, p) in set(dbrows) - disk)[:50]
-    rep["orphan_disk"] = sorted(f"{r}:{p}" for (r, p) in disk - set(dbrows))[:50]
+    orphan_db_set = set(dbrows) - disk
+    orphan_disk_set = disk - set(dbrows)
+    rep["orphan_db_count"] = len(orphan_db_set)
+    rep["orphan_disk_count"] = len(orphan_disk_set)
+    rep["orphan_db"] = sorted(f"{r}:{p}" for (r, p) in orphan_db_set)[:50]
+    rep["orphan_disk"] = sorted(f"{r}:{p}" for (r, p) in orphan_disk_set)[:50]
 
     bad_name, bad_char = [], []
+    bad_bytes = 0
+    bad_by_top: dict[str, int] = {}
     for rn, rel in sorted(disk):
         if rn == "store" and (rel.startswith(".archive/") or rel.startswith("work/")):
             continue
         fn = os.path.basename(rel)
         if BAD_NAME.search(fn):
             bad_name.append(f"{rn}:{rel}")
+            top = rel.split("/")[0]
+            bad_by_top[top] = bad_by_top.get(top, 0) + 1
+            try:
+                bad_bytes += os.path.getsize(os.path.join(bases[rn], rel))
+            except OSError:
+                pass
         if BAD_CHAR.search(fn):
             bad_char.append(f"{rn}:{rel}")
     rep["violations"] = {"bak_in_production_dirs": bad_name[:50],
-                         "bad_chars": bad_char[:50], "count": len(bad_name) + len(bad_char)}
+                         "bad_name_total": len(bad_name),
+                         "bad_name_bytes": bad_bytes,
+                         "bad_name_by_top": bad_by_top,
+                         "bad_chars": bad_char[:50],
+                         "count": len(bad_name) + len(bad_char)}
+
+    cur.execute("""SELECT count(*) n FROM store_files
+                   WHERE fname LIKE %s
+                     AND (archived=FALSE OR wiki_status<>'skip'
+                          OR status NOT IN ('archived','removed','backup'))""", ("%.bak%",))
+    rep["active_backup_rows"] = cur.fetchone()["n"]
 
     cur.execute("""SELECT sha256,count(*) n,array_agg(path ORDER BY id) paths
                    FROM store_files WHERE sha256<>'' AND archived=FALSE
@@ -944,8 +996,9 @@ def cmd_doctor(a) -> None:
     rep["by_kind"] = {r["kind"]: {"files": r["n"], "bytes": r["bytes"]} for r in cur.fetchall()}
 
     conn.close()
-    problems = (len(rep["orphan_db"]) + len(rep["orphan_disk"])
-                + rep["violations"]["count"] + len(rep["duplicate_sha_groups"]))
+    problems = (rep["orphan_db_count"] + rep["orphan_disk_count"]
+                + rep["violations"]["count"] + len(rep["duplicate_sha_groups"])
+                + rep["active_backup_rows"])
     rep["ok"] = problems == 0
     rep["problem_count"] = problems
     out(rep)
@@ -1145,7 +1198,10 @@ def cmd_sync(a) -> None:
                           sender_id,task_id,sensitivity
                    FROM store_files
                    WHERE kind='knowledge' AND archived=FALSE ORDER BY id""")
-    local = [dict(r) for r in cur.fetchall()]
+    local_all = [dict(r) for r in cur.fetchall()]
+    # 防御性过滤：即使台账漏标 archived/skip，备份/临时件也绝不进入 wiki 同步。
+    backup_local = [r for r in local_all if is_backup_rel(r["path"])]
+    local = [r for r in local_all if not is_backup_rel(r["path"])]
     remote = _wiki_rows(tok, kb)
     by_name = {r.get("file_name"): r for r in remote}
 
@@ -1169,6 +1225,8 @@ def cmd_sync(a) -> None:
         conn.close()
         return out({"kb": kb, "local_knowledge": len(local), "wiki_items": len(remote),
                     "missing": miss, "present": have,
+                    "backup_skipped": len(backup_local),
+                    "backup_skipped_paths": [r["path"] for r in backup_local[:50]],
                     "need_tag_backfill": [h["path"] for h in have if not h["tag_ok"]]})
 
     if a.action == "push":
