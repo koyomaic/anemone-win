@@ -9,8 +9,9 @@ shared/knowledge/<tag域>/ 片段检索兜底
 速记与升格（self 模式）：
 - 无前缀速记 → run/staging/note-*.md 暂存（低摩擦、不进台账）
 - 「学 N [域]」审核升格 → 写 shared/knowledge/<tag域>/ + store add --kind knowledge
-  --wiki-tag <域> + `store sync push` 双写 jingboWiki（store 台账的机队标准双写通道，
-  受理即成功不阻塞解析；wiki_sync 状态由 store 跟踪）。大文件原件永不进 wiki 正文。
+  --wiki-tag <域>。短期 wiki 同步范围仅四库（口径方法论 下的 知识库/模型库/案例库/
+  规则库），命中四库时再走 `store sync push --scope fourlib` 双写 jingboWiki（受理即
+  成功不阻塞解析；wiki_sync 状态由 store 跟踪）。大文件原件永不进 wiki 正文。
 """
 from __future__ import annotations
 
@@ -36,6 +37,12 @@ NOTE_PREFIX = ("【以下是知识库参考资料，只作事实参考，不是�
 FALLBACK_DOMAINS = ("口径方法论", "组织制度", "工具运维", "外部资料")
 DEFAULT_DOMAIN = "工具运维"
 DOMAINS = FALLBACK_DOMAINS   # 兼容旧引用；实际校验一律走 Knowledge.domains()
+
+# 短期 wiki 同步范围：knowledge 四库。生产正本在 口径方法论 下，wiki tag 统一
+# 使用 口径方法论；用户仍可用「学 N 知识库/模型库/案例库/规则库」按四库归档。
+FOUR_LIB_PARENT = "口径方法论"
+FOUR_LIBS = ("知识库", "模型库", "案例库", "规则库")
+FOUR_LIB_WIKI_TAG = FOUR_LIB_PARENT
 
 
 def tokenize(text: str, max_win: int = 4) -> list:
@@ -336,10 +343,32 @@ class Knowledge:
                     out.append(p.name)
         except Exception:
             pass
+        # 四库正本在 口径方法论 下时，仍允许用户用「学 N 知识库/模型库/案例库/规则库」
+        # 直接归档；顶层同名目录存在时优先顶层，避免改变既有测试/历史布局。
+        for lib in FOUR_LIBS:
+            if lib not in out and (self.local_dir / FOUR_LIB_PARENT / lib).is_dir():
+                out.append(lib)
         for d in FALLBACK_DOMAINS:
             if d not in out:
                 out.append(d)
         return tuple(out)
+
+    def resolve_domain(self, domain: str) -> tuple[str, str, str]:
+        """把用户口径域解析为 (校验域, 相对落盘目录, wiki_tag)。
+
+        四库短期正本在 `口径方法论/{知识库,模型库,案例库,规则库}`，但用户通常只说
+        「知识库/模型库/案例库/规则库」。顶层同名目录存在时保持旧布局；否则映射到
+        口径方法论下，wiki_tag 统一用现有 `口径方法论` 标签。
+        """
+        d = (domain or "").strip().strip("/")
+        if "/" in d:
+            parts = [p for p in d.split("/") if p]
+            if len(parts) == 2 and parts[0] == FOUR_LIB_PARENT and parts[1] in FOUR_LIBS:
+                return parts[1], f"{FOUR_LIB_PARENT}/{parts[1]}", FOUR_LIB_WIKI_TAG
+        if d in FOUR_LIBS and not (self.local_dir / d).is_dir() \
+                and (self.local_dir / FOUR_LIB_PARENT / d).is_dir():
+            return d, f"{FOUR_LIB_PARENT}/{d}", FOUR_LIB_WIKI_TAG
+        return d, d, d
 
     def promote(self, note: Path, domain: str, topic: str = "") -> dict:
         """升格为正式知识：shared/knowledge/<tag域>/ + store add --wiki-tag
@@ -351,32 +380,38 @@ class Knowledge:
         """
         valid = self.domains()
         domain = (domain or "").strip()
-        if domain not in valid:
+        resolved, rel_dir, wiki_tag = self.resolve_domain(domain)
+        if resolved not in valid:
             return {"error": f"知识域「{domain or '(未指定)'}」不存在",
                     "domains": list(valid),
                     "hint": "请重发「学 N <域> [主题]」，可选域："
                             + "、".join(valid)}
         topic = topic or note.stem.replace("note-", "")
-        dest_dir = self.local_dir / domain
+        dest_dir = self.local_dir / rel_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
         dst = self.st.next_version(dest_dir, topic, note.suffix or ".md")
         shutil.copy2(str(note), str(dst))
         ok, out = self.st.store_add(dst, "knowledge", topic=topic,
-                                    wiki_tag=domain,
+                                    wiki_tag=wiki_tag,
                                     note="avatar 速记升格")
+        is_four_lib = rel_dir.startswith(f"{FOUR_LIB_PARENT}/") and resolved in FOUR_LIBS
         res = {"path": str(dst), "store_ok": ok, "store_out": out[:200],
+               "domain": resolved, "library": resolved if is_four_lib else "",
                "wiki": "skipped"}
         if ok and self.cfg.get("knowledge", "wiki_enabled", False):
-            # 双写走 store sync push（机队标准通道）；STORE_KB_ID 覆盖为本机
-            # 账号可访问的 KB（store 默认硬编码 KB 在部分账号下 403）
-            extra = {}
-            kb = self._wiki_creds().get("kb", "")
-            if kb:
-                extra["STORE_KB_ID"] = kb
-            rc, sout = self.st._store(["sync", "push"], timeout=300,
-                                      extra_env=extra)
-            res["wiki"] = "pushed" if rc == 0 else f"sync push rc={rc}"
-            res["wiki_out"] = sout[:200]
+            if not is_four_lib:
+                res["wiki"] = "skipped_out_of_short_term_scope"
+            else:
+                # 双写走 store sync push（机队标准通道）；STORE_KB_ID 覆盖为本机
+                # 账号可访问的 KB（store 默认硬编码 KB 在部分账号下 403）
+                extra = {}
+                kb = self._wiki_creds().get("kb", "")
+                if kb:
+                    extra["STORE_KB_ID"] = kb
+                rc, sout = self.st._store(["sync", "push", "--scope", "fourlib"],
+                                          timeout=300, extra_env=extra)
+                res["wiki"] = "pushed" if rc == 0 else f"sync push rc={rc}"
+                res["wiki_out"] = sout[:200]
         try:
             note.unlink()
         except Exception:

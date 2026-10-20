@@ -623,9 +623,12 @@ class Avatar:
                     s, f"⚠️ {r['error']}"
                        + (f"\n\n{r['hint']}" if r.get("hint") else ""))
                 return
-            wiki = ("已双写 jingboWiki（受理即成功，解析后台进行）"
-                    if r.get("wiki") == "pushed"
-                    else f"wiki 双写未执行（{r.get('wiki')}）")
+            if r.get("wiki") == "pushed":
+                wiki = "已双写 jingboWiki（受理即成功，解析后台进行）"
+            elif r.get("wiki") == "skipped_out_of_short_term_scope":
+                wiki = "短期 wiki 同步范围仅四库，本条已本地归档并登记，未上传"
+            else:
+                wiki = f"wiki 双写未执行（{r.get('wiki')}）"
             store = "✓" if r.get("store_ok") else \
                 "✗ " + str(r.get("store_out", ""))[:80]
             self._notify_session(
@@ -1034,6 +1037,7 @@ class Avatar:
             return
         resume = self.sess.resume_candidate(s)
         desc = self._with_chain_digest(s, desc, resume)
+        desc += self._knowledge_intake_rules(desc, uid)
         # resume 时上一轮 desc 已带完整铁律且在重放的 transcript 里，只发精简版去重
         r = self.exec_relay.submit(desc + self._relay_marker_rules(s, brief=bool(resume)),
                                    resume_from=resume, uid=uid,
@@ -1722,6 +1726,43 @@ class Avatar:
                 "追问里的指代；**不要**把它当新任务重做一遍，也不要重复投递其中"
                 "提到的文件。\n"
                 f"{digest}\n\n---\n\n{desc}")
+
+    def _knowledge_intake_rules(self, desc: str, uid: str = "") -> str:
+        """按发起人原话追加四库知识入库/不上传边界，避免 relay agent 只靠 AGENTS 猜测。"""
+        t = desc or ""
+        if "【四库知识入库铁律" in t or "【知识入库边界" in t:
+            return ""
+        neg = ("不要上传 jingbowiki", "不要上传jingbowiki", "不要上传wiki",
+               "不同步wiki", "仅本地归档", "只本地归档", "不进wiki",
+               "不做知识入库", "不要入库")
+        pos = ("四库入库", "知识库入库", "模型库入库", "案例库入库", "规则库入库",
+               "归档知识并同步wiki", "上传知识库", "同步wiki", "知识入库",
+               "上传jingbowiki", "上传 jingbowiki")
+        low = t.lower()
+        if any(k in low for k in neg):
+            return (
+                "\n\n---\n【知识入库边界｜本任务不上传 wiki】\n"
+                "· 发起人明确要求不同步 wiki：只生成/本地归档，不执行 `store sync push`。\n"
+                "· 如写入 `shared/knowledge/`，执行 `store add <path> --kind knowledge "
+                "--wiki-status skip --note 用户要求不上传wiki`。\n"
+            )
+        if not any(k in low for k in pos):
+            return ""
+        sender = str(uid or "").strip() or "<发起人ID>"
+        return (
+            "\n\n---\n【四库知识入库铁律｜短期】\n"
+            "· 短期只同步 `shared/knowledge/口径方法论/{知识库,模型库,案例库,规则库}/` "
+            "的现行版 `.md`；`shared/report`、`shared/data` 与其他 knowledge 暂不同步 wiki。\n"
+            "· 归属：理论框架→知识库；算法/数学模型→模型库；分析路径/得失→案例库；"
+            "业务边界/限制→规则库。\n"
+            "· 文件名沿用 `KB-/MD-/CS-/R-` 前缀、版本号和日期；改版用 vN+1，旧版移入对应"
+            "「归档-」目录，并 `store set <id> --archived true --wiki-status skip`。\n"
+            "· 落盘后执行：`store add <path> --kind knowledge --wiki-tag 口径方法论 "
+            f"--sender {sender} --task T<本任务号> --topic <主题>`，再执行 "
+            "`store sync push --scope fourlib`；受理即成功，不等待解析。\n"
+            "· 结果必须回报：本地路径、store id、wiki knowledge_id、归属库。若含敏感、"
+            "未脱敏或一次性数据，不上传 wiki，改为 `store add ... --wiki-status skip` 并说明原因。\n"
+        )
 
     def _relay_marker_rules(self, s: dict, brief: bool = False) -> str:
         """附在 relay 任务描述末尾的标记铁律：发起人身份 + 代投/代建通道。

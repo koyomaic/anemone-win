@@ -92,6 +92,74 @@ def classify_backup(rel: str, kind: str, status: str, wiki_status: str, note: st
     return ("archive", BACKUP_STATUS, "skip",
             note or "生产目录备份件：自动标 archive/backup/skip，待移入 .archive")
 
+
+# 短期 wiki 同步范围：只同步 knowledge 四库现行版，report/data 与其他 knowledge
+# 暂不进入 jingboWiki。四库正本位于 口径方法论 下，wiki tag 短期统一用 口径方法论。
+FOUR_LIB_PARENT = "口径方法论"
+FOUR_LIBS = ("知识库", "模型库", "案例库", "规则库")
+FOUR_LIB_PREFIXES = tuple(f"knowledge/{FOUR_LIB_PARENT}/{lib}/" for lib in FOUR_LIBS)
+STALE_FOUR_LIB_PREFIXES = tuple(f"knowledge/{lib}/" for lib in FOUR_LIBS)
+ARCHIVE_DIR_PREFIX = "归档-"
+WIKI_TEXT_EXT = {".md", ".txt"}
+WIKI_MAX_BYTES = 5 * 1024 * 1024
+
+
+def is_four_lib_rel(rel: str) -> bool:
+    """是否属短期允许同步的四库正本路径。"""
+    return rel.startswith(FOUR_LIB_PREFIXES)
+
+
+def four_lib_of(rel: str) -> str:
+    for lib in FOUR_LIBS:
+        if rel.startswith(f"knowledge/{FOUR_LIB_PARENT}/{lib}/"):
+            return lib
+    return ""
+
+
+def is_stale_four_lib_rel(rel: str) -> bool:
+    """旧顶层四库路径；磁盘已迁移到 口径方法论 下，不得再参与同步。"""
+    return rel.startswith(STALE_FOUR_LIB_PREFIXES)
+
+
+def is_archived_knowledge_rel(rel: str) -> bool:
+    """knowledge 下的归档目录（已废止旧版、副本分叉留档等）。"""
+    if not rel.startswith("knowledge/"):
+        return False
+    return any(part.startswith(ARCHIVE_DIR_PREFIX)
+               for part in rel.split("/")[:-1])
+
+
+def classify_knowledge_archive(rel: str, kind: str, status: str,
+                               wiki_status: str, note: str,
+                               archived: bool | None = None):
+    """knowledge 归档目录强制 archived/skip，防止旧版或副本进入 wiki。"""
+    if kind != "knowledge" or not is_archived_knowledge_rel(rel):
+        return kind, status, wiki_status, note, archived
+    return (kind, "archived", "skip",
+            note or "knowledge 归档目录：自动标 archived/skip，不参与 wiki 同步",
+            True)
+
+
+def wiki_sync_eligible(row: dict) -> tuple[bool, str]:
+    """四库短期同步闸门：文本、大小、敏感度与路径白名单。"""
+    path = row.get("path", "")
+    if not is_four_lib_rel(path):
+        return False, "out_of_four_lib_scope"
+    if is_archived_knowledge_rel(path) or is_stale_four_lib_rel(path):
+        return False, "archived_or_stale"
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in WIKI_TEXT_EXT:
+        return False, "unsupported_ext"
+    try:
+        if int(row.get("size") or 0) > WIKI_MAX_BYTES:
+            return False, "too_large"
+    except (TypeError, ValueError):
+        return False, "bad_size"
+    if str(row.get("sensitivity") or "").lower() == "sensitive":
+        return False, "sensitive"
+    return True, ""
+
+
 DDL = [
     "CREATE EXTENSION IF NOT EXISTS pg_trgm",
     """CREATE TABLE IF NOT EXISTS store_files(
@@ -627,7 +695,7 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
                 task_id=None, sensitivity: str = "", authority: str = "",
                 wiki_status: str = "", hash_it: bool = True,
                 infer_rel: str = "", root_name: str = "store",
-                wiki_tag: str = "") -> str:
+                wiki_tag: str = "", archived: bool | None = None) -> str:
     st = os.stat(abspath)
     fn = os.path.basename(rel)
     parsed = parse_fname(fn)
@@ -677,9 +745,10 @@ def upsert_file(cur, root: str, abspath: str, rel: str, kind: str, status: str,
                  parsed.get("task_id", task_id) if parsed else task_id,
                  parsed.get("version") or 1, st.st_size, sha, status, sens,
                   authority or ("jingbowiki" if kind == "knowledge" else "local"),
-                  wiki_tag or (dom if kind == "knowledge" else ""),
-                  wiki_status or ("skip" if kind == "archive" else "none"),
-                  kind == "archive", note, root_name, now, now))
+                   wiki_tag or (dom if kind == "knowledge" else ""),
+                   wiki_status or ("skip" if kind == "archive" else "none"),
+                   kind == "archive" if archived is None else archived,
+                   note, root_name, now, now))
     return rel
 
 
@@ -742,7 +811,10 @@ def cmd_scan(a) -> None:
         status = a.status
         wiki_status = ""
         note = ""
+        archived = None
         kind, status, wiki_status, note = classify_backup(key, kind, status, wiki_status, note)
+        kind, status, wiki_status, note, archived = classify_knowledge_archive(
+            key, kind, status, wiki_status, note, archived)
         if is_production_backup(key):
             backup_marked += 1
         if a.skip_archive and kind == "archive":
@@ -751,7 +823,7 @@ def cmd_scan(a) -> None:
         try:
             upsert_file(cur, src, abspath, key, kind, status, domain=a.domain or "",
                         note=note, wiki_status=wiki_status,
-                        infer_rel=rel, root_name=a.root_name)
+                        infer_rel=rel, root_name=a.root_name, archived=archived)
             n += 1
         except OSError as e:
             print(f"WARN 跳过 {rel}: {e}", file=sys.stderr)
@@ -770,12 +842,15 @@ def cmd_add(a) -> None:
     status = a.status
     wiki_status = a.wiki_status or ""
     note = a.note or ""
+    archived = None
     kind, status, wiki_status, note = classify_backup(rel, kind, status, wiki_status, note)
+    kind, status, wiki_status, note, archived = classify_knowledge_archive(
+        rel, kind, status, wiki_status, note, archived)
     upsert_file(cur, a.root, p, rel, kind, status, domain=a.domain or "",
                 note=note, sender_id=a.sender or "",
                 task_id=a.task, sensitivity=a.sensitivity or "",
                 authority=a.authority or "", wiki_status=wiki_status,
-                wiki_tag=a.wiki_tag or "")
+                wiki_tag=a.wiki_tag or "", archived=archived)
     cur.execute("SELECT id,path FROM store_files WHERE path=%s", (rel,))
     r = cur.fetchone()
     conn.close()
@@ -986,6 +1061,36 @@ def cmd_doctor(a) -> None:
                    WHERE kind='knowledge' AND archived=FALSE GROUP BY wiki_status ORDER BY n DESC""")
     rep["wiki_status"] = {r["wiki_status"]: r["n"] for r in cur.fetchall()}
 
+    cur.execute("""SELECT path,wiki_status,archived,wiki_page_id FROM store_files
+                   WHERE kind='knowledge'
+                     AND (path LIKE 'knowledge/口径方法论/%'
+                          OR path LIKE 'knowledge/知识库/%'
+                          OR path LIKE 'knowledge/模型库/%'
+                          OR path LIKE 'knowledge/案例库/%'
+                          OR path LIKE 'knowledge/规则库/%')""")
+    four_rows = [dict(r) for r in cur.fetchall()]
+    four_canonical = [r for r in four_rows
+                      if is_four_lib_rel(r["path"]) and not is_archived_knowledge_rel(r["path"])]
+    four_archived = [r for r in four_rows
+                     if is_four_lib_rel(r["path"]) and is_archived_knowledge_rel(r["path"])]
+    four_stale = [r for r in four_rows if is_stale_four_lib_rel(r["path"])]
+    rep["four_lib"] = {
+        "rows": len(four_rows),
+        "canonical_rows": len(four_canonical),
+        "canonical_active": sum(1 for r in four_canonical if not r["archived"]),
+        "canonical_archived": sum(1 for r in four_canonical if r["archived"]),
+        "archive_dir_rows": len(four_archived),
+        "stale_top_level_rows": len(four_stale),
+        "stale_top_level_active": sum(1 for r in four_stale if not r["archived"]),
+        "wiki_status": {s: sum(1 for r in four_canonical if r["wiki_status"] == s)
+                        for s in sorted({r["wiki_status"] for r in four_canonical})},
+        "by_lib": {lib: sum(1 for r in four_canonical if four_lib_of(r["path"]) == lib)
+                   for lib in FOUR_LIBS},
+        "problems": (sum(1 for r in four_canonical if not r["archived"]
+                         and r["wiki_status"] not in ("accepted", "indexed"))
+                     + sum(1 for r in four_stale if not r["archived"])),
+    }
+
     cur.execute("""SELECT d.domain, count(f.id) n FROM store_domains d
                    LEFT JOIN store_files f ON f.domain=d.domain AND f.archived=FALSE
                    GROUP BY d.domain ORDER BY n DESC""")
@@ -1195,13 +1300,37 @@ def cmd_sync(a) -> None:
         return out({"ok": True, "created": created, "tags": remote})
 
     cur.execute("""SELECT id,path,domain,wiki_tag,wiki_page_id,wiki_status,sha256,topic,
-                          sender_id,task_id,sensitivity
+                          sender_id,task_id,sensitivity,size
                    FROM store_files
                    WHERE kind='knowledge' AND archived=FALSE ORDER BY id""")
     local_all = [dict(r) for r in cur.fetchall()]
     # 防御性过滤：即使台账漏标 archived/skip，备份/临时件也绝不进入 wiki 同步。
     backup_local = [r for r in local_all if is_backup_rel(r["path"])]
     local = [r for r in local_all if not is_backup_rel(r["path"])]
+    scope = getattr(a, "scope", "fourlib") or "fourlib"
+    pattern = getattr(a, "pattern", "") or ""
+    scope_skipped, ineligible = [], []
+    if scope == "fourlib":
+        kept = []
+        for r in local:
+            ok, why = wiki_sync_eligible(r)
+            if not ok:
+                if why == "out_of_four_lib_scope":
+                    scope_skipped.append(r["path"])
+                else:
+                    ineligible.append({"path": r["path"], "why": why})
+                continue
+            kept.append(r)
+        local = kept
+    if pattern:
+        rx = re.compile(pattern)
+        kept = []
+        for r in local:
+            if rx.search(r["path"]):
+                kept.append(r)
+            else:
+                scope_skipped.append(r["path"])
+        local = kept
     remote = _wiki_rows(tok, kb)
     by_name = {r.get("file_name"): r for r in remote}
 
@@ -1223,10 +1352,14 @@ def cmd_sync(a) -> None:
                              "tags": [t.get("name") for t in (hit.get("tags") or [])],
                              "want_tag_id": want, "tag_ok": (not want) or want in tids})
         conn.close()
-        return out({"kb": kb, "local_knowledge": len(local), "wiki_items": len(remote),
+        return out({"kb": kb, "scope": scope, "pattern": pattern or None,
+                    "local_knowledge": len(local), "wiki_items": len(remote),
                     "missing": miss, "present": have,
                     "backup_skipped": len(backup_local),
                     "backup_skipped_paths": [r["path"] for r in backup_local[:50]],
+                    "scope_skipped": len(scope_skipped),
+                    "scope_skipped_paths": scope_skipped[:50],
+                    "ineligible": ineligible[:50],
                     "need_tag_backfill": [h["path"] for h in have if not h["tag_ok"]]})
 
     if a.action == "push":
@@ -1264,7 +1397,11 @@ def cmd_sync(a) -> None:
                 _log_sync(cur, r["id"], "push", "", "failed", json.dumps(res, ensure_ascii=False)[:400])
                 failed.append({"path": r["path"], "res": res})
         conn.close()
-        return out({"ok": not failed, "pushed": pushed, "failed": failed})
+        return out({"ok": not failed, "scope": scope, "pattern": pattern or None,
+                    "pushed": pushed, "failed": failed,
+                    "scope_skipped": len(scope_skipped),
+                    "scope_skipped_paths": scope_skipped[:50],
+                    "ineligible": ineligible[:50]})
 
     if a.action == "verify":
         upd = []
@@ -1286,7 +1423,8 @@ def cmd_sync(a) -> None:
             upd.append({"path": r["path"], "wiki_status": new, "parse": st,
                         "tags": [t.get("name") for t in (hit.get("tags") or [])]})
         conn.close()
-        return out({"ok": True, "checked": len(upd), "rows": upd})
+        return out({"ok": True, "scope": scope, "pattern": pattern or None,
+                    "checked": len(upd), "rows": upd})
 
     if a.action == "backfill":  # 给已存在但服务端 tag 为空/不符的条目补 tag
         updates = {}
@@ -1310,10 +1448,12 @@ def cmd_sync(a) -> None:
                 if row:
                     _log_sync(cur, row["id"], "tag", pid, row["wiki_status"], f"tag_ids={tid}")
             conn.close()
-            return out({"ok": bool(res.get("success")), "tagged": len(updates),
+            return out({"ok": bool(res.get("success")), "scope": scope,
+                        "pattern": pattern or None, "tagged": len(updates),
                         "updates": updates, "res": res})
         conn.close()
-        return out({"ok": True, "tagged": 0, "note": "无需补 tag"})
+        return out({"ok": True, "scope": scope, "pattern": pattern or None,
+                    "tagged": 0, "note": "无需补 tag"})
 
     conn.close()
     raise SystemExit(f"未知 sync 动作: {a.action}")
@@ -1409,6 +1549,10 @@ def main() -> None:
     p.add_argument("action", choices=("tags", "scan", "push", "verify", "backfill"))
     p.add_argument("--kb", default=None,
                    help="缺省按机解析：STORE_KB_ID env > jingbowiki.env 的 JINGBOWIKI_KB_ID")
+    p.add_argument("--scope", default="fourlib", choices=("fourlib", "all"),
+                   help="短期默认只同步 knowledge 四库；--scope all 才恢复全量 knowledge")
+    p.add_argument("--pattern", default="",
+                   help="在 scope 结果内再按路径正则过滤，如 '/知识库/'")
     p.set_defaults(f=cmd_sync)
 
     a = ap.parse_args()

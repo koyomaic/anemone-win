@@ -440,3 +440,12 @@ def test_build_prompt_keeps_resume_prefix(tmp_path):
     p = build_prompt(row, cfg)
     assert p.startswith("接续任务 #689")
     assert "#691" in p and "T691" in p
+
+
+def test_build_prompt_includes_four_lib_wiki_scope(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = {"id": 692, "description": "归档知识", "targets": [], "resume_from": None}
+    p = build_prompt(row, cfg)
+    assert "知识库,模型库,案例库,规则库" in p
+    assert "store sync push --scope fourlib" in p
+    assert "report/data 与其他 knowledge 暂不同步" in p

@@ -973,3 +973,20 @@ def test_flush_keeps_substantive_items_mixed_with_control_keywords(avatar):
     desc = avatar.exec_relay.submitted[-1]["desc"]
     assert "再做一个门店日销报告" in desc
     assert "进度" not in desc
+
+
+def test_knowledge_intake_rules_appends_four_lib_block(avatar):
+    txt = avatar._knowledge_intake_rules("请把结论四库入库并同步wiki", "18434")
+    assert "【四库知识入库铁律｜短期】" in txt
+    assert "store sync push --scope fourlib" in txt
+    assert "--sender 18434" in txt
+
+
+def test_knowledge_intake_rules_respects_skip(avatar):
+    txt = avatar._knowledge_intake_rules("仅本地归档，不要上传 jingboWiki", "18434")
+    assert "【知识入库边界｜本任务不上传 wiki】" in txt
+    assert "store sync push" in txt
+
+
+def test_knowledge_intake_rules_no_keyword(avatar):
+    assert avatar._knowledge_intake_rules("生成日报", "18434") == ""

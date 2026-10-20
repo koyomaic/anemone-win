@@ -247,3 +247,59 @@ def test_wiki_creds_base_normalization(cfg, storage, tmp_path):
                    'export JINGBOWIKI_PASSWORD=p\n'
                    'export JINGBOWIKI_KB_ID=KB1\n', encoding="utf-8")
     assert k._wiki_creds()["base"] == "http://wiki.test/api/v1"
+
+
+def test_domains_include_nested_four_libs(cfg, storage, shared):
+    (shared / "knowledge" / "口径方法论" / "知识库").mkdir(parents=True)
+    (shared / "knowledge" / "口径方法论" / "规则库").mkdir(parents=True)
+    ds = Knowledge(cfg, storage).domains()
+    assert "知识库" in ds and "规则库" in ds
+    assert "口径方法论" in ds
+
+
+def test_promote_nested_four_lib_maps_to_methodology(cfg, storage, shared, monkeypatch):
+    (shared / "knowledge" / "口径方法论" / "模型库").mkdir(parents=True)
+    k = Knowledge(cfg, storage)
+    note = k.save_note("净头寸模型")
+    calls = []
+    monkeypatch.setattr(storage, "_store",
+                        lambda a, timeout=60, extra_env=None:
+                        (calls.append(a) or (0, "")))
+    r = k.promote(note, "模型库", "净头寸模型")
+    dst = Path(r["path"])
+    assert dst.parent == shared / "knowledge" / "口径方法论" / "模型库"
+    assert r["library"] == "模型库"
+    add = [c for c in calls if c[0] == "add"][0]
+    assert "--wiki-tag" in add and "口径方法论" in add
+    assert r["wiki"] == "skipped"
+
+
+def test_promote_non_four_lib_skips_wiki_under_short_term_scope(
+        cfg, storage, shared, monkeypatch):
+    cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
+    k = Knowledge(cfg, storage)
+    note = k.save_note("运维经验")
+    calls = []
+    monkeypatch.setattr(storage, "_store",
+                        lambda a, timeout=60, extra_env=None:
+                        (calls.append(a) or (0, "")))
+    r = k.promote(note, "工具运维", "运维经验")
+    assert r["wiki"] == "skipped_out_of_short_term_scope"
+    assert not [c for c in calls if c[:2] == ["sync", "push"]]
+
+
+def test_promote_nested_four_lib_pushes_wiki_scope(cfg, storage, shared, monkeypatch):
+    (shared / "knowledge" / "口径方法论" / "案例库").mkdir(parents=True)
+    cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
+    k = Knowledge(cfg, storage)
+    note = k.save_note("调价复盘")
+    calls = []
+    monkeypatch.setattr(Knowledge, "_wiki_creds", lambda self: {"kb": "KB1"})
+    monkeypatch.setattr(storage, "_store",
+                        lambda a, timeout=60, extra_env=None:
+                        (calls.append((a, extra_env)) or (0, "")))
+    r = k.promote(note, "案例库", "调价复盘")
+    assert r["wiki"] == "pushed"
+    sync = [c for c, _ in calls if c[:2] == ["sync", "push"]][0]
+    assert sync == ["sync", "push", "--scope", "fourlib"]
+    assert [e for _, e in calls if e and e.get("STORE_KB_ID") == "KB1"]

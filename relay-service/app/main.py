@@ -749,6 +749,11 @@ def build_prompt(row: dict, cfg: Settings) -> str:
         f"MCP 工具 {cfg.shared_dir}/mcp/、团队记忆 {cfg.shared_dir}/memory/（已并入 AGENTS.md）\n"
         f"  - 知识库文档 {cfg.shared_dir}/knowledge/：动手前可先查阅；"
         f"产生的可复用经验沉淀到对应主题目录\n"
+        f"  - 知识入库短期口径：只有 {cfg.shared_dir}/knowledge/口径方法论/"
+        f"{{知识库,模型库,案例库,规则库}}/ 的现行版 .md 才同步 wiki；"
+        f"report/data 与其他 knowledge 暂不同步。四库知识落盘后执行 "
+        f"`store add <path> --kind knowledge --wiki-tag 口径方法论`，再执行 "
+        f"`store sync push --scope fourlib`；受理即成功，不等待解析。\n"
         # 产出命名铁律。为什么必须显式写进 prompt：AGENTS.md 虽已规定
         # `report : <YYYYMMDD>_<taskId>_<topic>_v<N>.<ext>`，但**此前 prompt 从不
         # 告知 agent 自己的任务号**，它无从遵守。2026-10-10 事故：同一需求经三个

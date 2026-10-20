@@ -65,9 +65,9 @@ report : <YYYYMMDD>_<taskId>_<topic>[-<variant>]_v<N>.<ext>
 - store 防御：正式目录的 `.bak`/`.old`/`.tmp` 即使被 `store scan/add` 登记，也会强制标为 `archive/backup/skip`；`store sync` 会再次跳过备份/临时件，绝不上传 jingboWiki
 - **禁止**同一内容出中英双份目录或双份文件（历史上 `20260921能源局座谈会/` 与 `20260921_energy_meeting/`、`jingbo-data-api-能力清单.md` 与 `-capability-list.md` 都是这么来的）；中文为准，需要英文名时在台账记 alias
 - 任务产生的可复用经验写入 `shared/knowledge/<tag域>/` 对应主题目录
-- **知识归档双写（硬性）**：凡归档进 `shared/knowledge/` 的知识文件（报告/文档/摘要/经验，无论任务产出还是用户上传），**必须在同一任务内经 `jingbowiki-api` 同步上传 jingboWiki**（权威源，全员可检索）。双写是归档动作的一部分，任务描述里"只改动 shared/knowledge/ 下文件""不要修改其他文件"之类范围限定**不豁免**本条；仅当任务明确写"不要上传 jingboWiki"时才跳过
+- **知识归档双写（短期范围）**：短期只把 `shared/knowledge/口径方法论/{知识库,模型库,案例库,规则库}/` 的现行版 `.md` 同步到 jingboWiki；`shared/report/`、`shared/data/` 与其他 knowledge 目录暂不同步。四库归档必须在同一任务内执行 `store add <path> --kind knowledge --wiki-tag 口径方法论`，再执行 `store sync push --scope fourlib`。任务描述里"只改动 shared/knowledge/ 下文件"之类范围限定**不豁免**本条；仅当任务明确写"不要上传 jingboWiki"时才跳过
 - 上传**受理即成功**（不阻塞等解析，解析后台异步），在任务结果里报告 knowledge_id；需确认解析完成时用技能的 wait 子命令后查，不要长轮询
-- 报告升格为知识的判定：**进 wiki**＝口径/方法论/能力清单/组织架构/纪要结论/策略矩阵；**不进**＝一次性数值报表、日报周报原始数据、`report/经营汇报/`（敏感）、自检与进度类过程文档。大文件原件（m4a/xlsx/docx）永不进 wiki 正文，只存结论并在台账用 refs 指回原件
+- 四库归类：**知识库**＝理论框架/概念卡/知识图谱/口径解释；**模型库**＝算法/数学模型/公式/参数；**案例库**＝分析路径/复盘/得失/可复用案例；**规则库**＝业务边界/限制/红线/预警与合规规则。报告升格为知识时只提炼可复用结论，不把原始报告、一次性数值报表、日报周报原始数据、`report/经营汇报/`（敏感）、自检与进度类过程文档推入 wiki。大文件原件（m4a/xlsx/docx）永不进 wiki 正文，只存结论并在台账用 refs 指回原件
 
 ### 台账 CLI（`store`）
 
