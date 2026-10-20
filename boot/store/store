@@ -93,8 +93,9 @@ def classify_backup(rel: str, kind: str, status: str, wiki_status: str, note: st
             note or "生产目录备份件：自动标 archive/backup/skip，待移入 .archive")
 
 
-# 短期 wiki 同步范围：只同步 knowledge 四库现行版，report/data 与其他 knowledge
-# 暂不进入 jingboWiki。四库正本位于 口径方法论 下，wiki tag 短期统一用 口径方法论。
+# 每机 wiki 同步范围：机队默认 all（保持既有行为）；本机可在 jingbowiki.env 配
+# JINGBOWIKI_SYNC_SCOPE=fourlib 或 JINGBOWIKI_SYNC_PATHS=prefix1,prefix2 收窄。
+# fourlib 是中鲁本机新增的四库路径别名，不代表其他机队成员也有这些目录。
 FOUR_LIB_PARENT = "口径方法论"
 FOUR_LIBS = ("知识库", "模型库", "案例库", "规则库")
 FOUR_LIB_PREFIXES = tuple(f"knowledge/{FOUR_LIB_PARENT}/{lib}/" for lib in FOUR_LIBS)
@@ -105,7 +106,7 @@ WIKI_MAX_BYTES = 5 * 1024 * 1024
 
 
 def is_four_lib_rel(rel: str) -> bool:
-    """是否属短期允许同步的四库正本路径。"""
+    """是否属四库别名路径。"""
     return rel.startswith(FOUR_LIB_PREFIXES)
 
 
@@ -140,11 +141,36 @@ def classify_knowledge_archive(rel: str, kind: str, status: str,
             True)
 
 
-def wiki_sync_eligible(row: dict) -> tuple[bool, str]:
-    """四库短期同步闸门：文本、大小、敏感度与路径白名单。"""
+def _split_paths(raw: str) -> tuple[str, ...]:
+    return tuple(p.strip().rstrip("/") + "/" for p in re.split(r"[,，;；\n]+", raw or "")
+                 if p.strip())
+
+
+def resolve_sync_scope(cli_scope: str = "") -> tuple[str, tuple[str, ...]]:
+    """返回 (scope, path_prefixes)。scope=config 时按本机配置解析，缺省 all。"""
+    scope = (cli_scope or "config").strip().lower()
+    if scope == "all":
+        return "all", ()
+    if scope == "fourlib":
+        return "fourlib", FOUR_LIB_PREFIXES
+    env_scope = (os.environ.get("STORE_SYNC_SCOPE")
+                 or _wiki_env_val("JINGBOWIKI_SYNC_SCOPE")).strip().lower()
+    env_paths = _split_paths(os.environ.get("STORE_SYNC_PATHS")
+                             or _wiki_env_val("JINGBOWIKI_SYNC_PATHS"))
+    if env_paths:
+        return "custom", env_paths
+    if env_scope == "fourlib":
+        return "fourlib", FOUR_LIB_PREFIXES
+    if env_scope == "all":
+        return "all", ()
+    return "all", ()
+
+
+def wiki_sync_eligible(row: dict, prefixes: tuple[str, ...] = ()) -> tuple[bool, str]:
+    """受限同步范围下的闸门：路径白名单、文本、大小、敏感度。"""
     path = row.get("path", "")
-    if not is_four_lib_rel(path):
-        return False, "out_of_four_lib_scope"
+    if prefixes and not path.startswith(prefixes):
+        return False, "out_of_sync_scope"
     if is_archived_knowledge_rel(path) or is_stale_four_lib_rel(path):
         return False, "archived_or_stale"
     ext = os.path.splitext(path)[1].lower()
@@ -1061,6 +1087,9 @@ def cmd_doctor(a) -> None:
                    WHERE kind='knowledge' AND archived=FALSE GROUP BY wiki_status ORDER BY n DESC""")
     rep["wiki_status"] = {r["wiki_status"]: r["n"] for r in cur.fetchall()}
 
+    sync_scope, sync_prefixes = resolve_sync_scope("")
+    rep["wiki_sync_scope"] = {"scope": sync_scope, "prefixes": list(sync_prefixes)}
+
     cur.execute("""SELECT path,wiki_status,archived,wiki_page_id FROM store_files
                    WHERE kind='knowledge'
                      AND (path LIKE 'knowledge/口径方法论/%'
@@ -1307,15 +1336,15 @@ def cmd_sync(a) -> None:
     # 防御性过滤：即使台账漏标 archived/skip，备份/临时件也绝不进入 wiki 同步。
     backup_local = [r for r in local_all if is_backup_rel(r["path"])]
     local = [r for r in local_all if not is_backup_rel(r["path"])]
-    scope = getattr(a, "scope", "fourlib") or "fourlib"
+    scope, prefixes = resolve_sync_scope(getattr(a, "scope", "") or "")
     pattern = getattr(a, "pattern", "") or ""
     scope_skipped, ineligible = [], []
-    if scope == "fourlib":
+    if prefixes:
         kept = []
         for r in local:
-            ok, why = wiki_sync_eligible(r)
+            ok, why = wiki_sync_eligible(r, prefixes)
             if not ok:
-                if why == "out_of_four_lib_scope":
+                if why == "out_of_sync_scope":
                     scope_skipped.append(r["path"])
                 else:
                     ineligible.append({"path": r["path"], "why": why})
@@ -1352,7 +1381,8 @@ def cmd_sync(a) -> None:
                              "tags": [t.get("name") for t in (hit.get("tags") or [])],
                              "want_tag_id": want, "tag_ok": (not want) or want in tids})
         conn.close()
-        return out({"kb": kb, "scope": scope, "pattern": pattern or None,
+        return out({"kb": kb, "scope": scope, "sync_prefixes": list(prefixes),
+                    "pattern": pattern or None,
                     "local_knowledge": len(local), "wiki_items": len(remote),
                     "missing": miss, "present": have,
                     "backup_skipped": len(backup_local),
@@ -1397,7 +1427,8 @@ def cmd_sync(a) -> None:
                 _log_sync(cur, r["id"], "push", "", "failed", json.dumps(res, ensure_ascii=False)[:400])
                 failed.append({"path": r["path"], "res": res})
         conn.close()
-        return out({"ok": not failed, "scope": scope, "pattern": pattern or None,
+        return out({"ok": not failed, "scope": scope, "sync_prefixes": list(prefixes),
+                    "pattern": pattern or None,
                     "pushed": pushed, "failed": failed,
                     "scope_skipped": len(scope_skipped),
                     "scope_skipped_paths": scope_skipped[:50],
@@ -1423,7 +1454,8 @@ def cmd_sync(a) -> None:
             upd.append({"path": r["path"], "wiki_status": new, "parse": st,
                         "tags": [t.get("name") for t in (hit.get("tags") or [])]})
         conn.close()
-        return out({"ok": True, "scope": scope, "pattern": pattern or None,
+        return out({"ok": True, "scope": scope, "sync_prefixes": list(prefixes),
+                    "pattern": pattern or None,
                     "checked": len(upd), "rows": upd})
 
     if a.action == "backfill":  # 给已存在但服务端 tag 为空/不符的条目补 tag
@@ -1449,10 +1481,12 @@ def cmd_sync(a) -> None:
                     _log_sync(cur, row["id"], "tag", pid, row["wiki_status"], f"tag_ids={tid}")
             conn.close()
             return out({"ok": bool(res.get("success")), "scope": scope,
+                        "sync_prefixes": list(prefixes),
                         "pattern": pattern or None, "tagged": len(updates),
                         "updates": updates, "res": res})
         conn.close()
-        return out({"ok": True, "scope": scope, "pattern": pattern or None,
+        return out({"ok": True, "scope": scope, "sync_prefixes": list(prefixes),
+                    "pattern": pattern or None,
                     "tagged": 0, "note": "无需补 tag"})
 
     conn.close()
@@ -1549,8 +1583,9 @@ def main() -> None:
     p.add_argument("action", choices=("tags", "scan", "push", "verify", "backfill"))
     p.add_argument("--kb", default=None,
                    help="缺省按机解析：STORE_KB_ID env > jingbowiki.env 的 JINGBOWIKI_KB_ID")
-    p.add_argument("--scope", default="fourlib", choices=("fourlib", "all"),
-                   help="短期默认只同步 knowledge 四库；--scope all 才恢复全量 knowledge")
+    p.add_argument("--scope", default="config", choices=("config", "all", "fourlib"),
+                   help="config=按本机 STORE_SYNC_SCOPE/JINGBOWIKI_SYNC_SCOPE 解析（缺省 all）；"
+                        "fourlib 只是中鲁本机四库别名，不代表机队统一范围")
     p.add_argument("--pattern", default="",
                    help="在 scope 结果内再按路径正则过滤，如 '/知识库/'")
     p.set_defaults(f=cmd_sync)

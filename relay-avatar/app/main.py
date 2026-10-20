@@ -625,8 +625,8 @@ class Avatar:
                 return
             if r.get("wiki") == "pushed":
                 wiki = "已双写 jingboWiki（受理即成功，解析后台进行）"
-            elif r.get("wiki") == "skipped_out_of_short_term_scope":
-                wiki = "短期 wiki 同步范围仅四库，本条已本地归档并登记，未上传"
+            elif r.get("wiki") == "skipped_out_of_machine_sync_scope":
+                wiki = "本机 wiki 同步范围未覆盖该路径，本条已本地归档并登记，未上传"
             else:
                 wiki = f"wiki 双写未执行（{r.get('wiki')}）"
             store = "✓" if r.get("store_ok") else \
@@ -1728,9 +1728,9 @@ class Avatar:
                 f"{digest}\n\n---\n\n{desc}")
 
     def _knowledge_intake_rules(self, desc: str, uid: str = "") -> str:
-        """按发起人原话追加四库知识入库/不上传边界，避免 relay agent 只靠 AGENTS 猜测。"""
+        """按发起人原话与本机同步范围追加知识入库/不上传边界。"""
         t = desc or ""
-        if "【四库知识入库铁律" in t or "【知识入库边界" in t:
+        if "【知识入库铁律" in t or "【四库知识入库铁律" in t or "【知识入库边界" in t:
             return ""
         neg = ("不要上传 jingbowiki", "不要上传jingbowiki", "不要上传wiki",
                "不同步wiki", "仅本地归档", "只本地归档", "不进wiki",
@@ -1749,19 +1749,36 @@ class Avatar:
         if not any(k in low for k in pos):
             return ""
         sender = str(uid or "").strip() or "<发起人ID>"
+        prefixes = self.know.wiki_sync_prefixes()
+        fourlib = set(prefixes) == {
+            "knowledge/口径方法论/知识库/", "knowledge/口径方法论/模型库/",
+            "knowledge/口径方法论/案例库/", "knowledge/口径方法论/规则库/"}
+        if fourlib:
+            return (
+                "\n\n---\n【四库知识入库铁律｜本机范围】\n"
+                "· 本机只同步 `shared/knowledge/口径方法论/{知识库,模型库,案例库,规则库}/` "
+                "的现行版 `.md`；`shared/report`、`shared/data` 与其他 knowledge 暂不同步 wiki。\n"
+                "· 归属：理论框架→知识库；算法/数学模型→模型库；分析路径/得失→案例库；"
+                "业务边界/限制→规则库。\n"
+                "· 文件名沿用 `KB-/MD-/CS-/R-` 前缀、版本号和日期；改版用 vN+1，旧版移入对应"
+                "「归档-」目录，并 `store set <id> --archived true --wiki-status skip`。\n"
+                "· 落盘后执行：`store add <path> --kind knowledge --wiki-tag 口径方法论 "
+                f"--sender {sender} --task T<本任务号> --topic <主题>`，再执行 "
+                "`store sync push`；受理即成功，不等待解析。\n"
+                "· 结果必须回报：本地路径、store id、wiki knowledge_id、归属库。若含敏感、"
+                "未脱敏或一次性数据，不上传 wiki，改为 `store add ... --wiki-status skip` 并说明原因。\n"
+            )
+        scope_text = self.know.wiki_sync_scope_text()
         return (
-            "\n\n---\n【四库知识入库铁律｜短期】\n"
-            "· 短期只同步 `shared/knowledge/口径方法论/{知识库,模型库,案例库,规则库}/` "
-            "的现行版 `.md`；`shared/report`、`shared/data` 与其他 knowledge 暂不同步 wiki。\n"
-            "· 归属：理论框架→知识库；算法/数学模型→模型库；分析路径/得失→案例库；"
-            "业务边界/限制→规则库。\n"
-            "· 文件名沿用 `KB-/MD-/CS-/R-` 前缀、版本号和日期；改版用 vN+1，旧版移入对应"
-            "「归档-」目录，并 `store set <id> --archived true --wiki-status skip`。\n"
-            "· 落盘后执行：`store add <path> --kind knowledge --wiki-tag 口径方法论 "
+            "\n\n---\n【知识入库铁律｜本机范围】\n"
+            f"· {scope_text}；`shared/report`、`shared/data` 不自动同步 wiki。\n"
+            "· 可复用、稳定、已脱敏的知识写入对应 `shared/knowledge/<域>/` 现行版 `.md`；"
+            "一次性报表、过程日志、敏感件不上传。\n"
+            "· 落盘后执行：`store add <path> --kind knowledge --wiki-tag <域> "
             f"--sender {sender} --task T<本任务号> --topic <主题>`，再执行 "
-            "`store sync push --scope fourlib`；受理即成功，不等待解析。\n"
-            "· 结果必须回报：本地路径、store id、wiki knowledge_id、归属库。若含敏感、"
-            "未脱敏或一次性数据，不上传 wiki，改为 `store add ... --wiki-status skip` 并说明原因。\n"
+            "`store sync push`；受理即成功，不等待解析。\n"
+            "· 结果必须回报：本地路径、store id、wiki knowledge_id。若不在本机同步范围或含敏感数据，"
+            "改为 `store add ... --wiki-status skip` 并说明原因。\n"
         )
 
     def _relay_marker_rules(self, s: dict, brief: bool = False) -> str:

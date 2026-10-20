@@ -9,9 +9,10 @@ shared/knowledge/<tag域>/ 片段检索兜底
 速记与升格（self 模式）：
 - 无前缀速记 → run/staging/note-*.md 暂存（低摩擦、不进台账）
 - 「学 N [域]」审核升格 → 写 shared/knowledge/<tag域>/ + store add --kind knowledge
-  --wiki-tag <域>。短期 wiki 同步范围仅四库（口径方法论 下的 知识库/模型库/案例库/
-  规则库），命中四库时再走 `store sync push --scope fourlib` 双写 jingboWiki（受理即
-  成功不阻塞解析；wiki_sync 状态由 store 跟踪）。大文件原件永不进 wiki 正文。
+  --wiki-tag <域>。wiki 同步范围按本机 policy/jingbowiki.env 配置：缺省 all；中鲁
+  本机可配 fourlib（口径方法论 下的 知识库/模型库/案例库/规则库）。命中范围时再走
+  `store sync push` 双写 jingboWiki（受理即成功不阻塞解析；wiki_sync 状态由 store
+  跟踪）。大文件原件永不进 wiki 正文。
 """
 from __future__ import annotations
 
@@ -140,6 +141,37 @@ class Knowledge:
                 "password": w.get("JINGBOWIKI_PASSWORD", ""),
                 "kb": str(self.cfg.get("knowledge", "wiki_kb_id", "")
                           or w.get("JINGBOWIKI_KB_ID", ""))}
+
+    def _wiki_sync_prefixes(self) -> tuple:
+        """本机 wiki 同步范围（相对 shared/ 的路径前缀）；空元组＝不限。"""
+        scope = str(self.cfg.get("knowledge", "wiki_sync_scope", "all") or "all").lower()
+        raw = str(self.cfg.get("knowledge", "wiki_sync_paths", "") or "")
+        paths = tuple(p.strip().rstrip("/") + "/"
+                      for p in re.split(r"[,，;；\n]+", raw) if p.strip())
+        if paths:
+            return paths
+        if scope == "fourlib":
+            return tuple(f"knowledge/{FOUR_LIB_PARENT}/{lib}/" for lib in FOUR_LIBS)
+        return ()
+
+    def _wiki_sync_in_scope(self, path: Path) -> bool:
+        prefixes = self._wiki_sync_prefixes()
+        if not prefixes:
+            return True
+        try:
+            rel = path.relative_to(self.local_dir.parent).as_posix()
+        except Exception:
+            rel = str(path)
+        return rel.startswith(prefixes)
+
+    def wiki_sync_prefixes(self) -> tuple:
+        return self._wiki_sync_prefixes()
+
+    def wiki_sync_scope_text(self) -> str:
+        prefixes = self._wiki_sync_prefixes()
+        if not prefixes:
+            return "本机 wiki 同步范围：全部未归档 `shared/knowledge/`（以 store 配置为准）"
+        return ("本机 wiki 同步范围：" + "、".join(f"`shared/{p}`" for p in prefixes))
 
     def _wiki_token(self, c: dict) -> str:
         """登录取 Bearer token（缓存 25 分钟）。"""
@@ -372,7 +404,7 @@ class Knowledge:
 
     def promote(self, note: Path, domain: str, topic: str = "") -> dict:
         """升格为正式知识：shared/knowledge/<tag域>/ + store add --wiki-tag
-        + store sync push 双写 jingboWiki（机队标准通道，受理即成功）。
+        + 按本机 wiki 同步范围决定是否 `store sync push`（受理即成功）。
 
         域非法时**不再静默回落默认域**：静默改归会让知识落错域且用户无感知
         （检索、统计、台账域一致性全错），改为返回 error + 可选域清单，由分身
@@ -399,16 +431,23 @@ class Knowledge:
                "domain": resolved, "library": resolved if is_four_lib else "",
                "wiki": "skipped"}
         if ok and self.cfg.get("knowledge", "wiki_enabled", False):
-            if not is_four_lib:
-                res["wiki"] = "skipped_out_of_short_term_scope"
+            if not self._wiki_sync_in_scope(dst):
+                res["wiki"] = "skipped_out_of_machine_sync_scope"
             else:
                 # 双写走 store sync push（机队标准通道）；STORE_KB_ID 覆盖为本机
-                # 账号可访问的 KB（store 默认硬编码 KB 在部分账号下 403）
+                # 账号可访问的 KB（store 默认硬编码 KB 在部分账号下 403）。
+                # 同步范围同样按本机配置传递，避免把本机四库口径强加给其他机队成员。
                 extra = {}
                 kb = self._wiki_creds().get("kb", "")
                 if kb:
                     extra["STORE_KB_ID"] = kb
-                rc, sout = self.st._store(["sync", "push", "--scope", "fourlib"],
+                scope = str(self.cfg.get("knowledge", "wiki_sync_scope", "all") or "all").lower()
+                raw_paths = str(self.cfg.get("knowledge", "wiki_sync_paths", "") or "")
+                if raw_paths.strip():
+                    extra["STORE_SYNC_PATHS"] = raw_paths.strip()
+                elif scope in ("all", "fourlib"):
+                    extra["STORE_SYNC_SCOPE"] = scope
+                rc, sout = self.st._store(["sync", "push", "--scope", "config"],
                                           timeout=300, extra_env=extra)
                 res["wiki"] = "pushed" if rc == 0 else f"sync push rc={rc}"
                 res["wiki_out"] = sout[:200]

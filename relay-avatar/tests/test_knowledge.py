@@ -274,9 +274,10 @@ def test_promote_nested_four_lib_maps_to_methodology(cfg, storage, shared, monke
     assert r["wiki"] == "skipped"
 
 
-def test_promote_non_four_lib_skips_wiki_under_short_term_scope(
+def test_promote_non_four_lib_skips_wiki_under_machine_scope(
         cfg, storage, shared, monkeypatch):
     cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
+    cfg._p["knowledge"]["wiki_sync_scope"] = "fourlib"
     k = Knowledge(cfg, storage)
     note = k.save_note("运维经验")
     calls = []
@@ -284,13 +285,14 @@ def test_promote_non_four_lib_skips_wiki_under_short_term_scope(
                         lambda a, timeout=60, extra_env=None:
                         (calls.append(a) or (0, "")))
     r = k.promote(note, "工具运维", "运维经验")
-    assert r["wiki"] == "skipped_out_of_short_term_scope"
+    assert r["wiki"] == "skipped_out_of_machine_sync_scope"
     assert not [c for c in calls if c[:2] == ["sync", "push"]]
 
 
 def test_promote_nested_four_lib_pushes_wiki_scope(cfg, storage, shared, monkeypatch):
     (shared / "knowledge" / "口径方法论" / "案例库").mkdir(parents=True)
     cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
+    cfg._p["knowledge"]["wiki_sync_scope"] = "fourlib"
     k = Knowledge(cfg, storage)
     note = k.save_note("调价复盘")
     calls = []
@@ -301,5 +303,23 @@ def test_promote_nested_four_lib_pushes_wiki_scope(cfg, storage, shared, monkeyp
     r = k.promote(note, "案例库", "调价复盘")
     assert r["wiki"] == "pushed"
     sync = [c for c, _ in calls if c[:2] == ["sync", "push"]][0]
-    assert sync == ["sync", "push", "--scope", "fourlib"]
-    assert [e for _, e in calls if e and e.get("STORE_KB_ID") == "KB1"]
+    assert sync == ["sync", "push", "--scope", "config"]
+    env = [e for _, e in calls if e and e.get("STORE_KB_ID") == "KB1"][0]
+    assert env.get("STORE_SYNC_SCOPE") == "fourlib"
+
+
+def test_promote_default_scope_pushes_all_knowledge(cfg, storage, shared, monkeypatch):
+    cfg._p.setdefault("knowledge", {})["wiki_enabled"] = True
+    k = Knowledge(cfg, storage)
+    note = k.save_note("运维经验")
+    calls = []
+    monkeypatch.setattr(Knowledge, "_wiki_creds", lambda self: {"kb": "KB1"})
+    monkeypatch.setattr(storage, "_store",
+                        lambda a, timeout=60, extra_env=None:
+                        (calls.append((a, extra_env)) or (0, "")))
+    r = k.promote(note, "工具运维", "运维经验")
+    assert r["wiki"] == "pushed"
+    sync = [c for c, _ in calls if c[:2] == ["sync", "push"]][0]
+    assert sync == ["sync", "push", "--scope", "config"]
+    env = [e for _, e in calls if e and e.get("STORE_KB_ID") == "KB1"][0]
+    assert env.get("STORE_SYNC_SCOPE") == "all"

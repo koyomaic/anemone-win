@@ -320,6 +320,8 @@ wiki_enabled = false           # jingboWiki 权威源检索+升格双写（凭�
                                # 宿主级文件，非 relay.env；启用前置 true）
 wiki_env = "/mnt/vol-eltaah12/workspace/shared/secrets/jingbowiki.env"
 wiki_kb_id = ""                # 留空=取 jingbowiki.env 的 JINGBOWIKI_KB_ID
+wiki_sync_scope = "all"        # all=全部未归档 knowledge；fourlib=中鲁本机四库别名（其他机队成员不一定有）
+wiki_sync_paths = ""           # 可选自定义同步前缀（逗号分隔，相对 shared/），优先级高于 wiki_sync_scope
 recall_max_files = 6
 recall_char_budget = 3000
 domains = ""                     # 知识域白名单（逗号分隔，可空）。空=自动发现 local_dir 下

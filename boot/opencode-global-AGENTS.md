@@ -27,7 +27,7 @@
 
 1. jingboWiki 为优先权威源（技能 `jingbowiki-api`，`http://10.200.3.235:18082`）
 2. 本地 `shared/knowledge/` 兜底；冲突以 jingboWiki 为准
-3. 短期只把 `shared/knowledge/口径方法论/{知识库,模型库,案例库,规则库}/` 的现行版 `.md` 同步到 jingboWiki；四库归档后同任务执行 `store add --kind knowledge --wiki-tag 口径方法论` 与 `store sync push --scope fourlib`（受理即成功、不阻塞等解析），`report/data` 与其他 knowledge 暂不同步
+3. 归档进 `shared/knowledge/` 的知识文件必须同任务 `store add --kind knowledge --wiki-tag <域>`；是否上传 jingboWiki 按本机 `store sync` 配置执行（受理即成功、不阻塞等解析），`report/data` 不自动同步
 
 ## 钉钉消息样式（默认约定）
 

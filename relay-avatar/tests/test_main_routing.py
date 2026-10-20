@@ -976,10 +976,18 @@ def test_flush_keeps_substantive_items_mixed_with_control_keywords(avatar):
 
 
 def test_knowledge_intake_rules_appends_four_lib_block(avatar):
+    avatar.cfg._p.setdefault("knowledge", {})["wiki_sync_scope"] = "fourlib"
     txt = avatar._knowledge_intake_rules("请把结论四库入库并同步wiki", "18434")
-    assert "【四库知识入库铁律｜短期】" in txt
-    assert "store sync push --scope fourlib" in txt
+    assert "【四库知识入库铁律｜本机范围】" in txt
+    assert "store sync push" in txt
     assert "--sender 18434" in txt
+
+
+def test_knowledge_intake_rules_default_machine_scope(avatar):
+    txt = avatar._knowledge_intake_rules("请知识入库并同步wiki", "18434")
+    assert "【知识入库铁律｜本机范围】" in txt
+    assert "全部未归档" in txt
+    assert "store sync push" in txt
 
 
 def test_knowledge_intake_rules_respects_skip(avatar):
