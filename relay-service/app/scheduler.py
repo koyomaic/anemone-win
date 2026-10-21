@@ -98,6 +98,23 @@ class Scheduler:
     def active_long(self) -> int:
         return self._active_long
 
+    def queue_info(self, task_id: int | None = None) -> dict:
+        now = time.monotonic()
+        queued = [tid for _prio, _seq, tid in self._heap]
+        info = {"pending": len(queued), "active": self._active,
+                "active_long": self._active_long}
+        if task_id is not None:
+            info["queued"] = task_id in queued
+            try:
+                info["position"] = queued.index(task_id) + 1
+            except ValueError:
+                info["position"] = 0
+            is_long, enq = self._meta.get(task_id, (False, now))
+            info["long"] = bool(is_long)
+            info["lane_open"] = self._lane_open(task_id, now)
+            info["wait_sec"] = max(0.0, now - enq) if is_long else 0.0
+        return info
+
     def _lane_open(self, task_id: int, now: float) -> bool:
         """该任务此刻是否允许占用槽位（lane 视角）。"""
         if self.long_lane_cap <= 0:

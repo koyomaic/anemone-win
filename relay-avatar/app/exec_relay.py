@@ -37,6 +37,9 @@ class ExecRelay:
     def poll(self, tid) -> dict:
         return self.relay.get_task(tid)
 
+    def progress(self, tid, after_id: int = 0, limit: int = 5) -> dict:
+        return self.relay.get_progress(tid, after_id=after_id, limit=limit)
+
     def approve(self, tid, decision: str, uid: str = "") -> dict:
         r = self.relay.approve(tid, decision)
         self.audit.log("gate_approve", uid, f"#{tid} {decision}",

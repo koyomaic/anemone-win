@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response, Streamin
 from pydantic import BaseModel, Field
 
 from .audit import AuditLog
+from . import progress
 from . import shared_knowledge
 from . import plans as plan_util
 from .config import AUTO_DENY_REASONS, Settings
@@ -1777,6 +1778,44 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/tasks/{task_id}/progress")
+    async def task_progress(task_id: int, after_id: int = 0, limit: int = 5,
+                            _: dict = Depends(auth)):
+        row = db.task(task_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="task not found")
+        limit = max(1, min(int(limit or 5), 10))
+        after_id = max(0, int(after_id or 0))
+        events = bus.history(task_id)
+        filtered = [e for e in events if int(e.get("id") or 0) > after_id]
+        recent = progress.summarize_events(filtered, limit)
+        last_id = int(events[-1].get("id") or 0) if events else after_id
+        tool_calls = sum(1 for e in events
+                         if e.get("t") == "agent" and e.get("kind") == "tool")
+        now = time.time()
+        status = str(row.get("status") or "")
+        end = float(row.get("finished_at") or 0)
+        if not end and status in TERMINAL | {"review"}:
+            end = now
+        created = float(row.get("created_at") or now)
+        started = float(row.get("started_at") or 0)
+        seg = _segment_of(row.get("resume_hint") or "")
+        queue = sched.queue_info(task_id) if sched is not None else {}
+        return {
+            "task_id": task_id,
+            "status": status,
+            "segment": seg,
+            "max_segments": cfg.long_task_max_segments,
+            "budget_sec": cfg.task_timeout,
+            "elapsed_sec": max(0.0, (end or now) - created),
+            "segment_elapsed_sec": max(0.0, ((end or now) - started)) if started else 0.0,
+            "last_event_id": last_id,
+            "tool_calls": tool_calls,
+            "recent": recent,
+            "stage": progress.infer_stage(events, status),
+            "queue": queue,
+        }
 
     # ---- 计划（定时任务）----
     # 大脑/成员只写声明（POST /plans），root 侧 relay-plan.timer 每分钟扫库、

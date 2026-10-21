@@ -198,7 +198,7 @@ def test_parse_line_collects_partial_context():
     ExecLocal._parse_line(line, steps, None, texts, notes)
     assert texts == ["已确认模板契约"]
     assert notes[0].startswith("Read: /tmp/render_report.py")
-    assert "📖 读取文件" in steps
+    assert any("📖 读取文件 · render_report.py" in x for x in steps)
 
 
 # ── C. main 路由与会话态 ──

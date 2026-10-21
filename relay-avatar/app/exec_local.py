@@ -25,11 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-TOOL_CN = {
-    "Bash": "🔧 执行命令", "Read": "📖 读取文件", "Write": "✍️ 写文件",
-    "Edit": "✏️ 修改文件", "Glob": "🔍 查找文件", "Grep": "🔍 搜索内容",
-    "WebFetch": "🌐 访问网页", "WebSearch": "🔍 联网搜索", "Task": "🤖 调度子任务",
-}
+from . import card_progress
 
 # 外部内容可信度定性。为什么必须写进提示词（2026-09-25）：shared/data/ 在
 # l2_add_dirs 里，**每个 local 任务都能 Read 到上传件**，而 sanitize_injected 只
@@ -52,10 +48,7 @@ DENY_MARKERS = ("permission", "denied", "rejected", "not allowed",
 
 
 def tool_desc(blk: dict) -> str:
-    name = blk.get("name") or ""
-    if name.startswith("mcp__"):
-        return f"🔌 调用 {name.split('__')[-1]}"
-    return TOOL_CN.get(name, f"🔧 {name or '工具'}")
+    return card_progress.tool_step(blk)
 
 
 class ExecLocal:

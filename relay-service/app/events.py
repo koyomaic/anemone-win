@@ -27,6 +27,9 @@ class EventBus:
             except asyncio.QueueFull:
                 pass
 
+    def history(self, task_id: int) -> list[dict]:
+        return list(self._history.get(task_id, []))
+
     def subscribe(self, task_id: int) -> tuple[list[dict], asyncio.Queue]:
         history = list(self._history.get(task_id, []))
         q: asyncio.Queue = asyncio.Queue(maxsize=2000)

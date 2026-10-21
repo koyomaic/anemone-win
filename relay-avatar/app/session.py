@@ -55,6 +55,12 @@ class SessionManager:
             "notified_followup": False, "last_activity": time.time(),
             "review_followup_notified": False, "review_reprompt_count": 0,
             "user_started_at": 0.0,
+            "key": "",
+            "card_biz": "", "card_hint": "", "card_start": 0.0,
+            "card_upd": 0.0, "card_backend": "", "card_task_id": None,
+            "card_state": "", "card_progress": {},
+            "card_real_summary_count": 0, "card_last_real_summary": 0.0,
+            "local_timeout": 0.0,
             "uid": ev.get("_uid", ""),
             # 在途请求原文（relay 通路提交后留存），供跨会话重复请求去重比对。
             # local 通路用 local_desc，BUFFERING 用 buffer，故只在 relay 通路写。
@@ -72,8 +78,10 @@ class SessionManager:
 
     def get_or_create(self, key: str, sender: str, sid: str, ev: dict,
                       is_group: bool) -> dict:
-        return self.sessions.setdefault(
+        s = self.sessions.setdefault(
             key, self.new_session(sender, sid, ev, is_group))
+        s["key"] = key
+        return s
 
     def touch(self, s: dict, ev: dict):
         s["reply"]["sender"] = ev.get("sender") or s["reply"].get("sender", "")

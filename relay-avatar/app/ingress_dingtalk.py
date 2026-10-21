@@ -84,6 +84,40 @@ def card_biz_id(resp) -> str:
         return ""
 
 
+def parse_card_response(r) -> dict:
+    if not isinstance(r, dict) or not r:
+        return {"ok": False, "accepted": False, "verified": False,
+                "retryable": False, "error": "空响应"}
+    for k in ("_exc", "_error", "_timeout"):
+        if k in r:
+            return {"ok": False, "accepted": False, "verified": False,
+                    "retryable": k == "_timeout", "error": f"{k}={str(r[k])[:110]}"}
+    err = r.get("error") or r.get("errorMsg")
+    if err:
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        retryable = bool(err.get("retryable")) if isinstance(err, dict) else False
+        return {"ok": False, "accepted": False, "verified": False,
+                "retryable": retryable, "error": str(msg)[:160]}
+    if "raw" in r and r.get("ok") is not True:
+        return {"ok": False, "accepted": False, "verified": False,
+                "retryable": False, "error": f"非 JSON 响应: {str(r['raw'])[:110]}"}
+    data = r.get("data") if isinstance(r.get("data"), dict) else {}
+    if data.get("errorCode"):
+        return {"ok": False, "accepted": False, "verified": False,
+                "retryable": False,
+                "error": f"{data.get('errorCode')}: {data.get('errorMsg')}"}
+    accepted = (r.get("accepted") is True or r.get("success") is True
+                or data.get("success") is True or r.get("ok") is True
+                or r.get("dry") is True)
+    verified = bool(r.get("verified") is True or data.get("verified") is True)
+    if not accepted:
+        return {"ok": False, "accepted": False, "verified": verified,
+                "retryable": False,
+                "error": str(r.get("warning") or "响应无 accepted/success 标记")[:160]}
+    return {"ok": True, "accepted": True, "verified": verified,
+            "retryable": False, "error": ""}
+
+
 def strip_ctrl(text: str) -> str:
     """剔除钉钉拒收的控制字符，保留 \\n 与 \\t。
 
@@ -290,16 +324,20 @@ class Dws:
                 return {}
         return self.run(args + ["--yes", "--format", "json"], timeout=30)
 
-    def card_update(self, biz_id: str, content: str, flow_status: int) -> bool:
-        """更新卡片。flow_status: 1处理中/2输入中/3完成/4执行中/5错误。"""
+    def card_update_ex(self, biz_id: str, content: str,
+                       flow_status: int) -> dict:
         if not biz_id:
-            return False
+            return {"ok": False, "accepted": False, "verified": False,
+                    "retryable": False, "error": "empty_biz"}
         r = self.run(["chat", "+messages-update-card", "--biz-id", biz_id,
                       "--content", md_hardbreak(content or ""),
                       "--flow-status", str(flow_status),
                       "--yes", "--format", "json"], timeout=30)
-        return not (r.get("error") or r.get("errorMsg") or r.get("_error")
-                    or r.get("_timeout"))
+        return parse_card_response(r)
+
+    def card_update(self, biz_id: str, content: str, flow_status: int) -> bool:
+        """更新卡片。flow_status: 1处理中/2输入中/3完成/4执行中/5错误。"""
+        return bool(self.card_update_ex(biz_id, content, flow_status).get("ok"))
 
     def download_media(self, media_id: str, message_id: str, conv_id: str,
                        outdir: Path) -> dict:

@@ -292,13 +292,15 @@ def test_heartbeat_first_segment_no_number(av, cfg):
     assert "第 2 段" in av.dws.sent[-1][1]
 
 
-def test_heartbeat_normal_task_unchanged(av, cfg):
-    """未升级任务的心跳文案一字不变（既有测试依赖「正在为你办…（已用 31s）」）。"""
+def test_heartbeat_normal_task_rich_frame(av, cfg):
+    """未升级任务的心跳帧显示阶段与已用时间，不再只有一句单调提示。"""
     setcfg(cfg, "ingress", card_progress_sec=0)
     s = sess(card_upd=0.0, card_start=time.time() - 31)
     av._card_beat(s, 7, "running")
-    assert "正在为你办…（已用 31s）" in av.dws.sent[-1][1]
-    assert "长任务" not in av.dws.sent[-1][1]
+    body = av.dws.sent[-1][1]
+    assert "当前阶段" in body
+    assert "31 秒" in body
+    assert "长任务" not in body
 
 
 def test_notice_then_heartbeat_both_carry_state(av, cfg):

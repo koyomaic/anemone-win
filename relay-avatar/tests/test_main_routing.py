@@ -412,7 +412,7 @@ def test_card_flow_submit_to_done(cfg):
     av.exec_relay.tasks[1]["status"] = "running"
     s["card_upd"] = 0
     av._poll_sessions()
-    assert any("正在为你办" in c and "已用" in c
+    assert any("当前阶段" in c and "已用" in c
                for _, c, _ in av.dws.card_frames[1:])
     # done → 卡片定格结果，不再重复发文本
     av.exec_relay.tasks[1] = {"id": 1, "status": "done", "result": "汇总完成"}

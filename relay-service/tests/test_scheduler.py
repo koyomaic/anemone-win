@@ -71,3 +71,29 @@ def test_scheduler_urgent_first():
         assert order.index(2) < order.index(3), f"urgent 未插队: {order}"
 
     asyncio.run(main())
+
+
+def test_scheduler_queue_info():
+    async def main():
+        started = asyncio.Event()
+
+        async def run_fn(tid: int) -> None:
+            started.set()
+            await asyncio.sleep(0.3)
+
+        s = Scheduler(1, run_fn)
+        await s.start()
+        await s.submit(1)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await s.submit(2, "normal")
+        await s.submit(3, "normal", long=True)
+        info = s.queue_info(2)
+        assert info["pending"] == 2
+        assert info["active"] == 1
+        assert info["queued"] is True
+        assert info["position"] == 1
+        long_info = s.queue_info(3)
+        assert long_info["long"] is True
+        await s.stop()
+
+    asyncio.run(main())

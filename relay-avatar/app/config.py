@@ -39,9 +39,24 @@ DEFAULTS: dict[str, Any] = {
                 "poll_sec": 3, "result_max_chars": 3000,
                 "ack_emoji": "奋斗", "submit_emoji": "",
                 "noise_emoji": "打招呼", "followup_emoji": "OK",
-                "ack_text_emotion": {}, "done_text_emotion": {},
-                "fail_text_emotion": {}, "use_card": True,
+                 "ack_text_emotion": {}, "done_text_emotion": {},
+                 "fail_text_emotion": {}, "use_card": True,
                  "card_progress_sec": 30,
+                 "card_progress_mode": "rich",
+                 "card_progress_fast_sec": 15,
+                 "card_progress_slow_sec": 60,
+                 "card_progress_actions": 3,
+                 "card_progress_detail_in_group": False,
+                 "card_real_summary_sec": 900,
+                 "card_real_summary_max": 2,
+                 "card_orphan_sweep_sec": 900,
+                 "card_orphan_ttl_sec": 3600,
+                 "card_orphan_sweep_batch": 5,
+                 "relay_progress_enabled": True,
+                 "relay_progress_retry_sec": 1800,
+                 "relay_segment_budget_sec": 1800,
+                 "relay_max_segments": 3,
+
                  # 长任务提示：与 relay 侧同名参数对齐（relay 管执行、分身管告知）。
                  # 分身**自己按 row.started_at 算 elapsed**，不依赖 relay 新增字段——
                  # poll 拿到的 row 里本来就有 started_at/resume_hint，故零新增 HTTP

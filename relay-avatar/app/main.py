@@ -23,9 +23,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import config as C
+from app import card_progress
 from app import integrity
 from app import recall
 from app.audit import Audit
+from app.cards import CardRegistry
 from app.dashboard import Dashboard
 from app.exec_local import ExecLocal
 from app.exec_relay import ExecRelay
@@ -129,6 +131,7 @@ class Avatar:
         self.echo = SentEcho(self.st)
         self.monitor = Monitor(cfg, self.st, self.dws, self.audit)
         self.dashboard = Dashboard(cfg, self.st, self.audit, policy=self.policy)
+        self.cards = CardRegistry(self.st, self.audit, cfg)
         self.q: queue.Queue = queue.Queue()
         self.stop = threading.Event()
         self.contacts = self.st.run / "contacts.json"
@@ -138,6 +141,11 @@ class Avatar:
         self._guest_seen: dict = {}
         self._note_guard: dict = {}
         self._plan_delivery_next = 0.0
+        self._local_progress: dict = {}
+        self._card_sweep_next = 0.0
+        self._relay_progress_enabled = bool(
+            cfg.get("ingress", "relay_progress_enabled", True))
+        self._relay_progress_retry = 0.0
 
     def _guest_silent(self, sid: str, sender: str, content):
         """名单外静默忽略：只留节流审计（同人每小时一条），绝不回话。"""
@@ -666,13 +674,11 @@ class Avatar:
                                  "（policy execution.local_enabled=false），"
                                  "文件已安全存档，如需加急请联系管理员。")
             return
-        biz = ""
-        if self.cfg.get("ingress", "use_card", True):
-            try:
-                biz = card_biz_id(self.dws.card_create(s["reply"]))
-            except Exception:
-                biz = ""
+        biz = self._card_open(s, None, text, backend="local")
         throttle = {"upd": 0.0}
+        started = time.time()
+        hint = (text.splitlines() or [""])[0][:40]
+        is_group = bool((s.get("reply") or {}).get("is_group"))
 
         def on_step(step, steps):
             if not biz:
@@ -681,25 +687,44 @@ class Avatar:
             if now - throttle["upd"] < 5:
                 return
             throttle["upd"] = now
+            ctx = card_progress.ProgressCtx(
+                avatar_name=self.cfg.avatar_name,
+                hint=hint,
+                backend="local",
+                status="local",
+                total_elapsed=now - started,
+                seg_elapsed=now - started,
+                actions=list(steps or [])[-3:],
+                controls="正在处理文件问答",
+                detail=not is_group or bool(self.cfg.get(
+                    "ingress", "card_progress_detail_in_group", False)),
+                mode=self._card_mode(),
+            )
             try:
-                self.dws.card_update(
-                    biz, f"🍂 **{self.cfg.avatar_name}正在处理…**\n\n"
-                    + "\n".join(f"> {x}" for x in steps[-6:]), 1)
+                self._card_update_biz(biz, card_progress.render(ctx), 1)
             except Exception:
                 pass
 
-        kb = self.know.search(text)
-        r = self.exec_local.run_l3(uid, text, kb=kb, on_step=on_step)
-        out = str(r.get("text") or "（没读出内容，换个问法试试？）")
-        self.st.archive_round(f"l3-{uid}", "qa",
-                              {"q": text[:200], "a": out[:300]})
-        if biz:
-            try:
-                if self.dws.card_update(biz, out[:2500], 3):
-                    return
-            except Exception:
-                pass
-        self._notify(target, out)
+        try:
+            kb = self.know.search(text)
+            r = self.exec_local.run_l3(uid, text, kb=kb, on_step=on_step)
+            out = str(r.get("text") or "（没读出内容，换个问法试试？）")
+            self.st.archive_round(f"l3-{uid}", "qa",
+                                  {"q": text[:200], "a": out[:300]})
+            if biz and self._card_final(s, out, 3):
+                return
+            self._notify(target, out)
+        except Exception as e:
+            log("l3 qa failed:", e)
+            self._card_final(
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n"
+                   f"> 文件问答处理失败：{str(e)[:180]}", 5)
+            self._notify(target, f"⚠️ 文件问答处理失败：{str(e)[:180]}")
+        finally:
+            if s.get("card_biz"):
+                self._card_final(
+                    s, f"🍂 **{self.cfg.avatar_name}已结束**\n\n"
+                       "> 文件问答已结束；如有结果请查看后续消息。", 3)
 
     # ── 会话流（自 im-bridge 演进） ──
     def _kw(self, text: str, name: str) -> bool:
@@ -736,14 +761,26 @@ class Avatar:
                 r = self.exec_relay.approve(s["task_id"], "approve", uid)
                 self._notify_session(s, "✅ 已放行，继续执行。")
                 s["state"] = "RUNNING"
+                if s.get("card_biz"):
+                    self._card_update(
+                        s, s["card_biz"],
+                        self._card_frame(s, "已放行，继续执行",
+                                         status="running"), 1,
+                        task_id=s.get("task_id"))
+                    s["card_upd"] = time.time()
                 self.st.archive_round(s["task_id"], "approve", r)
                 return
             if self._kw(cmd, "deny"):
-                r = self.exec_relay.approve(s["task_id"], "deny", uid)
+                tid = s.get("task_id")
+                r = self.exec_relay.approve(tid, "deny", uid)
                 self._notify_session(s, "🚫 已拒绝，任务终止。")
+                self._card_final(
+                    s, f"🍂 **{self.cfg.avatar_name}已拒绝 🚫**\n\n"
+                       "> 门禁请求已被拒绝，任务终止", 3)
                 s["state"] = "IDLE"
+                s["task_id"] = None
                 self._swap_ack(s, "")
-                self.st.archive_round(s["task_id"], "deny", r)
+                self.st.archive_round(tid, "deny", r)
                 return
             self._reprompt(s)
             return
@@ -803,8 +840,10 @@ class Avatar:
                     self.st.archive_round(tid, "cancel-by-user", r)
                     self._notify_session(
                         s, "🚫 已取消任务，补充内容一并丢弃。")
+                    self._card_final(s, "🍂 **已取消 🚫**", 3, task_id=tid)
                 else:
                     self._notify_session(s, "已放弃待提交的追问内容。")
+                    self._card_final(s, "🍂 **已取消 🚫**", 3)
                 s["task_id"] = None
                 s["followups"] = []
                 s["buffer"] = []
@@ -1003,7 +1042,7 @@ class Avatar:
         return (ok and delivered is not False), delivered, err
 
     def _flush(self, s: dict, followup: bool = False, uid: str = "",
-               force_relay: bool = False):
+               force_relay: bool = False, card_note: str = ""):
         items = s["followups"] if followup else s["buffer"]
         # 兜底过滤：控制关键词不是需求。#150 实测——三条被吞进 followups 的「进度」
         # 在上一件任务结束时被刷成 desc="进度\n\n进度\n\n进度" 的真任务，白占一个
@@ -1047,8 +1086,11 @@ class Avatar:
                                    resume_from=resume, uid=uid,
                                    requester=self._requester_name(s))
         if "_error" in r:
-            self._notify_session(s, f"⚠️ 提交失败了：{r['_error']} "
-                                    f"{str(r.get('_detail', ''))[:120]}，稍后再试～")
+            msg = (f"⚠️ 提交失败了：{r['_error']} "
+                   f"{str(r.get('_detail', ''))[:120]}，稍后再试～")
+            self._card_final(
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n> {msg}", 5)
+            self._notify_session(s, msg)
             s["state"] = "IDLE"
             self._swap_ack(s, "fail_text_emotion")
             return
@@ -1071,7 +1113,8 @@ class Avatar:
             "ingress": "dingtalk", "backend": "relay",
             "tier": self.policy.get_level(uid)})
         self._react(s, "submit_emoji")
-        self._card_open(s, tid, desc)
+        self._card_open(s, tid, desc, backend="relay",
+                        reuse=bool(force_relay), note=card_note)
         log(f"task #{tid} submitted (resume={resume})")
 
     # ── local 后端团队任务（只读编排，可委派 subagent） ──
@@ -1107,12 +1150,6 @@ class Avatar:
             return False
         if s.get("state") == "LOCAL":
             return False                       # 已有本机任务在跑，不并发
-        biz = ""
-        if self.cfg.get("ingress", "use_card", True):
-            try:
-                biz = card_biz_id(self.dws.card_create(s["reply"]))
-            except Exception:
-                biz = ""
         if followup:
             s["followups"] = []
         else:
@@ -1121,9 +1158,6 @@ class Avatar:
         s["task_id"] = None
         s["state"] = "LOCAL"
         s["local_result"] = None
-        # 重启恢复元数据。local 通路没有 relay task_id，进程一退 daemon 线程即
-        # 消失，仅凭 state="LOCAL" 无法区分「正在跑」与「上一进程遗留」。落任务
-        # 原文 + 起跑时刻 + 硬截止，供 _reap_local（启动清理／超时兜底）改投 relay。
         s["local_desc"] = desc
         s["local_started"] = time.time()
         try:
@@ -1131,12 +1165,14 @@ class Avatar:
         except Exception:
             local_timeout = float(self.cfg.get("claude",
                                                "reply_timeout_sec", 600))
+        s["local_timeout"] = local_timeout
         s["local_deadline"] = s["local_started"] + local_timeout + 60
         s["notified_followup"] = False
         self._swap_ack(s, "")
-        # 影子记录：让 local 任务在 relay 任务列表/看板可见（否则无 task_id，
-        # 出事故只能翻 journal+audit+state.json 三处对账）。建记录失败**不阻断**
-        # local 执行——降级回今天的无记录行为，可见性不该成为可用性前提。
+        biz = self._card_open(s, None, desc, backend="local")
+        key = str(s.get("key") or "")
+        self._local_progress[key] = {"ts": time.time(), "steps": [],
+                                     "count": 0}
         rec = {}
         try:
             rec = self.exec_relay.create_local_record(
@@ -1145,6 +1181,8 @@ class Avatar:
             log("local shadow record failed:", repr(e)[:120])
         if "_error" not in rec and rec.get("task_id"):
             s["task_id"] = rec["task_id"]
+            self.cards.touch(biz, 1, s["task_id"])
+            s["card_task_id"] = s["task_id"]
         else:
             s["task_id"] = None
         self.st.archive_round(f"local-{uid}", "submit", {
@@ -1154,28 +1192,49 @@ class Avatar:
             "sandbox": cons.get("sandbox", ""),
             "write_dirs": list(cons.get("write_dirs") or []),
             "add_dirs": list(cons.get("add_dirs") or [])})
-        threading.Thread(target=self._local_worker,
-                         args=(s, uid, desc, biz), daemon=True).start()
+        threading.Thread(
+            target=self._local_worker,
+            args=(s, uid, desc, biz, key, s.get("card_hint") or "",
+                  bool((s.get("reply") or {}).get("is_group")),
+                  local_timeout),
+            daemon=True).start()
         log(f"local task started for {uid} (tier={cons['tier']}"
             + (f", shadow=#{s['task_id']})" if s.get("task_id") else ", no shadow)"))
         return True
 
-    def _local_worker(self, s: dict, uid: str, desc: str, biz: str):
-        """后台执行 local 任务；只写 s["local_result"]，不碰其他会话态。"""
+    def _local_worker(self, s: dict, uid: str, desc: str, biz: str,
+                      key: str, hint: str, is_group: bool,
+                      budget: float):
         throttle = {"upd": 0.0}
         gap = float(self.cfg.get("ingress", "card_progress_sec", 30))
+        started = time.time()
 
         def on_step(step, steps):
+            now = time.time()
+            tail = list(steps or [])[-5:]
+            self._local_progress[key] = {"ts": now, "steps": tail,
+                                         "count": len(steps or [])}
             if not biz:
                 return
-            now = time.time()
             if now - throttle["upd"] < gap:
                 return
             throttle["upd"] = now
+            ctx = card_progress.ProgressCtx(
+                avatar_name=self.cfg.avatar_name,
+                hint=hint,
+                backend="local",
+                status="local",
+                total_elapsed=now - started,
+                seg_elapsed=now - started,
+                budget=budget,
+                actions=tail[-3:],
+                controls="本机预处理中；超时会自动转后台持久通道",
+                detail=not is_group or bool(self.cfg.get(
+                    "ingress", "card_progress_detail_in_group", False)),
+                mode=self._card_mode(),
+            )
             try:
-                self.dws.card_update(
-                    biz, f"🍂 **{self.cfg.avatar_name}正在处理…**\n\n"
-                    + "\n".join(f"> {x}" for x in steps[-6:]), 1)
+                self._card_update_biz(biz, card_progress.render(ctx), 1)
             except Exception:
                 pass
 
@@ -1202,7 +1261,10 @@ class Avatar:
                     self._reap_local(key, s, "timeout")
                 continue                       # 仍在跑
             s["local_result"] = None
+            self._local_progress.pop(key, None)
             r, biz, uid = res["r"], res["biz"], res["uid"]
+            if biz and s.get("card_biz") != biz:
+                s["card_biz"] = biz
             desc, out = res["desc"], str(r.get("text") or "").strip()
             if r.get("escalate") or not out:
                 s["state"] = "IDLE"
@@ -1242,7 +1304,9 @@ class Avatar:
                 self._report_local(s, "cancelled", uid=uid,
                                    error="升级 relay 门禁"
                                          + (f"：{why}" if why else ""))
-                self._flush(s, uid=uid, force_relay=True)
+                self._flush(s, uid=uid, force_relay=True,
+                            card_note="本机预处理已转后台持久通道；"
+                                      "已保留阶段摘要，不会从头重做")
                 continue
             s["state"] = "IDLE"
             # 代投文件与代建计划。必须在清元数据与回报之前做：去重键要取影子
@@ -1267,18 +1331,15 @@ class Avatar:
             s["local_desc"] = ""
             s["local_started"] = 0
             s["local_deadline"] = 0
+            s["local_timeout"] = 0.0
             s["local_reap_count"] = 0
             s["user_started_at"] = 0.0
             self._report_local(s, "done", uid=uid, result=out)
             self.st.archive_round(f"local-{uid}", "done",
                                   {"backend": "local", "chars": len(out),
                                    "out": out[:500]})
-            done = False
-            if biz:
-                try:
-                    done = bool(self.dws.card_update(biz, out[:2500], 3))
-                except Exception:
-                    done = False
+            done = self._card_final(s, out, 3,
+                                    task_id=s.get("card_task_id"))
             if not done:
                 self._notify_session(s, out)
             # 去重绑定进来的其它会话**必须**另发真实消息：卡片是原地更新（钉钉
@@ -1330,9 +1391,9 @@ class Avatar:
         s["state"] = "IDLE"
         s["local_result"] = None
         s["local_deadline"] = 0
+        s["local_timeout"] = 0.0
         s["local_reap_count"] = n + 1
-        # 影子记录标 failed。必须在 _flush 之前——_flush 会覆盖 s["task_id"]。
-        # 三个分支（无 desc／重投护栏／正常改投）都要报，故放在分支之前。
+        self._local_progress.pop(key, None)
         self._report_local(s, "failed", uid=uid,
                            error=f"local 任务中断（{why}），未产出结果")
         self.audit.log("local_reaped", uid,
@@ -1341,12 +1402,17 @@ class Avatar:
                        backend="local")
         log(f"reaping stale LOCAL session {key} (reason={reason})")
         if not desc:
+            self._card_final(
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n"
+                   f"> 本机执行因{why}中断，且未留存任务内容", 5)
             self._notify_session(
                 s, f"⚠️ 上一条任务因{why}中断，且未留存任务内容，"
                    f"麻烦你再发一次。")
             return
         if n >= 2:
-            # 反复中断（如崩溃循环）不再自动重投，避免任务风暴；交回人工。
+            self._card_final(
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n"
+                   f"> 本机执行因{why}中断，且已自动重投 2 次仍未跑成", 5)
             self._notify_session(
                 s, f"⚠️ 上一条任务因{why}中断，且已自动重投 2 次仍未跑成，"
                    f"先不再自动重试。请稍后重发，或联系管理员。")
@@ -1355,7 +1421,8 @@ class Avatar:
             s, f"⚠️ 上一条任务因{why}中断，未产出结果。已自动改投持久通道重跑，"
                f"跑完主动回你。")
         s["buffer"] = [desc]
-        self._flush(s, uid=uid, force_relay=True)
+        self._flush(s, uid=uid, force_relay=True,
+                    card_note=f"本机执行因{why}中断，已转后台持久通道重跑")
 
     def _reap_stale_local(self):
         """启动时清理上一进程遗留的 LOCAL 态会话（见 _reap_local）。"""
@@ -1364,83 +1431,369 @@ class Avatar:
                 self._reap_local(key, s, "restart")
         self.sess.save()
 
-    # ── 流式卡片（fenshen 样式：叶子+粗体名+引用行；提交即开卡，跳变更新，完成定格） ──
-    def _card_open(self, s: dict, tid, desc: str):
-        if not self.cfg.get("ingress", "use_card", True):
+    # ── 流式卡片（一请求一卡；跳变更新；完成定格；失败可追踪） ──
+    def _card_mode(self) -> str:
+        return str(self.cfg.get("ingress", "card_progress_mode", "rich")).lower()
+
+    def _card_detail(self, s: dict) -> bool:
+        if (s.get("reply") or {}).get("is_group"):
+            return bool(self.cfg.get("ingress",
+                                     "card_progress_detail_in_group", False))
+        return True
+
+    def _card_gap(self, s: dict) -> int:
+        normal = int(self.cfg.get("ingress", "card_progress_sec", 30) or 0)
+        if normal <= 0:
+            return 0
+        now = time.time()
+        start = float(s.get("user_started_at") or s.get("card_start") or now)
+        elapsed = max(0.0, now - start)
+        fast = int(self.cfg.get("ingress", "card_progress_fast_sec", 15) or 0)
+        slow = int(self.cfg.get("ingress", "card_progress_slow_sec", 60) or 0)
+        if elapsed < 180 and fast > 0:
+            return fast
+        if elapsed < 900:
+            return normal
+        return slow or normal
+
+    def _card_update_biz(self, biz: str, content: str, flow_status: int,
+                         task_id=None, track: bool = True) -> tuple:
+        if not biz:
+            return False, "empty_biz", False
+        content = (content or "")[:2500]
+        fn = getattr(self.dws, "card_update_ex", None)
+        try:
+            if callable(fn):
+                res = fn(biz, content, flow_status) or {}
+                ok = bool(res.get("ok"))
+                err = str(res.get("error") or "")
+                retryable = bool(res.get("retryable"))
+            else:
+                ok = bool(self.dws.card_update(biz, content, flow_status))
+                err = "" if ok else "card_update=false"
+                retryable = False
+        except Exception as e:
+            return False, repr(e)[:160], False
+        if ok and track:
+            self.cards.touch(biz, flow_status, task_id)
+        return ok, err, retryable
+
+    def _card_update(self, s: dict, biz: str, content: str, flow_status: int,
+                     task_id=None) -> tuple:
+        tid = task_id or s.get("card_task_id") or s.get("task_id")
+        ok, err, retryable = self._card_update_biz(biz, content, flow_status,
+                                                   task_id=tid)
+        if not ok and not s.get("card_fail_logged"):
+            s["card_fail_logged"] = True
+            log(f"card update not accepted (flow={flow_status})", err)
+            self.audit.log("card_update_failed", str(s.get("uid") or ""),
+                           f"flow={flow_status} err={err}"[:300],
+                           backend=s.get("card_backend", ""), task_id=tid)
+        return ok, err
+
+    def _card_meta(self, s: dict, biz: str, tid, desc: str, backend: str,
+                   fresh: bool = True):
+        now = time.time()
+        s["card_biz"] = biz
+        if fresh or not s.get("card_start"):
+            s["card_start"] = now
+            s["card_progress"] = {}
+            s["card_real_summary_count"] = 0
+            s["card_last_real_summary"] = 0.0
+        s["card_upd"] = now
+        s["card_hint"] = (desc.splitlines() or [""])[0][:40]
+        s["card_backend"] = backend
+        s["card_task_id"] = tid
+        s["card_state"] = "open"
+        s.pop("card_fail_logged", None)
+
+    def _abandon_card(self, s: dict, biz: str, reason: str):
+        biz = biz or s.get("card_biz")
+        if not biz:
             return
+        tid = s.get("card_task_id") or s.get("task_id")
+        self.cards.orphan(biz, reason, tid)
+        self.audit.log("card_orphan_created", str(s.get("uid") or ""),
+                       f"biz={str(biz)[:12]} reason={reason}"[:300],
+                       backend=s.get("card_backend", ""), task_id=tid)
+        if s.get("card_biz") == biz:
+            s.pop("card_biz", None)
+            s["card_state"] = "orphan"
+            s.pop("card_start", None)
+            s.pop("card_upd", None)
+            s.pop("card_fail_logged", None)
+
+    def _card_open(self, s: dict, tid, desc: str, backend: str = "relay",
+                   reuse: bool = False, note: str = "") -> str:
+        if not self.cfg.get("ingress", "use_card", True):
+            return ""
+        hint = (desc.splitlines() or [""])[0][:40]
+        existing = s.get("card_biz")
+        if existing and reuse:
+            ctx = self._progress_ctx(
+                s, backend=backend,
+                status="queued" if backend == "relay" else "local",
+                note=note)
+            ok, err = self._card_update(s, existing,
+                                        card_progress.render(ctx), 1,
+                                        task_id=tid)
+            if ok:
+                self._card_meta(s, existing, tid, desc, backend, fresh=False)
+                self.cards.open(existing,
+                                self._target_sig(s.get("reply") or {}),
+                                tid, backend, hint)
+                return existing
+            self._abandon_card(s, existing, f"reuse_failed:{err}")
+        elif existing:
+            self._abandon_card(s, existing, "stale_before_new")
         try:
             resp = self.dws.card_create(s["reply"])
         except Exception as e:
             log("card create failed:", e)
-            return
+            return ""
         biz = card_biz_id(resp)
         if not biz:
-            return
+            return ""
         recall.record(self.st, "card",
                       s["reply"].get("open_dingtalk_id")
                       or s["reply"].get("conversation_id"), resp,
                       task_id=tid, snippet=f"card:{biz}")
-        s["card_biz"] = biz
-        s["card_hint"] = (desc.splitlines() or [""])[0][:40]
-        s["card_start"] = time.time()
-        s["card_upd"] = time.time()
+        self._card_meta(s, biz, tid, desc, backend, fresh=True)
+        self.cards.open(biz, self._target_sig(s.get("reply") or {}),
+                        tid, backend, hint)
+        ctx = self._progress_ctx(
+            s, backend=backend,
+            status="queued" if backend == "relay" else "local", note=note)
+        ok, err = self._card_update(s, biz, card_progress.render(ctx), 1,
+                                    task_id=tid)
+        if not ok:
+            log("card first frame failed:", err)
+        return biz
+
+    def _card_frame(self, s: dict, note: str = "", backend: str = "",
+                    status: str = "", row=None) -> str:
+        ctx = self._progress_ctx(s, backend=backend, status=status,
+                                 row=row, note=note)
+        return card_progress.render(ctx)
+
+    @staticmethod
+    def _action_text(a) -> str:
+        if isinstance(a, dict):
+            label = str(a.get("label") or a.get("tool") or "")
+            detail = str(a.get("detail") or "")
+            return f"{label} · {detail}" if detail else label
+        return str(a or "")
+
+    def _progress_ctx(self, s: dict, backend: str = "", status: str = "",
+                      row=None, tid=None, note: str = "",
+                      actions=None) -> card_progress.ProgressCtx:
+        now = time.time()
+        row = row or {}
+        backend = backend or s.get("card_backend") or (
+            "local" if s.get("state") == "LOCAL" else "relay")
+        status = status or str(row.get("status") or "") or (
+            "local" if backend == "local" else "running")
+        start = float(s.get("user_started_at") or s.get("card_start") or now)
+        total = max(0.0, now - start)
+        seg = _seg_of(row.get("resume_hint") or "") if row else 0
+        if not seg and backend == "relay":
+            seg = int(s.get("seg_seen") or 0)
+        started = row.get("started_at")
+        seg_elapsed = max(0.0, now - float(started)) if started else (
+            total if backend == "local" else 0.0)
+        prog = s.get("card_progress") or {}
+        budget = 0.0
+        max_seg = 0
+        queue = {}
+        stage = ""
+        controls = ""
+        if backend == "local":
+            budget = float(s.get("local_timeout") or 0)
+            if actions is None:
+                lp = self._local_progress.get(s.get("key") or "") or {}
+                actions = lp.get("steps") or []
+            status = status or "local"
+            controls = "本机预处理中；超时会自动转后台持久通道"
+        else:
+            budget = float(prog.get("budget_sec")
+                           or self.cfg.get("ingress",
+                                           "relay_segment_budget_sec", 1800)
+                           or 0)
+            max_seg = int(prog.get("max_segments")
+                          or self.cfg.get("ingress", "relay_max_segments", 3)
+                          or 0)
+            queue = prog.get("queue") or {}
+            stage = str(prog.get("stage") or "")
+            if actions is None:
+                actions = [self._action_text(a)
+                           for a in (prog.get("recent") or [])]
+            if status in ("queued", "running"):
+                controls = "发「进度」看详情，发「取消」随时中止"
+            if status == "queued":
+                budget = 0.0
+        if note:
+            stage = ""
+        elif s.get("long_notified") and backend == "relay" \
+                and status in ("queued", "running"):
+            stage = (f"长任务后台执行中（第 {seg + 1} 段）" if seg >= 1
+                     else "长任务后台执行中")
+            mode = str(self.cfg.get("ingress", "long_task_mode", "on")).lower()
+            controls = (("会自动分段接续、跑完主动通知你；"
+                         "发「进度」看状态，发「取消」随时中止")
+                        if mode == "on" else
+                        "还在继续跑，跑完主动通知你；"
+                        "发「进度」看状态，发「取消」随时中止")
+        actions = list(actions or [])[-int(self.cfg.get(
+            "ingress", "card_progress_actions", 3) or 3):]
+        return card_progress.ProgressCtx(
+            avatar_name=self.cfg.avatar_name,
+            hint=s.get("card_hint") or "",
+            backend=backend,
+            status=status,
+            total_elapsed=total,
+            seg_elapsed=seg_elapsed,
+            budget=budget,
+            seg=seg,
+            max_seg=max_seg,
+            stage=stage,
+            actions=actions,
+            note=note,
+            controls=controls,
+            queue=queue,
+            detail=self._card_detail(s),
+            mode=self._card_mode(),
+        )
+
+    def _relay_progress_fail(self, s: dict, tid, err: str):
+        if s.get("card_progress_fail_logged"):
+            return
+        s["card_progress_fail_logged"] = True
+        log(f"relay progress fetch failed #{tid}", err)
+        self.audit.log("card_progress_fetch_failed", str(s.get("uid") or ""),
+                       f"task={tid} err={err}"[:300], backend="relay",
+                       task_id=tid)
+
+    def _fetch_relay_progress(self, s: dict, tid, row: dict, gap: int,
+                              force: bool = False):
+        if self._card_mode() != "rich":
+            return
+        if not bool(self.cfg.get("ingress", "relay_progress_enabled", True)):
+            return
+        now = time.time()
+        if not self._relay_progress_enabled:
+            if now < self._relay_progress_retry:
+                return
+            self._relay_progress_enabled = True
+        fn = getattr(self.exec_relay, "progress", None)
+        if not callable(fn):
+            return
+        avail = getattr(self.exec_relay, "available", None)
+        if callable(avail) and not avail():
+            return
+        prog = s.setdefault("card_progress", {})
+        if not force and now - float(prog.get("fetched") or 0) < max(gap, 1):
+            return
+        prog["fetched"] = now
         try:
-            self.dws.card_update(biz, self._card_frame(
-                s, "正在为你办，稍等一下～"), 1)
+            r = fn(tid, int(prog.get("cursor") or 0),
+                   int(self.cfg.get("ingress", "card_progress_actions", 3)))
         except Exception as e:
-            log("card first frame failed:", e)
+            self._relay_progress_fail(s, tid, repr(e)[:120])
+            return
+        if not isinstance(r, dict):
+            return
+        if r.get("_error"):
+            if r.get("_error") == 404:
+                self._relay_progress_enabled = False
+                self._relay_progress_retry = now + float(
+                    self.cfg.get("ingress", "relay_progress_retry_sec", 1800))
+            self._relay_progress_fail(s, tid, str(r.get("_error")))
+            return
+        self._relay_progress_enabled = True
+        s.pop("card_progress_fail_logged", None)
+        prog["cursor"] = int(r.get("last_event_id") or prog.get("cursor") or 0)
+        seg = r.get("segment")
+        if seg is not None and prog.get("segment") is not None \
+                and int(seg) != int(prog.get("segment") or 0):
+            prog["recent"] = []
+            prog["stage"] = ""
+        if seg is not None:
+            prog["segment"] = int(seg)
+        new = r.get("recent") or []
+        if new:
+            old = prog.get("recent") or []
+            limit = int(self.cfg.get("ingress", "card_progress_actions", 3))
+            prog["recent"] = (old + new)[-limit:]
+        prog["tool_calls"] = r.get("tool_calls") or prog.get("tool_calls") or 0
+        prog["queue"] = r.get("queue") or {}
+        prog["stage"] = r.get("stage") or ""
+        prog["budget_sec"] = r.get("budget_sec") or prog.get("budget_sec") or 0
+        prog["max_segments"] = r.get("max_segments") or prog.get("max_segments") or 0
 
-    def _card_frame(self, s: dict, note: str) -> str:
-        return (f"🍂 **{self.cfg.avatar_name}正在处理…**\n\n"
-                f"> 📥 已收到：{s.get('card_hint') or ''}\n> ⏳ {note}")
-
-    def _card_beat(self, s: dict, tid, status: str):
-        """运行中进度刷新（节流 card_progress_sec，防钉钉客户端合并帧）。"""
+    def _card_beat(self, s: dict, tid, status: str, row=None):
         biz = s.get("card_biz")
         if not biz:
             return
-        gap = int(self.cfg.get("ingress", "card_progress_sec", 30))
+        gap = self._card_gap(s)
         now = time.time()
-        if now - s.get("card_upd", 0) < gap:
+        if now - float(s.get("card_upd", 0)) < gap:
             return
         s["card_upd"] = now
-        used = int(now - s.get("card_start", now))
-        if s.get("long_notified"):
-            # 长任务态必须**持续**写在心跳帧里。一次性提示帧撑不过 30s——下一次心跳
-            # 就把整张卡片覆盖成"正在为你办"，用户回头看等于没提示（#146 实测踩到：
-            # 14:03:44 提示已发、long_notified=True，但 14:04 起卡片全是心跳文案）。
-            seg = int(s.get("seg_seen") or 0)
-            # seg_seen 是"已完成段数"：≥1 才说明任务被拆过，显示正在跑的第 seg+1 段
-            word = (f"长任务后台执行中（第 {seg + 1} 段）" if seg >= 1
-                    else "长任务后台执行中")
-            note = (f"{word}…（已用 {used}s）会自动分段接续、跑完主动通知你；"
-                    "发「进度」看状态、「取消」随时中止")
-        else:
-            word = "已排队，马上开始" if status == "queued" else "正在为你办"
-            note = f"{word}…（已用 {used}s）"
-        try:
-            accepted = bool(self.dws.card_update(biz, self._card_frame(s, note), 1))
-            err = None
-        except Exception as e:                      # 钉钉抽风不能把 poll 循环带崩
-            accepted, err = False, e
-        if not accepted and not s.get("card_fail_logged"):
-            # 每会话只留一次痕：此前 `except: pass` 把失败全吞了，排查「用户看不到
-            # 进度」时根本无从判断是没发、发失败、还是发了但不显眼（#147 三种都要排）。
+        if status in ("queued", "running"):
+            self._fetch_relay_progress(s, tid, row or {}, gap)
+        ctx = self._progress_ctx(s, backend="relay", status=status,
+                                 row=row or {}, tid=tid)
+        ok, err = self._card_update(s, biz, card_progress.render(ctx), 1,
+                                    task_id=tid)
+        if not ok and not s.get("card_fail_logged"):
             s["card_fail_logged"] = True
             log(f"card beat not accepted (task #{tid})", err or "")
+        if ok:
+            self._maybe_real_summary(s, ctx)
+
+    def _maybe_real_summary(self, s: dict,
+                            ctx: card_progress.ProgressCtx):
+        sec = int(self.cfg.get("ingress", "card_real_summary_sec", 900) or 0)
+        maxn = int(self.cfg.get("ingress", "card_real_summary_max", 2) or 0)
+        if sec <= 0 or maxn <= 0 or not s.get("long_notified"):
+            return
+        now = time.time()
+        count = int(s.get("card_real_summary_count") or 0)
+        last = float(s.get("card_last_real_summary") or 0)
+        if last <= 0:
+            s["card_last_real_summary"] = now
+            return
+        if count >= maxn or now - last < sec:
+            return
+        s["card_real_summary_count"] = count + 1
+        s["card_last_real_summary"] = now
+        try:
+            self._notify_session(s, card_progress.render_summary(ctx))
+        except Exception as e:
+            log("card real summary failed:", e)
 
     def _progress_reply(self, s: dict, uid: str) -> None:
-        """「进度」→ 立即回一条独立消息报当前状态（不动卡片、不进聚合缓冲）。
-
-        为什么必须有：长任务提示三处都承诺了「发进度看状态」，但 keywords 里原先
-        没有 progress 意图——RUNNING 时被当追问吞进 followups（首条只贴表情、其后
-        全静默），IDLE 时被当暂存笔记存起来。承诺一个不存在的命令＝提示说谎，比不
-        提示更糟：用户会判定分身死了。#149 实测复现（15:33 提示发出后连问无应答）。
-
-        状态全部取自 relay 现有 row（poll 一次），不新增 API；lane 不在 row 里，
-        故不报 lane——宁可少说，不编。
-        """
         tid = s.get("task_id")
+        if s.get("state") == "LOCAL":
+            now = time.time()
+            start = float(s.get("user_started_at") or s.get("local_started")
+                          or now)
+            used = max(0, int(now - start))
+            budget = int(s.get("local_timeout") or 0)
+            lp = self._local_progress.get(s.get("key") or "") or {}
+            actions = [card_progress.safe_text(a, 70)
+                       for a in (lp.get("steps") or [])[-3:]]
+            lines = [(f"#{tid} · 本机预处理中" if tid else "本机预处理中"),
+                     f"总用时 {card_progress.fmt_dur(used)}"]
+            if budget > 0:
+                lines.append(f"本机预算 {card_progress.fmt_dur(budget)}")
+            stage = card_progress.infer_stage(actions, "local", "local")
+            lines.append(f"当前阶段：{stage}")
+            if actions and self._card_detail(s):
+                lines.append("最近动作：" + "；".join([a for a in actions if a]))
+            lines.append("超时会自动转后台持久通道，不会丢任务")
+            self._notify_session(s, "⏳ " + "\n· ".join(lines))
+            return
         if not tid:
             last = s.get("last_task_id")
             self._notify_session(
@@ -1464,6 +1817,16 @@ class Avatar:
         seg = _seg_of(row.get("resume_hint") or "")
         if seg:
             lines.append(f"正在跑第 {seg + 1} 段（前 {seg} 段产出已保留，不重做）")
+        if status in ("queued", "running"):
+            self._fetch_relay_progress(s, tid, row, 0, force=True)
+            prog = s.get("card_progress") or {}
+            if prog.get("stage"):
+                lines.append(f"当前阶段：{prog.get('stage')}")
+            actions = [self._action_text(a)
+                       for a in (prog.get("recent") or [])[-3:]]
+            actions = [a for a in actions if a]
+            if actions and self._card_detail(s):
+                lines.append("最近动作：" + "；".join(actions))
         fu = s.get("followups") or []
         if fu:
             lines.append(f"你追加的 {len(fu)} 条已并入本轮，跑完一并处理")
@@ -1472,35 +1835,19 @@ class Avatar:
         self._notify_session(s, "⏳ " + "\n· ".join(lines))
 
     def _long_task_notice(self, s: dict, tid, row: dict, status: str) -> bool:
-        """长任务升级／分段续跑的进度告知。返回 True＝本轮已发帧（心跳可跳过）。
-
-        判据在**分身侧自算**：elapsed 取 relay 本段耗时与用户总等待的较大值，
-        段号从 resume_hint 的 [seg:N] 标记读回。relay 的 row 本来就带 started_at，
-        故**零新增 HTTP 请求、零 API 变更**；每轮只多几次浮点/字符串比较。
-
-        为什么用用户总等待：local 预处理超时升级 relay 后，row.started_at 会重新
-        起算；若只看 relay 段，用户实际已等 10 分钟，却还要再等 10 分钟才收到
-        长任务提示（2026-10-21 #1173→#1175 实测）。
-
-        为什么不在提交时预测：静态特征精确率仅 16.9%（desc≥1000 字）／15.9%（长活
-        关键词），要抓 91.7% 召回得给 60% 的任务贴"这是个大活儿"，八成是错的——
-        提示一旦经常说谎，用户就不再信它。运行时判据 T=10m 是 75% 精确率、100% 召回。
-        """
         mode = str(self.cfg.get("ingress", "long_task_mode", "on")).lower()
         thr = float(self.cfg.get("ingress", "long_task_threshold_sec", 600) or 0)
         started = row.get("started_at")
         if mode not in ("notify", "on") or thr <= 0 or not started:
             return False
         seg = _seg_of(row.get("resume_hint") or "")
-        # 分段边界优先：用户最想知道的是"没死，还在接着干"。
-        # started_at 每段会被 relay 重置，故 elapsed 是**本段**耗时，不会重复触发。
         if seg > 0 and seg != s.get("seg_seen"):
             s["seg_seen"] = seg
             s["long_notified"] = True
-            # seg 是 relay 写的"已完成段数"，正在跑的是第 seg+1 段（人读序号）
             return self._card_note(s, (
                 f"这个活儿比较大，正在跑第 {seg + 1} 段，已产出的部分不会重做。"
-                "跑完我主动通知你；发「进度」看状态，发「取消」随时中止"))
+                "跑完我主动通知你；发「进度」看状态，发「取消」随时中止"),
+                row=row, status=status)
         now = time.time()
         elapsed = now - float(started)
         user_started = float(s.get("user_started_at") or 0)
@@ -1510,33 +1857,25 @@ class Avatar:
             return False
         s["long_notified"] = True
         used = int(elapsed)
-        # mode=on 才承诺"分段接续不掐断"；notify 阶段 relay 仍会在单段上限处停，
-        # 不能许下做不到的话。
         tail = ("已转**后台长任务**，会自动分段接续、不再被中途掐断，跑完主动通知你"
                 if mode == "on" else
                 "还在继续跑，跑完我主动通知你")
         return self._card_note(s, (
             f"已用 {used // 60} 分 {used % 60} 秒，比一般任务大。{tail}；"
-            "发「进度」看状态，发「取消」随时中止"))
+            "发「进度」看状态，发「取消」随时中止"), row=row, status=status)
 
-    def _card_note(self, s: dict, note: str, announce: bool = True) -> bool:
-        """发一帧卡片进度；announce=True 时**另发一条独立消息**。
-
-        为什么必须另发一条：卡片是**原地更新**的，不产生新消息、不触发提醒，外观几乎
-        没变（只有 ⏳ 那一行字），用户实测「看不到提示」——#147 排查确认
-        card_update 返回 success=true、long_notified=True、心跳也在按 30s 刷新，
-        但用户两次反馈没看见。重要的状态变化必须落成一条真正的消息才可见。
-        同时刷新节流时间戳，避免紧接着的心跳帧把卡片上的提示冲掉。
-        """
+    def _card_note(self, s: dict, note: str, announce: bool = True,
+                   row=None, status: str = "") -> bool:
         s["card_upd"] = time.time()
+        if announce:
+            s["card_last_real_summary"] = s["card_upd"]
         biz = s.get("card_biz")
         framed = False
         if biz:
-            try:
-                framed = bool(self.dws.card_update(
-                    biz, self._card_frame(s, note), 1))
-            except Exception as e:
-                log("card long-task frame failed:", e)
+            framed, err = self._card_update(
+                s, biz, self._card_frame(s, note, row=row, status=status), 1)
+            if not framed:
+                log("card long-task frame failed:", err)
         if announce or not framed:
             try:
                 self._notify_session(s, f"⏳ {note}")
@@ -1544,15 +1883,70 @@ class Avatar:
                 log("long-task notify failed:", e)
         return True
 
-    def _card_final(self, s: dict, content: str, status: int = 3) -> bool:
-        biz = s.pop("card_biz", None)
+    def _card_final(self, s: dict, content: str, status: int = 3,
+                    task_id=None) -> bool:
+        biz = s.get("card_biz")
         if not biz:
             return False
-        try:
-            return bool(self.dws.card_update(biz, content[:2500], status))
-        except Exception as e:
-            log("card final failed:", e)
-            return False
+        tid = task_id or s.get("card_task_id") or s.get("task_id")
+        attempts = 2 if callable(getattr(self.dws, "card_update_ex", None)) else 1
+        err = ""
+        for i in range(attempts):
+            ok, err, retryable = self._card_update_biz(biz, content, status,
+                                                       task_id=tid)
+            if ok:
+                s.pop("card_biz", None)
+                s["card_state"] = "final"
+                self.cards.close(biz, status)
+                self.audit.log("card_final_ok", str(s.get("uid") or ""),
+                               f"status={status}",
+                               backend=s.get("card_backend", ""), task_id=tid)
+                return True
+            if not retryable or i + 1 >= attempts:
+                break
+        self.cards.orphan(biz, f"final_failed:{err}", tid)
+        self.audit.log("card_final_failed", str(s.get("uid") or ""),
+                       f"status={status} err={err}"[:300],
+                       backend=s.get("card_backend", ""), task_id=tid)
+        s.pop("card_biz", None)
+        s["card_state"] = "orphan"
+        log("card final failed:", err)
+        return False
+
+    def _sweep_cards(self, force: bool = False):
+        interval = int(self.cfg.get("ingress", "card_orphan_sweep_sec", 900) or 0)
+        ttl = int(self.cfg.get("ingress", "card_orphan_ttl_sec", 3600) or 0)
+        batch = int(self.cfg.get("ingress", "card_orphan_sweep_batch", 5) or 0)
+        if interval <= 0 or ttl <= 0 or batch <= 0:
+            return
+        now = time.time()
+        if not force and now < self._card_sweep_next:
+            return
+        self._card_sweep_next = now + interval
+        active_states = ("RUNNING", "LOCAL", "WAIT_APPROVAL", "WAIT_REVIEW",
+                         "BUFFERING", "FOLLOWUP")
+        skip = {s.get("card_biz") for s in self.sess.sessions.values()
+                if s.get("card_biz") and s.get("state") in active_states}
+        stale = self.cards.stale(now, 0 if force else ttl, skip, batch)
+        for biz, rec in stale:
+            tids = rec.get("task_ids") or []
+            tid = tids[-1] if tids else None
+            content = (f"🍂 **{self.cfg.avatar_name}已结束**\n\n"
+                       "> 这张进度卡已停止更新；如有结果或失败通知，"
+                       "请查看后续消息。")
+            ok, err, _ = self._card_update_biz(biz, content, 3, task_id=tid)
+            age = int(now - float(rec.get("last_update")
+                                  or rec.get("created") or now))
+            if ok:
+                self.cards.close(biz, 3)
+                self.audit.log("card_orphan_swept", "system",
+                               f"biz={str(biz)[:12]} age={age}s", task_id=tid)
+            else:
+                self.cards.orphan(biz, f"sweep_failed:{err}", tid)
+                self.audit.log("card_orphan_abandoned", "system",
+                               f"biz={str(biz)[:12]} age={age}s err={err}"[:300],
+                               task_id=tid)
+        self.cards.save()
 
     # ── relay 任务轮询 ──
     def _poll_sessions(self):
@@ -1574,7 +1968,7 @@ class Avatar:
                 # 长任务提示优先于心跳：升级／分段这类"状态变了"的告知每任务只发一次，
                 # 发过就跳过本轮心跳，免得 30s 节流帧紧跟着把它冲掉。
                 if not self._long_task_notice(s, tid, row, status):
-                    self._card_beat(s, tid, status)
+                    self._card_beat(s, tid, status, row=row)
                 continue
             if status == "pending_approval" and s["state"] != "WAIT_APPROVAL":
                 s["state"] = "WAIT_APPROVAL"
@@ -1585,19 +1979,14 @@ class Avatar:
                 uid = str(s.get("uid") or "")
                 self._notify_gate(s, uid)
                 if s.get("card_biz"):
-                    # 卡片是发给**发起人**的，同样不贴 shell 原文
                     summ = self._gate_summary(s["gate_cmd"], s["gate_cat"])
                     is_sup = self.policy.level_of(uid, *self._ident(s)) == "super"
-                    try:
-                        # 不销卡：放行后任务继续，卡片随后续状态刷新
-                        self.dws.card_update(
-                            s["card_biz"],
-                            f"🍂 **{self.cfg.avatar_name}等拍板…**\n\n"
-                            f"> 🚧 {summ}\n"
-                            + ("> 回复「确认」放行 /「拒绝」终止" if is_sup else
-                               "> 已转超管确认，你无需操作"), 4)
-                    except Exception:
-                        pass
+                    self._card_update(
+                        s, s["card_biz"],
+                        f"🍂 **{self.cfg.avatar_name}等拍板…**\n\n"
+                        f"> 🚧 {summ}\n"
+                        + ("> 回复「确认」放行 /「拒绝」终止" if is_sup else
+                           "> 已转超管确认，你无需操作"), 4, task_id=tid)
                 self.st.archive_round(tid, "pending_approval",
                                       row.get("blocked_cmd"))
                 continue
@@ -2714,6 +3103,11 @@ class Avatar:
             self._swap_ack(s, "")
         s["task_id"] = None
         s["user_started_at"] = 0.0
+        s["card_progress"] = {}
+        s["card_real_summary_count"] = 0
+        s["card_last_real_summary"] = 0.0
+        s.pop("card_progress_fail_logged", None)
+        self._local_progress.pop(s.get("key") or "", None)
         s.pop("review_followup_notified", None)
         s.pop("review_reprompt_count", None)
         if s.get("followups"):
@@ -2769,13 +3163,15 @@ class Avatar:
 
     # ── 定时 ──
     def _tick(self):
-        self._drain_local()      # 先收尾本机任务，escalate 的可在本轮直接转 relay
+        self._drain_local()
         self._poll_plan_deliveries()
         for key, s, kind in self.sess.due():
             s["deadline"] = 0
             self._flush(s, followup=(kind == "followup"))
             self.sess.save()
         self.sess.cleanup_expired()
+        self._sweep_cards()
+        self.cards.save()
         self.gwatch.gc()
 
     # ── 完整性自检 ──
@@ -2806,10 +3202,12 @@ class Avatar:
                          f"实例代码与入库基线不一致：{summary}\n\n"
                          f"> 手改会被夜间 provision 覆盖；有意的改动请走 git 提案流回仓库。\n"
                          f"> 改动全文已固化 {snap}")
-        try:
-            flag.write_text(f"{today}:{sig}", encoding="utf-8")
-        except Exception:
-            pass
+            try:
+                self._card_update_biz(biz, card_progress.render(ctx), 1,
+                                      track=False)
+            except Exception:
+                pass
+
 
     # ── 主循环 ──
     def run(self):
@@ -2832,6 +3230,8 @@ class Avatar:
                 self._reprompt(s)
         # 重启后清理 LOCAL 态遗留会话：改投 relay + 回执（否则会话永久砖化）
         self._reap_stale_local()
+        self._sweep_cards(force=True)
+        self.cards.save()
         if self.inject:
             self._run_inject()
             return
@@ -2859,6 +3259,7 @@ class Avatar:
         log("avatar stopping")
         self.monitor.stop.set()
         self.sess.save()
+        self.cards.save()
 
     def _run_inject(self):
         for line in open(self.inject, encoding="utf-8"):

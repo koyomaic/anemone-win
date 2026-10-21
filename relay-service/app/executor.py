@@ -10,6 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from . import progress
 from . import shared_knowledge
 from .config import block_category
 
@@ -91,14 +92,11 @@ def _parse_opencode(line: str) -> dict | None:
         out["text"] = part["text"]
         out["agent_event"] = {"kind": "text", "text": part["text"][:2000]}
     elif t == "tool_use":
-        out["agent_event"] = {
-            "kind": "tool",
-            "tool": part.get("tool", ""),
-            "title": part.get("title", ""),
-        }
+        state = part.get("state") or {}
+        inp = part.get("input") or state.get("input") or {}
+        out["agent_event"] = progress.agent_tool_event(
+            part.get("tool", ""), inp, part.get("title", ""))
         if part.get("tool") == "bash":
-            state = part.get("state") or {}
-            inp = part.get("input") or state.get("input") or {}
             cmd = inp.get("command") or inp.get("cmd")
             if isinstance(cmd, str) and cmd.strip():
                 out["tool_cmd"] = cmd
@@ -126,9 +124,10 @@ def _parse_claude(line: str) -> dict | None:
                 out["text"] = out.get("text", "") + block["text"]
                 out["agent_event"] = {"kind": "text", "text": block["text"][:2000]}
             elif block.get("type") == "tool_use":
-                out["agent_event"] = {"kind": "tool", "tool": block.get("name", "")}
+                inp = block.get("input") or {}
+                out["agent_event"] = progress.agent_tool_event(
+                    block.get("name", ""), inp)
                 if str(block.get("name", "")).lower() == "bash":
-                    inp = block.get("input") or {}
                     cmd = inp.get("command") or inp.get("cmd")
                     if isinstance(cmd, str) and cmd.strip():
                         out["tool_cmd"] = cmd

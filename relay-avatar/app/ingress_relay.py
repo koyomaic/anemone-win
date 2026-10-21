@@ -62,6 +62,11 @@ class RelayClient:
     def get_task(self, tid) -> dict:
         return self.req("GET", f"/tasks/{tid}")
 
+    def get_progress(self, tid, after_id: int = 0, limit: int = 5) -> dict:
+        return self.req("GET",
+                        f"/tasks/{tid}/progress?after_id={int(after_id or 0)}"
+                        f"&limit={int(limit or 5)}")
+
     def approve(self, tid, decision: str) -> dict:
         return self.req("POST", f"/tasks/{tid}/approve", {"decision": decision})
 

@@ -42,6 +42,20 @@ noise_emoji = "打招呼"          # 寒暄/噪音消息的轻回执
 followup_emoji = "OK"          # 任务运行中收到补充消息的回执
 use_card = true                # 流式卡片：提交即开卡「正在处理」，状态跳变更新，完成定格结果
 card_progress_sec = 30         # 运行中卡片进度刷新节流（秒）
+card_progress_mode = "rich"    # rich=阶段/动作/预算；basic=旧版单行提示
+card_progress_fast_sec = 15    # 前 3 分钟刷新间隔
+card_progress_slow_sec = 60    # 15 分钟后刷新间隔
+card_progress_actions = 3      # 卡片最多显示几条最近动作
+card_progress_detail_in_group = false
+card_real_summary_sec = 900    # 长任务额外真实消息摘要间隔；0=关闭
+card_real_summary_max = 2      # 每个长任务最多补发几条周期摘要
+card_orphan_sweep_sec = 900    # 孤儿卡清扫周期；0=关闭
+card_orphan_ttl_sec = 3600     # 无活跃会话的卡片超过此时长即尝试定格
+card_orphan_sweep_batch = 5    # 每次清扫最多处理几张，防 dws 风暴
+relay_progress_enabled = true  # 拉取 relay /tasks/{id}/progress 细粒度动作
+relay_progress_retry_sec = 1800
+relay_segment_budget_sec = 1800
+relay_max_segments = 3
 noise_ignore = ["你好", "您好", "在吗", "在么", "hi", "hello", "嗯", "嗯嗯",
                 "好的", "好", "收到", "ok", "OK", "谢谢", "多谢", "辛苦了", "测试"]
 self_poll = false              # P2：轮询本人单聊（账号自发消息不进事件流）
