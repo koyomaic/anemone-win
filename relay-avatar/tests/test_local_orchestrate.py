@@ -137,14 +137,17 @@ def test_run_task_uses_sandbox_cwd_and_task_flag(cfg, storage, audit, policy,
     seen = {}
 
     def fake_run(prompt, conv_key=None, cwd=None, flags=None, uid="",
-                 on_step=None, sbx=None):
+                 on_step=None, sbx=None, timeout=None):
         seen.update(prompt=prompt, conv_key=conv_key, cwd=cwd, flags=flags,
-                    sbx=sbx)
+                    sbx=sbx, timeout=timeout)
         return {"text": "本机结论", "denied": False}
 
     monkeypatch.setattr(ex, "_run", fake_run)
     r = ex.run_task("200", "统计门店日销")
-    assert r == {"text": "本机结论", "escalate": False}
+    assert r["text"] == "本机结论"
+    assert r["escalate"] is False
+    assert r["timeout"] is False
+    assert seen["timeout"] == 600
     assert seen["cwd"] == str(sb)                  # cwd 锁 sandbox
     assert seen["conv_key"] == "task:200"
     f = seen["flags"]
@@ -172,6 +175,30 @@ def test_run_task_rejects_l3(cfg, storage, audit, policy, shared, monkeypatch):
     monkeypatch.setattr(ex, "_run",
                         lambda prompt, **kw: {"text": "不该发生", "denied": False})
     assert ex.run_task("300", "干活")["escalate"] is True
+
+
+def test_local_timeout_uses_heavy_budget_for_report_tasks(cfg, storage, audit,
+                                                          policy, shared):
+    local_ready(cfg, shared)
+    ex = make_ex(cfg, storage, audit, policy)
+    assert ex.local_timeout("整理一下鲁大师智能体项目进度及使用情况报告") == 300
+    assert ex.local_timeout("今天有多少人跟鲁大师对话了") == 600
+
+
+def test_parse_line_collects_partial_context():
+    steps, texts, notes = [], [], []
+    line = json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "text", "text": "已确认模板契约"},
+            {"type": "tool_use", "name": "Read",
+             "input": {"file_path": "/tmp/render_report.py"}},
+        ]},
+    })
+    ExecLocal._parse_line(line, steps, None, texts, notes)
+    assert texts == ["已确认模板契约"]
+    assert notes[0].startswith("Read: /tmp/render_report.py")
+    assert "📖 读取文件" in steps
 
 
 # ── C. main 路由与会话态 ──
@@ -352,6 +379,44 @@ def test_local_escalate_falls_back_to_relay(av, cfg, shared):
     assert len(av.exec_local.calls) == 1
     assert len(av.exec_relay.submitted) == 1
     assert s["state"] == "RUNNING" and s["task_id"] == 1
+
+
+def test_local_escalate_sends_real_notice_and_keeps_user_clock(av, cfg, shared):
+    """local 超时升级必须发真实消息，并保留用户总等待计时。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={"text": "", "escalate": True})
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    started = time.time() - 600
+    s["local_started"] = started
+    s["user_started_at"] = started
+    av.dws.sent.clear()
+    av._drain_local()
+    assert any("本机预处理已用 10 分 0 秒" in c for _, c in av.dws.sent)
+    assert any("后台持久通道" in c for _, c in av.dws.sent)
+    assert len(av.exec_relay.submitted) == 1
+    assert s["user_started_at"] == started
+
+
+def test_local_escalate_carries_partial_summary(av, cfg, shared):
+    """local 超时升级时，把阶段摘要带给 relay，避免 relay 从零重复探索。"""
+    local_ready(cfg, shared)
+    av.exec_local = FakeExecLocal(result={
+        "text": "",
+        "escalate": False,
+        "timeout": True,
+        "partial_summary": "已确认 TF-06-01 模板\nRead: render_report.py",
+    })
+    s = sess_of(av)
+    av._flush(s, uid="200")
+    wait_local(s)
+    av._drain_local()
+    assert len(av.exec_relay.submitted) == 1
+    desc = av.exec_relay.submitted[0]["desc"]
+    assert "本机预处理阶段摘要｜不是新请求" in desc
+    assert "已确认 TF-06-01 模板" in desc
+    assert "不要重做已完成部分" in desc
 
 
 def test_local_not_used_when_backend_relay(av, cfg, shared):

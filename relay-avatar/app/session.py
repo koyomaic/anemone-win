@@ -54,6 +54,7 @@ class SessionManager:
             "task_id": None, "last_task_id": None, "deadline": 0,
             "notified_followup": False, "last_activity": time.time(),
             "review_followup_notified": False, "review_reprompt_count": 0,
+            "user_started_at": 0.0,
             "uid": ev.get("_uid", ""),
             # 在途请求原文（relay 通路提交后留存），供跨会话重复请求去重比对。
             # local 通路用 local_desc，BUFFERING 用 buffer，故只在 relay 通路写。

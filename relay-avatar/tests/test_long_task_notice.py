@@ -130,6 +130,23 @@ def test_elapsed_text_is_human_readable(av, cfg):
     assert "12 分 34 秒" in av.dws.sent[0][1]
 
 
+def test_user_started_at_includes_local_preprocessing(av, cfg):
+    """local 超时升级 relay 后，长任务阈值按用户总等待起算，不按 relay 段重新起算。"""
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600)
+    s = sess(user_started_at=time.time() - 700)
+    assert av._long_task_notice(s, 7, row(elapsed=100), "running") is True
+    body = av.dws.sent[0][1]
+    assert "11 分 40 秒" in body
+    assert s["long_notified"] is True
+
+
+def test_user_started_at_does_not_fire_below_threshold(av, cfg):
+    setcfg(cfg, "ingress", long_task_mode="on", long_task_threshold_sec=600)
+    s = sess(user_started_at=time.time() - 500)
+    assert av._long_task_notice(s, 7, row(elapsed=100), "running") is False
+    assert av.dws.sent == []
+
+
 # ── 分段边界 ──────────────────────────────────────────────────────────
 
 def test_segment_boundary_notice(av, cfg):

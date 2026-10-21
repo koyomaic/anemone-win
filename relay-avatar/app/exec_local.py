@@ -18,6 +18,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -69,6 +70,15 @@ class ExecLocal:
         self.sessions_file = storage.run / "sessions.json"
         self.ttl = int(cfg.get("claude", "session_ttl_sec", 3600))
         self.timeout = int(cfg.get("claude", "reply_timeout_sec", 600))
+        self.heavy_timeout = int(cfg.get("claude", "heavy_local_timeout_sec", 300))
+        self.partial_chars = int(cfg.get("claude",
+                                         "local_partial_summary_chars", 1500))
+        self.heavy_patterns = []
+        for pat in cfg.get("claude", "heavy_local_patterns", []) or []:
+            try:
+                self.heavy_patterns.append(re.compile(str(pat), re.I))
+            except re.error:
+                pass
         self.bin = shutil.which("claude") or ""
         # 内核沙箱靠 systemd-run 起瞬态 unit（--scope 不支持沙箱属性）。
         self.sbx_bin = shutil.which("systemd-run") or ""
@@ -99,6 +109,26 @@ class ExecLocal:
             except Exception:
                 return False
         return True
+
+    def is_heavy_task(self, text: str) -> bool:
+        """重报告/装配类任务：local 短预算，超时尽早带阶段摘要升级 relay。"""
+        t = str(text or "")
+        return any(rx.search(t) for rx in self.heavy_patterns)
+
+    def local_timeout(self, text: str) -> int:
+        if self.heavy_timeout > 0 and self.is_heavy_task(text):
+            return self.heavy_timeout
+        return self.timeout
+
+    def _partial_summary(self, texts: list, notes: list) -> str:
+        parts = []
+        if texts:
+            parts.append("最近判断/进展：")
+            parts.extend(f"- {t}" for t in texts[-5:])
+        if notes:
+            parts.append("最近工具动作：")
+            parts.extend(f"- {n}" for n in notes[-10:])
+        return "\n".join(parts).strip()[:self.partial_chars]
 
     # ── 会话记忆 ──
     def _sessions(self) -> dict:
@@ -433,14 +463,19 @@ class ExecLocal:
             "\n\n<user_message>\n" + sanitize_injected(text) + "\n</user_message>")
         r = self._run(prompt, conv_key=f"task:{uid}", cwd=sandbox,
                       flags=self._flags(cons, list(cons.get("add_dirs") or [])),
-                      uid=uid, on_step=on_step, sbx=cons.get("sbx"))
+                      uid=uid, on_step=on_step, sbx=cons.get("sbx"),
+                      timeout=self.local_timeout(text))
         if r.get("denied") or r.get("sbx_unavailable"):
-            return {"text": "", "escalate": True}   # 升级不降级：转 relay 门禁
-        return {"text": r.get("text") or "", "escalate": False}
+            return {"text": "", "escalate": True,
+                    "partial_summary": r.get("partial_summary", "")}
+        return {"text": r.get("text") or "", "escalate": False,
+                "timeout": bool(r.get("timeout")),
+                "partial_summary": r.get("partial_summary", "")}
 
     # ── 流式执行（移植 fenshen Engine.run：stream-json + 看门狗 + on_step） ──
     def _run(self, prompt: str, conv_key: str, cwd: str, flags: list,
-             uid: str = "", on_step=None, sbx: dict | None = None) -> dict:
+             uid: str = "", on_step=None, sbx: dict | None = None,
+             timeout: int | None = None) -> dict:
         sid = self.get_session(conv_key)
         cmd = [self.bin, "-p", "--output-format", "stream-json",
                "--verbose"] + flags
@@ -463,8 +498,12 @@ class ExecLocal:
         self.audit.log("local_exec", uid, f"conv={conv_key}", backend=self.name,
                        sandbox=(f"unit={unit}" if unit else "off"))
         steps: list = []
+        texts: list = []
+        notes: list = []
         reply, new_sid, denied = "", "", False
         proc, watchdog = None, None
+        state = {"timeout": False}
+        run_timeout = int(timeout or self.timeout)
 
         def _kill():
             try:
@@ -476,12 +515,16 @@ class ExecLocal:
             # _kill_unit）。顺序：先杀客户端停止读管道，再杀 unit 内全部进程。
             self._kill_unit(unit)
 
+        def _timeout_kill():
+            state["timeout"] = True
+            _kill()
+
         try:
             proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
                 cwd=cwd, env=env)
-            watchdog = threading.Timer(self.timeout, _kill)
+            watchdog = threading.Timer(run_timeout, _timeout_kill)
             watchdog.daemon = True
             watchdog.start()
             try:
@@ -490,7 +533,7 @@ class ExecLocal:
             except Exception:
                 pass
             for line in proc.stdout:
-                parsed = self._parse_line(line, steps, on_step)
+                parsed = self._parse_line(line, steps, on_step, texts, notes)
                 if parsed:
                     if parsed.get("type") == "result":
                         reply = (parsed.get("result") or "").strip()
@@ -502,10 +545,14 @@ class ExecLocal:
                 self.save_session(conv_key, new_sid)
             if reply and self._is_deny(reply) and not steps:
                 denied = True
-            return {"text": reply, "denied": denied, "steps": steps}
+            return {"text": reply, "denied": denied, "steps": steps,
+                    "timeout": state["timeout"],
+                    "partial_summary": self._partial_summary(texts, notes)}
         except Exception as e:
             return {"text": f"⚠️ 本地执行失败：{str(e)[:120]}",
-                    "denied": False, "steps": steps}
+                    "denied": False, "steps": steps,
+                    "timeout": state["timeout"],
+                    "partial_summary": self._partial_summary(texts, notes)}
         finally:
             try:
                 if watchdog:
@@ -515,8 +562,14 @@ class ExecLocal:
             _kill()
 
     @staticmethod
-    def _parse_line(line: str, steps: list, on_step) -> dict | None:
-        """解析一行 stream-json；tool_use/首段文本触发 on_step。返回 result 事件。"""
+    def _parse_line(line: str, steps: list, on_step,
+                    texts: list | None = None,
+                    notes: list | None = None) -> dict | None:
+        """解析一行 stream-json；tool_use/首段文本触发 on_step。返回 result 事件。
+
+        texts/notes 用于 local 超时升级 relay 时携带阶段摘要：卡片进度只保留
+        用户可读的短步骤，接力上下文需要更具体的最近判断与工具目标。
+        """
         line = (line or "").strip()
         if not line.startswith("{"):
             return None
@@ -530,12 +583,24 @@ class ExecLocal:
                 if blk.get("type") == "tool_use":
                     step = tool_desc(blk)
                     steps.append(step)
+                    if notes is not None:
+                        inp = blk.get("input") or {}
+                        detail = (inp.get("file_path") or inp.get("path")
+                                  or inp.get("pattern") or inp.get("command")
+                                  or inp.get("description") or inp.get("prompt")
+                                  or "")
+                        name = blk.get("name") or "tool"
+                        notes.append(f"{name}: {str(detail).replace(chr(10), ' ')[:180]}")
                     if on_step:
                         try:
                             on_step(step, steps)
                         except Exception:
                             pass
                 elif blk.get("type") == "text" and (blk.get("text") or "").strip():
+                    if texts is not None:
+                        txt = " ".join(str(blk.get("text")).split())[:300]
+                        if txt:
+                            texts.append(txt)
                     if not any(s == "✍️ 正在组织回复…" for s in steps):
                         steps.append("✍️ 正在组织回复…")
                         if on_step:

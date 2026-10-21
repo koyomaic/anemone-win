@@ -83,7 +83,17 @@ DEFAULTS: dict[str, Any] = {
                "permission_mode_l3": "manual",
                "l3_permission_prompts": "none",
                "l3_disallowed_tools": "Bash Write Edit MultiEdit WebFetch WebSearch",
-               "session_ttl_sec": 3600, "reply_timeout_sec": 600},
+                "session_ttl_sec": 3600, "reply_timeout_sec": 600,
+                # 重报告/装配类任务在 local 通路的短预算：超过即带阶段摘要升级 relay，
+                # 避免 local 白烧 10 分钟后 relay 再从零探索（2026-10-21 #1173→#1175）。
+                "heavy_local_timeout_sec": 300,
+                "heavy_local_patterns": [
+                    r"(整理|生成|制作|输出|装配|优化).{0,16}(报告|报表|方案|卡片|汇报|台账)",
+                    r"项目进度",
+                    r"使用情况报告",
+                    r"(?i)(html|模板|骨架|render_report|质检|机检)",
+                ],
+                "local_partial_summary_chars": 1500},
     "security": {"l2_lockdown": True,
                  "l2_sandbox_dir": f"{DEFAULT_WORKSPACE}/shared/work",
                  "l2_add_dirs": [],
