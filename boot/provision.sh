@@ -748,23 +748,104 @@ elif heal; then
   else warn "创建失败（任务 pip 需 --user 或自建 venv，不影响其余功能）"; fi
 else warn "缺失（install 模式自动创建）"; fi
 
-# ---------- 23 claude-proxy（可选组件，SOFT） ----------
+# ---------- 23 claude-proxy（可选组件，SOFT；代码随仓库同步，config 每机私有不覆盖） ----------
 step "claude-proxy"
-if [ -f "$PROXY_DIR/proxy.mjs" ] && [ -f "$PROXY_DIR/config.json" ] && [ -f "$UNIT_DIR/claude-proxy.service" ] && systemctl is-active --quiet claude-proxy; then
-  grep -q 'sk-xxxx' "$PROXY_DIR/config.json" && warn "运行中但 config.json 仍是示例密钥" || ok
-elif heal; then
-  miss "安装"
-  cp -n "$RES_ROOT/claude-code-openai-proxy/proxy.mjs" "$PROXY_DIR/proxy.mjs" 2>/dev/null
-  if [ ! -f "$PROXY_DIR/config.json" ]; then
-    cp "$RES_ROOT/claude-code-openai-proxy/config.example.json" "$PROXY_DIR/config.json" && chmod 600 "$PROXY_DIR/config.json"
+PROXY_SRC="$RES_ROOT/claude-code-openai-proxy"
+PROXY_CODE_DRIFT=0
+if [ ! -d "$PROXY_SRC" ]; then
+  warn "资源树无 claude-code-openai-proxy"
+else
+  if heal; then
+    mkdir -p "$PROXY_DIR"
+    for f in proxy.mjs redact.mjs redact-stream.mjs; do
+      if [ -f "$PROXY_SRC/$f" ] && { [ ! -f "$PROXY_DIR/$f" ] || ! cmp -s "$PROXY_SRC/$f" "$PROXY_DIR/$f"; }; then
+        if cp "$PROXY_SRC/$f" "$PROXY_DIR/$f" && chmod 644 "$PROXY_DIR/$f"; then
+          PROXY_CODE_DRIFT=1
+        else
+          bad "同步 $f 失败"
+        fi
+      fi
+    done
+    if [ ! -f "$PROXY_DIR/config.json" ]; then
+      cp "$PROXY_SRC/config.example.json" "$PROXY_DIR/config.json" && chmod 600 "$PROXY_DIR/config.json"
+    fi
+    if [ ! -f "$UNIT_DIR/claude-proxy.service" ]; then
+      sed -e "s#__DIR__#$PROXY_DIR#g" -e "s#__NODE__#$(command -v node)#g" \
+        "$PROXY_SRC/claude-proxy.service.example" > "$UNIT_DIR/claude-proxy.service"
+      systemctl daemon-reload && systemctl enable --now claude-proxy >/dev/null 2>&1
+      PROXY_CODE_DRIFT=1
+    fi
+    if [ "$PROXY_CODE_DRIFT" = 1 ] && systemctl is-active --quiet claude-proxy; then
+      systemctl restart claude-proxy >/dev/null 2>&1
+    fi
   fi
-  if [ ! -f "$UNIT_DIR/claude-proxy.service" ]; then
-    sed -e "s#__DIR__#$PROXY_DIR#g" -e "s#__NODE__#$(command -v node)#g" \
-      "$RES_ROOT/claude-code-openai-proxy/claude-proxy.service.example" > "$UNIT_DIR/claude-proxy.service"
-    systemctl daemon-reload && systemctl enable --now claude-proxy >/dev/null 2>&1
+  if [ -f "$PROXY_DIR/proxy.mjs" ] && [ -f "$PROXY_DIR/config.json" ] && [ -f "$UNIT_DIR/claude-proxy.service" ] && systemctl is-active --quiet claude-proxy; then
+    grep -q 'sk-xxxx' "$PROXY_DIR/config.json" && warn "运行中但 config.json 仍是示例密钥" || ok "$([ "$PROXY_CODE_DRIFT" = 1 ] && echo '代码已同步+重启' || echo '代码一致')"
+  else
+    warn "未运行（可选组件；检查 config.json / journalctl -u claude-proxy）"
   fi
-  systemctl is-active --quiet claude-proxy && warn "已安装运行；config.json 需填 baseURL/apiKey/model" || warn "已安装但未运行（检查 config.json）"
-else warn "缺失（可选组件，install 模式自动安装）"; fi
+fi
+
+# ---------- 23b claude-proxy-external（外部先进模型 strict 脱敏出口，SOFT；词典/密钥每机私有） ----------
+step "claude-proxy-external"
+EXT_CFG="$PROXY_DIR/external.config.json"
+EXT_UNIT=claude-proxy-external.service
+if [ ! -d "$PROXY_SRC" ]; then
+  warn "资源树无 claude-code-openai-proxy"
+elif [ ! -f "$EXT_CFG" ]; then
+  if heal; then
+    mkdir -p "$PROXY_DIR"
+    cp "$PROXY_SRC/external.config.example.json" "$EXT_CFG" && chmod 600 "$EXT_CFG"
+    warn "已落模板；填外部模型/词典后自动启用（strict fail-closed）"
+  else
+    warn "未配置（install 模式落模板）"
+  fi
+else
+  EXT_STATE="$(EXT_CFG="$EXT_CFG" "$VENV/bin/python" - <<'PYEOF' 2>/dev/null
+import json, os
+p = os.environ["EXT_CFG"]
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    print("badjson|0|"); raise SystemExit
+red = d.get("redaction") or {}
+dict_path = str(red.get("dictionary") or "")
+raw = json.dumps(d, ensure_ascii=False)
+filled = all([d.get("baseURL"), d.get("apiKey"), d.get("model"), dict_path])
+placeholder = any(s in raw for s in ("EXTERNAL_API_KEY", "external-openai-compatible-endpoint", "external-advanced-model"))
+strict = str(red.get("mode") or "").lower() == "strict"
+dict_ok = bool(dict_path) and os.path.isfile(dict_path)
+state = "ready" if (filled and strict and dict_ok and not placeholder) else "incomplete"
+print(f"{state}|{int(d.get('port') or 8792)}|{dict_path}")
+PYEOF
+)"
+  EXT_OK="${EXT_STATE%%|*}"
+  EXT_REST="${EXT_STATE#*|}"
+  EXT_PORT="${EXT_REST%%|*}"
+  EXT_DICT="${EXT_REST#*|}"
+  if [ "$EXT_OK" != "ready" ]; then
+    warn "配置/词典未就绪（strict fail-closed；dictionary=${EXT_DICT:-未设}）"
+  else
+    if heal; then
+      chmod 600 "$EXT_CFG" 2>/dev/null || true
+      want="$(sed -e "s#__DIR__#$PROXY_DIR#g" -e "s#__NODE__#$(command -v node)#g" "$PROXY_SRC/claude-proxy-external.service.example")"
+      have="$(cat "$UNIT_DIR/$EXT_UNIT" 2>/dev/null)"
+      if [ "$want" != "$have" ]; then
+        printf '%s\n' "$want" > "$UNIT_DIR/$EXT_UNIT" && systemctl daemon-reload && systemctl enable "$EXT_UNIT" >/dev/null 2>&1
+        PROXY_CODE_DRIFT=1
+      fi
+      if [ "$PROXY_CODE_DRIFT" = 1 ] || ! systemctl is-active --quiet "$EXT_UNIT"; then
+        systemctl restart "$EXT_UNIT" >/dev/null 2>&1
+      fi
+    fi
+    if systemctl is-active --quiet "$EXT_UNIT" \
+       && curl -sfm 3 "http://127.0.0.1:$EXT_PORT/healthz" 2>/dev/null | grep -q '"mode":"strict"'; then
+      ok "active+strict 端口=$EXT_PORT 词典在位"
+    else
+      warn "未健康（journalctl -u $EXT_UNIT；strict 模式下会 fail-closed）"
+    fi
+  fi
+fi
 
 # ---------- 24 relay-tls-proxy（仅 HTTPS 主机：回环明文健康检查转发 127.0.0.1:8787→8788，SOFT；内容级同步，角色变更随仓库模板自动迁移） ----------
 step "relay-tls-proxy"

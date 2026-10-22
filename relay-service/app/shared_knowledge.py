@@ -4,8 +4,100 @@ import json
 import os
 import re
 import shutil
+import urllib.error
+import urllib.request
 
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,49}$")
+REDACTION_DUMMY_API_KEY = "redaction-proxy-local"
+
+
+def _csv_list(value) -> list[str]:
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(p).strip() for p in value if str(p).strip()]
+    return []
+
+
+def _redaction_required(cfg) -> bool:
+    return str(getattr(cfg, "external_model_redaction", "off") or "off").strip().lower() == "required"
+
+
+def _redaction_proxy_url(cfg) -> str:
+    proxy = str(getattr(cfg, "external_proxy_url", "") or "").strip()
+    if not proxy:
+        raise RuntimeError("RELAY_EXTERNAL_MODEL_REDACTION=required 但未配置 RELAY_EXTERNAL_PROXY_URL")
+    return proxy.rstrip("/")
+
+
+def redaction_health(cfg) -> dict:
+    """检查本机 strict 脱敏代理；不健康即抛错（fail-closed，不派发外部模型任务）。"""
+    url = _redaction_proxy_url(cfg) + "/healthz"
+    timeout = float(getattr(cfg, "redaction_health_timeout", 2.0) or 2.0)
+    req = urllib.request.Request(url, headers={"accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise RuntimeError(f"外部模型脱敏代理不可达：{url}（{e.__class__.__name__}）") from e
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise RuntimeError("外部模型脱敏代理不健康")
+    red = data.get("redaction") or {}
+    if red.get("mode") != "strict" or not red.get("ready"):
+        raise RuntimeError("外部模型脱敏代理未处于 strict ready 状态")
+    return data
+
+
+def ensure_external_redaction(cfg, base_cfg: dict | None = None) -> dict | None:
+    """强制外部 OpenAI-compatible provider 走本机 strict 脱敏代理。
+
+    - `base_cfg=None`：只做配置/健康校验（claude 引擎或提交前守卫）。
+    - `base_cfg` 为 opencode 配置：把声明为外部的 provider 的 baseURL 改写到代理，
+      并用本地占位 apiKey 替换任务环境中的外部真钥匙。
+    """
+    if not _redaction_required(cfg):
+        return base_cfg
+    proxy = _redaction_proxy_url(cfg)
+    if getattr(cfg, "redaction_health_required", False):
+        redaction_health(cfg)
+    if base_cfg is None:
+        return None
+
+    externals = set(_csv_list(getattr(cfg, "external_providers", [])))
+    if not externals:
+        raise RuntimeError("RELAY_EXTERNAL_MODEL_REDACTION=required 但未配置 RELAY_EXTERNAL_PROVIDERS")
+    providers = base_cfg.get("provider")
+    if not isinstance(providers, dict):
+        return base_cfg
+    for name in list(providers.keys()):
+        if name not in externals:
+            continue
+        provider = providers[name]
+        if not isinstance(provider, dict):
+            raise RuntimeError(f"外部 provider 配置非法：{name}")
+        options = provider.get("options")
+        if not isinstance(options, dict):
+            options = {}
+            provider["options"] = options
+        options["baseURL"] = proxy + "/v1"
+        options["apiKey"] = REDACTION_DUMMY_API_KEY
+    return base_cfg
+
+
+def ensure_claude_external_redaction(cfg) -> None:
+    """claude 引擎不写 opencode provider 配置，但外部模型仍必须经 strict 代理。
+
+    当本机要求健康检查，或当前模型被声明为外部模型时，派发前先探活 8792。
+    """
+    if not _redaction_required(cfg):
+        return
+    externals = {m.strip().lower() for m in _csv_list(getattr(cfg, "external_models", []))}
+    current = {
+        str(getattr(cfg, "model", "") or "").strip().lower(),
+        str(os.environ.get("ANTHROPIC_MODEL", "") or "").strip().lower(),
+    }
+    if getattr(cfg, "redaction_health_required", False) or (externals & current):
+        redaction_health(cfg)
 
 
 def slug_valid(name: str) -> bool:
@@ -266,6 +358,7 @@ def _prepare_claude(workdir: str, cfg) -> str:
     - 鉴权/模型不经文件：由 relay.env 的 ANTHROPIC_* 走进程 env 透传；
       会话态由 executor 设 CLAUDE_CONFIG_DIR 持久化（不在 workdir，躲开终态清理）
     """
+    ensure_claude_external_redaction(cfg)
     xdg = os.path.join(workdir, ".xdg")
     os.makedirs(xdg, exist_ok=True)
     os.makedirs(os.path.join(workdir, "home"), exist_ok=True)
@@ -341,6 +434,9 @@ def prepare_run(workdir: str, cfg) -> str:
             for name in list(provs.keys()):
                 if name in exclude:
                     del provs[name]
+
+    # 外部先进模型 strict 脱敏：声明为外部的 provider 必须改写到本机 8792 代理。
+    ensure_external_redaction(cfg, base_cfg)
 
     skills = dict(base_cfg.get("skills") or {})
     paths = skills.get("paths")

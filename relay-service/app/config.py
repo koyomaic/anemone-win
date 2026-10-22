@@ -264,6 +264,15 @@ class Settings:
     auto_done_max_files: int = 200
     conflict_window_hours: float = 24.0  # 同文件冲突判定的时间窗；窗外的先后写入属正常演进，不算冲突
     relay_exclude_providers: list[str] = field(default_factory=list)  # 任务配置中剔除的 provider（本地专用模型不进任务环境）
+    # ── 外部先进模型 strict 脱敏出口（2026-10-22 方案落地）──
+    # required 时，opencode 任务配置里声明为外部的 provider 必须被改写到本机脱敏代理；
+    # 代理不健康或未配置外部 provider 时 fail-closed，避免明文公司/人员/基础设施出网。
+    external_model_redaction: str = "off"   # off | required
+    external_proxy_url: str = ""            # 例：http://127.0.0.1:8792
+    external_providers: list[str] = field(default_factory=list)
+    external_models: list[str] = field(default_factory=list)
+    redaction_health_required: bool = False
+    redaction_health_timeout: float = 2.0
     boot_cmd: str = "/opt/team/relay-boot/boot.sh"  # bootloader 入口（POST /admin/update 触发）
     min_client_version: str = ""  # 要求的最低客户端版本（空=不校验；/health 透出，客户端软提醒）
     auth_legacy: bool = False     # 旧式 bearer token 认证（生产默认关：token 仅作一次性激活码；过渡需要时置 1）
@@ -333,6 +342,13 @@ class Settings:
             auto_done_max_files=int(os.environ.get("RELAY_AUTO_DONE_MAX_FILES", "200")),
             conflict_window_hours=float(os.environ.get("RELAY_CONFLICT_WINDOW_HOURS", "24")),
             relay_exclude_providers=[p.strip() for p in os.environ.get("RELAY_EXCLUDE_PROVIDERS", "").split(",") if p.strip()],
+            external_model_redaction=os.environ.get("RELAY_EXTERNAL_MODEL_REDACTION", "off").strip().lower(),
+            external_proxy_url=os.environ.get("RELAY_EXTERNAL_PROXY_URL", "").strip(),
+            external_providers=[p.strip() for p in os.environ.get("RELAY_EXTERNAL_PROVIDERS", "").split(",") if p.strip()],
+            external_models=[p.strip() for p in os.environ.get("RELAY_EXTERNAL_MODELS", "").split(",") if p.strip()],
+            redaction_health_required=os.environ.get("RELAY_REDACTION_HEALTH_REQUIRED", "0").strip().lower()
+            in ("1", "true", "on", "yes"),
+            redaction_health_timeout=float(os.environ.get("RELAY_REDACTION_HEALTH_TIMEOUT", "2")),
             boot_cmd=os.environ.get("RELAY_BOOT_CMD", "/opt/team/relay-boot/boot.sh"),
             min_client_version=os.environ.get("RELAY_MIN_CLIENT_VERSION", "").strip(),
             auth_legacy=os.environ.get("RELAY_AUTH_LEGACY", "0").strip().lower()

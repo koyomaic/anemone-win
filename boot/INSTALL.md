@@ -12,7 +12,8 @@
 | 工作区备份 | `relay-backup.timer` → `scripts/backup.sh` | 每日 03:30：数据库快照（SQLite `.backup` 或 PG `pg_dump -Fc`）+ shared/ + relay.env + relay.log → `/mnt/vol-eltaah12/backup/` |
 | dws 登录态小时级刷新 | `dws-refresh.timer` → `dws-refresh.sh` | 每小时整点（±60s 抖动）：软链共享种子进临时 HOME 跑 `auth status`，token 刷新原地发生在种子上（与 boot 预警同一份登录态）；日志 `/var/log/dws-refresh.log`；登录态失效时清单 WARN，需人工设备码重授权 |
 | 计划触发器 | `relay-plan.timer` → `plan-tick.sh` | 每分钟（±20s 抖动，`Persistent=true` 漏跑补跑）：扫本机 relay 的 due 计划→`POST /plans/{id}/fire` 原子认领并提交任务；纯 HTTP 打 admin 接口，不碰 systemd 单元/不写 /etc；日志 `/var/log/relay-plan.log`。计划由大脑/成员经 `POST /plans` 或 dashboard「计划」页创建，存本机各自的库 |
-| Claude 代理 | `claude-proxy.service` | 可选：Anthropic→OpenAI 翻译代理 :8790 |
+| Claude 代理 | `claude-proxy.service` | 可选：Anthropic→OpenAI 翻译代理 :8790；外部模型路由可指向 strict 脱敏代理 |
+| 外部模型脱敏代理 | `claude-proxy-external.service` | 可选：OpenAI 兼容 strict 脱敏出口 :8792；词典/密钥每机私有，未就绪则 fail-closed |
 | TLS 代理 | `relay-tls-proxy.service` | 可选：仅 HTTPS 主机（有 relay-tls 证书才装），socat 回环明文 :8787→TLS :8788（仅本机健康检查兼容） |
 | store 台账 | —（CLI，`/usr/local/bin/store`） | 业务存储统一索引：磁盘为文件真身、PostgreSQL（relay 同库 `public` schema、`store_` 前缀）为权威索引与血缘、`index/manifest.jsonl` 为降级快照。存储根＝relay 的 `shared_dir`（同址是刻意的，见 `boot.env.example` 的 `STORE_ROOT` 说明）；约定见 workspace `AGENTS.md`「共享区约定」 |
 | 分身网关 | `relay-avatar.service` | 双入口统一分身网关（im-bridge 演进替代）：钉钉(dws)+relay API → 同一策略核 `policy.toml`（权限分层/审批流/限流/注入清洗/审计）→ relay 后端（默认，门禁透传）/local claude 后端（仅 self/L3，默认关）。代码 `/opt/team/relay-avatar`、状态 `workspace/avatar/`、看板 `:8791`（X-Token）、凭据 `shared/secrets/relay-avatar.env`（600）。**默认不启用**：`touch /etc/relay-avatar.enabled` 后 install 轮自动拉起；上传文件自动落 `shared/data/` store 台账（DB 不可达先暂存补登记）。详见 `relay-avatar/README.md` |
@@ -41,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 
 1. `/root/.config/opencode/opencode.jsonc` — 填两处 `apiKey`（占位符 `sk-REPLACE_ME`），然后 `systemctl restart relay`
 2. 无备份包时：`relay.env` 是新生成的随机密钥，成员 token 需重新发放；`relay.db` 为空库
-3. 可选：`/root/.claude-proxy/config.json` 填 baseURL/apiKey/model
+3. 可选：`/root/.claude-proxy/config.json` 填 baseURL/apiKey/model；外部先进模型另填 `/root/.claude-proxy/external.config.json` 与 `shared/secrets/redaction/entities.json`（均 600，不进 git）
 4. 可选：workspace `opencode.json`（内网 MCP 地址）从旧机拷贝
 5. 可选：本机私有检查写 `/opt/team/relay-boot/provision-local.sh`（可执行，参数=模式；
    适合放内网 MCP 连通性等不进 git 的检查，失败只 WARN；PG 连通性已是原生清单项）
@@ -70,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 24c | opencode 全局语境 `/root/.config/opencode/AGENTS.md`（模板 `boot/opencode-global-AGENTS.md`，git 为真源；所有会话默认加载 GitHub 项目指向等语境） | 缺失/漂移 → 备份后同步模板 | 软 |
 | 24d | team-agent-relay 安装位 `ca.pem`（公开 CA 证书，不入 git；统一从 `RELAY_CA_SRC`（缺省 `127.0.0.1:8788`，即所在服务器本机 TLS 链）TLS 链提取，自签校验后写入） | 缺失/漂移 → 备份后提取写入；源不可达且已有现存 → 沿用 | 软 |
 | 24e | store 台账 CLI（`boot/store/store`，业务存储统一索引）：装 `/opt/team/store/store` + 软链 `/usr/local/bin/store`；建目录骨架与 `index/` 配置（纯文件系统、幂等）；`store ping` 探活 DB 与 5 张 `store_*` 表。**建表（`store init`）属有副作用操作，install 不自动执行**，首次需人工跑 | CLI 同步 / 骨架自建 / 探活：缺表 WARN、**DB 不可达 FAIL（触发钉钉预警）** | 软（DB 不可达时硬） |
-| 25-26 | claude-proxy / relay-tls-proxy | 缺则装（tls 仅证书存在时） | 软 |
+| 25-26 | claude-proxy / claude-proxy-external / relay-tls-proxy | 代码随仓库同步；缺配置则装模板（tls 仅证书存在时；external 仅配置+词典就绪时启用并探活 `/healthz`） | 软 |
 | 27 | 首装引导（无现役 release → boot.sh boot 完整部署） | 自动 | 硬 |
 | 28 | relay active+healthy | enable/start/restart | 硬 |
 | 28b | 并发/长任务**实际生效值**：读运行中服务 `/health` 的 `max_concurrent`/`long_task_mode`/`long_lane_cap`，与机队期望（`FLEET_MAX_CONCURRENT`=8、`FLEET_LONG_TASK_MODE`=on，可用 env 覆盖）比对。为什么读 /health 而不是 relay.env：env 里没写的键会落到**代码默认值**，只有 /health 才是真正生效的那个数 | 不改配置，只报偏离 → WARN 并指出多半是本机 relay.env 显式写了旧值（代码默认值不覆盖已存在的 env），改后需 `systemctl restart relay`；服务未响应时退回读 relay.env 并标注默认值 | 软(WARN) |

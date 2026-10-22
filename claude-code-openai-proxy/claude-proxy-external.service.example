@@ -1,0 +1,20 @@
+[Unit]
+Description=Strict redaction egress proxy for external OpenAI-compatible models
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__DIR__
+Environment=PROXY_CONFIG=__DIR__/external.config.json
+ExecStart=__NODE__ __DIR__/proxy.mjs
+Restart=always
+RestartSec=2
+# Optional: uncomment to dump the last redacted upstream body for troubleshooting
+# Environment=PROXY_DEBUG=1
+StandardOutput=append:__DIR__/external-proxy.log
+StandardError=append:__DIR__/external-proxy.log
+
+[Install]
+WantedBy=multi-user.target

@@ -60,12 +60,27 @@ chmod 600 config.json      # 里面有密钥，务必收紧权限
 
 | 环境变量 | 对应字段 | 默认 |
 | --- | --- | --- |
+| `PROXY_CONFIG` | 配置文件路径 | `./config.json` |
 | `PROXY_HOST` | `host` | `127.0.0.1` |
 | `PROXY_PORT` | `port` | `8790` |
 | `UPSTREAM_BASE_URL` | `baseURL` | —（必填） |
 | `UPSTREAM_API_KEY` | `apiKey` | —（必填） |
 | `UPSTREAM_MODEL` | `model` | —（必填） |
-| `PROXY_DEBUG` | 打印每次请求的 role 序列并 dump 转换后的 body 到 `/tmp/claude_proxy_last.json` | 关闭 |
+| `PROXY_DEBUG` | 打印每次请求的 role 序列并 dump **脱敏后** body 到 `/tmp/claude_proxy_last_<port>.json` | 关闭 |
+
+`config.json` 还支持按请求模型名分流：
+
+```json
+{
+  "routes": {
+    "qwen3.8-flash": {
+      "baseURL": "http://127.0.0.1:8792/v1",
+      "apiKey": "redaction-proxy-local",
+      "model": "qwen3.8-flash"
+    }
+  }
+}
+```
 
 ### 2. 运行
 
@@ -161,6 +176,45 @@ curl -s http://127.0.0.1:8790/v1/messages \
 
 ---
 
+## Strict 脱敏出口（外部先进模型）
+
+外部先进模型必须走独立的 strict 脱敏代理（本机约定端口 `8792`），本地模型不走脱敏。
+
+```text
+Claude CLI / opencode
+  → 127.0.0.1:8790（本地模型/路由）
+    → 外部模型路由改指 127.0.0.1:8792
+      → 出站：公司/人员/联系方式/内部基础设施/凭据 → 占位符或不可逆掩码
+      → 外部先进模型
+      ← 入站：占位符 → 真实值
+      ← 响应 DLP：模型猜出词典真实实体时拦截/掩码
+```
+
+- **只支持 `strict` 模式**：出站脱敏、响应还原、tool args 还原、响应 DLP、附件不出网、fail-closed 全部强制开启。
+- `redaction.dictionary` 指向本机受控词典（建议 `shared/secrets/redaction/entities.json`，权限 `600`），词典**不进 Git**。
+- 词典缺失、加载失败或脱敏异常时返回 `503`，绝不调用外部模型。
+- `PROXY_DEBUG` 只能 dump 脱敏后的上游请求。
+- 日志只记录命中类型/数量、模型、耗时，不记录明文实体。
+- 健康检查：`GET /healthz`，strict 代理要求 `ok=true` 且 `redaction.mode="strict"`、`redaction.ready=true`。
+
+外部代理配置示例见 `external.config.example.json`；systemd 模板见 `claude-proxy-external.service.example`。
+
+OpenAI 兼容入口：
+
+```bash
+curl -s http://127.0.0.1:8792/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"external-advanced-model","messages":[{"role":"user","content":"..."}]}'
+```
+
+测试：
+
+```bash
+node --test test/*.test.mjs
+```
+
+---
+
 ## 已知限制
 
 - **思维链（reasoning）**：部分模型（如 Qwen 系）会把推理放在独立的 `reasoning` 字段。代理只转发正式回答 `content`，丢弃 `reasoning`，以避免与 Claude Code 的 extended-thinking（需要签名）冲突。
@@ -172,8 +226,10 @@ curl -s http://127.0.0.1:8790/v1/messages \
 
 ## 安全
 
-- `config.json` 含明文密钥，已在 `.gitignore` 中排除，**切勿提交**。
-- 建议 `chmod 600 config.json`，并让代理只监听 `127.0.0.1`。
+- `config.json`、`external.config.json` 含明文密钥，已在 `.gitignore` 中排除，**切勿提交**。
+- 脱敏词典含敏感实体，只能放本机受控目录（如 `shared/secrets/redaction/entities.json`），权限 `600`，**切勿提交**。
+- 建议 `chmod 600 config.json external.config.json`，并让代理只监听 `127.0.0.1`。
+- 外部模型真钥匙只应存在于 `8792` 脱敏代理；Claude/opencode 任务环境使用本地占位钥匙。
 
 ---
 

@@ -1,0 +1,16 @@
+{
+  "host": "127.0.0.1",
+  "port": 8792,
+  "baseURL": "https://external-openai-compatible-endpoint/v1",
+  "apiKey": "EXTERNAL_API_KEY",
+  "model": "external-advanced-model",
+  "routes": {
+    "external-advanced-model": {
+      "model": "external-advanced-model"
+    }
+  },
+  "redaction": {
+    "mode": "strict",
+    "dictionary": "/mnt/vol-eltaah12/workspace/shared/secrets/redaction/entities.json"
+  }
+}

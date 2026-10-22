@@ -1,5 +1,8 @@
 # real config with secrets — never commit
 config.json
+external.config.json
+entities.json
+redaction.entities.local.json
 
 # logs
 *.log
