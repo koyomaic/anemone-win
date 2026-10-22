@@ -718,13 +718,13 @@ class Avatar:
             log("l3 qa failed:", e)
             self._card_final(
                 s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n"
-                   f"> 文件问答处理失败：{str(e)[:180]}", 5)
+                   f"文件问答处理失败：{str(e)[:180]}", 5)
             self._notify(target, f"⚠️ 文件问答处理失败：{str(e)[:180]}")
         finally:
             if s.get("card_biz"):
                 self._card_final(
                     s, f"🍂 **{self.cfg.avatar_name}已结束**\n\n"
-                       "> 文件问答已结束；如有结果请查看后续消息。", 3)
+                       "文件问答已结束；如有结果请查看后续消息。", 3)
 
     # ── 会话流（自 im-bridge 演进） ──
     def _kw(self, text: str, name: str) -> bool:
@@ -776,7 +776,7 @@ class Avatar:
                 self._notify_session(s, "🚫 已拒绝，任务终止。")
                 self._card_final(
                     s, f"🍂 **{self.cfg.avatar_name}已拒绝 🚫**\n\n"
-                       "> 门禁请求已被拒绝，任务终止", 3)
+                       "门禁请求已被拒绝，任务终止", 3)
                 s["state"] = "IDLE"
                 s["task_id"] = None
                 self._swap_ack(s, "")
@@ -1089,7 +1089,7 @@ class Avatar:
             msg = (f"⚠️ 提交失败了：{r['_error']} "
                    f"{str(r.get('_detail', ''))[:120]}，稍后再试～")
             self._card_final(
-                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n> {msg}", 5)
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n{msg}", 5)
             self._notify_session(s, msg)
             s["state"] = "IDLE"
             self._swap_ack(s, "fail_text_emotion")
@@ -1404,7 +1404,7 @@ class Avatar:
         if not desc:
             self._card_final(
                 s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n"
-                   f"> 本机执行因{why}中断，且未留存任务内容", 5)
+                   f"本机执行因{why}中断，且未留存任务内容", 5)
             self._notify_session(
                 s, f"⚠️ 上一条任务因{why}中断，且未留存任务内容，"
                    f"麻烦你再发一次。")
@@ -1412,7 +1412,7 @@ class Avatar:
         if n >= 2:
             self._card_final(
                 s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n"
-                   f"> 本机执行因{why}中断，且已自动重投 2 次仍未跑成", 5)
+                   f"本机执行因{why}中断，且已自动重投 2 次仍未跑成", 5)
             self._notify_session(
                 s, f"⚠️ 上一条任务因{why}中断，且已自动重投 2 次仍未跑成，"
                    f"先不再自动重试。请稍后重发，或联系管理员。")
@@ -1932,7 +1932,7 @@ class Avatar:
             tids = rec.get("task_ids") or []
             tid = tids[-1] if tids else None
             content = (f"🍂 **{self.cfg.avatar_name}已结束**\n\n"
-                       "> 这张进度卡已停止更新；如有结果或失败通知，"
+                       "这张进度卡已停止更新；如有结果或失败通知，"
                        "请查看后续消息。")
             ok, err, _ = self._card_update_biz(biz, content, 3, task_id=tid)
             age = int(now - float(rec.get("last_update")
@@ -1984,9 +1984,9 @@ class Avatar:
                     self._card_update(
                         s, s["card_biz"],
                         f"🍂 **{self.cfg.avatar_name}等拍板…**\n\n"
-                        f"> 🚧 {summ}\n"
-                        + ("> 回复「确认」放行 /「拒绝」终止" if is_sup else
-                           "> 已转超管确认，你无需操作"), 4, task_id=tid)
+                        f"🚧 {summ}\n"
+                        + ("回复「确认」放行 /「拒绝」终止" if is_sup else
+                           "已转超管确认，你无需操作"), 4, task_id=tid)
                 self.st.archive_round(tid, "pending_approval",
                                       row.get("blocked_cmd"))
                 continue
@@ -3084,7 +3084,7 @@ class Avatar:
         elif status == "failed":
             err = (row.get("error") or "未知错误")[:300]
             self._card_final(
-                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n> {err}", 5)
+                s, f"🍂 **{self.cfg.avatar_name}没办成 ❌**\n\n{err}", 5)
             # 卡片之外**必须**再补一条真实消息，不能因为卡片更新成功就省掉。
             # 卡片是原地更新：钉钉不推送、不亮红点，用户看到的仍是几小时前的
             # 「正在处理…」。2026-10-10 交互群事故——#690 超时失败，卡片确实

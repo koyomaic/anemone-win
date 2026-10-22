@@ -53,6 +53,7 @@ def test_render_rich_contains_progress():
         controls="发「进度」看详情，发「取消」随时中止",
     )
     out = cp.render(ctx)
+    assert ">" not in out
     assert out.startswith("🍂 **鲁大师正在处理…**")
     assert "已收到：生成净头寸策略报告" in out
     assert "当前阶段" in out
@@ -77,6 +78,7 @@ def test_render_local_no_cancel_promise():
         controls="本机预处理中；超时会自动转后台持久通道",
     )
     out = cp.render(ctx)
+    assert ">" not in out
     assert "本机预算 5 分 0 秒" in out
     assert "取消" not in out
     assert "报告装配" in out
@@ -93,6 +95,7 @@ def test_render_hides_details_in_group_when_disabled():
         detail=False,
     )
     out = cp.render(ctx)
+    assert ">" not in out
     assert "secret_name.xlsx" not in out
     assert "最近动作" not in out
 
@@ -122,4 +125,5 @@ def test_basic_mode_fallback():
         mode="basic",
     )
     out = cp.render(ctx)
+    assert ">" not in out
     assert "正在为你办…（已用 31s）" in out

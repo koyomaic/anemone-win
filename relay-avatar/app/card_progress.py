@@ -200,47 +200,47 @@ def render(ctx: ProgressCtx) -> str:
     if str(ctx.mode or "rich").lower() != "rich":
         note = ctx.note or ctx.stage or "正在为你办"
         return (f"🍂 **{ctx.avatar_name}{ctx.title}**\n\n"
-                f"> 📥 已收到：{ctx.hint}\n"
-                f"> ⏳ {note}…（已用 {int(ctx.total_elapsed or 0)}s）")
+                f"📥 已收到：{ctx.hint}\n"
+                f"⏳ {note}…（已用 {int(ctx.total_elapsed or 0)}s）")
 
     lines = [f"🍂 **{ctx.avatar_name}{ctx.title}**", ""]
     q = []
     if ctx.hint:
-        q.append(f"> 📥 已收到：{ctx.hint}")
+        q.append(f"📥 已收到：{ctx.hint}")
     if ctx.note:
-        q.append(f"> ⏳ {ctx.note}")
+        q.append(f"⏳ {ctx.note}")
     stage = ctx.stage or infer_stage(ctx.actions, ctx.status, ctx.backend,
                                      ctx.seg, "")
     if stage:
-        q.append(f"> 🧭 当前阶段：{stage}")
+        q.append(f"🧭 当前阶段：{stage}")
     total = float(ctx.total_elapsed or 0)
     seg = float(ctx.seg_elapsed or 0)
     if total:
         if ctx.backend == "relay" and seg and abs(seg - total) >= 1:
-            q.append(f"> ⏱ 总用时 {fmt_dur(total)} · 本段 {fmt_dur(seg)}")
+            q.append(f"⏱ 总用时 {fmt_dur(total)} · 本段 {fmt_dur(seg)}")
         else:
-            q.append(f"> ⏱ 已用 {fmt_dur(total)}")
+            q.append(f"⏱ 已用 {fmt_dur(total)}")
     if ctx.seg > 0:
         if ctx.max_seg > 0:
-            q.append(f"> 🧵 第 {ctx.seg + 1}/{ctx.max_seg} 段，前段产出已保留")
+            q.append(f"🧵 第 {ctx.seg + 1}/{ctx.max_seg} 段，前段产出已保留")
         else:
-            q.append(f"> 🧵 第 {ctx.seg + 1} 段，前段产出已保留")
+            q.append(f"🧵 第 {ctx.seg + 1} 段，前段产出已保留")
     if ctx.budget and ctx.budget > 0:
         bar = budget_bar(seg or total, ctx.budget)
         label = "本机预算" if ctx.backend == "local" else "本段预算"
-        q.append(f"> 📊 {label} {fmt_dur(ctx.budget)} {bar}".rstrip())
+        q.append(f"📊 {label} {fmt_dur(ctx.budget)} {bar}".rstrip())
     if ctx.status == "queued":
         pending = int((ctx.queue or {}).get("pending") or 0)
         active = int((ctx.queue or {}).get("active") or 0)
         if pending or active:
-            q.append(f"> 🚦 后台队列：待执行 {pending} · 执行中 {active}")
+            q.append(f"🚦 后台队列：待执行 {pending} · 执行中 {active}")
     actions = _clean_actions(ctx.actions, 3)
     if actions and ctx.detail:
-        q.append("> 最近动作：")
+        q.append("最近动作：")
         for a in actions:
-            q.append(f"> · {a}")
+            q.append(f"· {a}")
     if ctx.controls:
-        q.append(f"> {ctx.controls}")
+        q.append(ctx.controls)
     return "\n".join(lines + q)
 
 

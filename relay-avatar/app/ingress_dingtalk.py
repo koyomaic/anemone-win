@@ -84,6 +84,19 @@ def card_biz_id(resp) -> str:
         return ""
 
 
+def card_plain(text: str) -> str:
+    out = []
+    for ln in str(text or "").split("\n"):
+        stripped = ln.lstrip()
+        if stripped.startswith(">"):
+            indent = ln[:len(ln) - len(stripped)]
+            rest = stripped.lstrip(">").lstrip()
+            out.append(f"{indent}{rest}" if rest else indent)
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def parse_card_response(r) -> dict:
     if not isinstance(r, dict) or not r:
         return {"ok": False, "accepted": False, "verified": False,
@@ -330,7 +343,7 @@ class Dws:
             return {"ok": False, "accepted": False, "verified": False,
                     "retryable": False, "error": "empty_biz"}
         r = self.run(["chat", "+messages-update-card", "--biz-id", biz_id,
-                      "--content", md_hardbreak(content or ""),
+                      "--content", md_hardbreak(card_plain(content or "")),
                       "--flow-status", str(flow_status),
                       "--yes", "--format", "json"], timeout=30)
         return parse_card_response(r)

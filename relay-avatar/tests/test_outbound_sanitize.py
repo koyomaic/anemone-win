@@ -128,12 +128,12 @@ def test_card_frame_shape_survives_sanitization():
     card_hint = (desc.splitlines() or [""])[0][:40]
     assert "\x07" in card_hint              # 清洗前确实带毒
     frame = (f"🍂 **鲁大师正在处理…**\n\n"
-             f"> 📥 已收到：{card_hint}\n> ⏳ 正在为你办…（已用 31s）")
+             f"📥 已收到：{card_hint}\n⏳ 正在为你办…（已用 31s）")
     out = md_hardbreak(frame)
     assert "\x07" not in out
     assert out.startswith("🍂 **鲁大师正在处理…**")
-    assert "> 📥 已收到：@鲁大师今天净头寸策略是什么" in out
-    assert "> ⏳ 正在为你办…（已用 31s）" in out
+    assert "📥 已收到：@鲁大师今天净头寸策略是什么" in out
+    assert "⏳ 正在为你办…（已用 31s）" in out
 
 
 @pytest.mark.parametrize("bad", ["\x00", "\x07", "\x1b", "\x7f", "\x0b", "\x0c"])

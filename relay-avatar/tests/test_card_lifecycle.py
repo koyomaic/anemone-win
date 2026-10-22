@@ -178,6 +178,7 @@ def test_local_done_finalizes_card(av):
     wait_local(s)
     assert any("本机预算" in c and "读取文件" in c
                for _, c, f in av.dws.frames if f == 1)
+    assert all(">" not in c for _, c, f in av.dws.frames if f == 1)
     av._drain_local()
     assert not s.get("card_biz")
     assert av.dws.frames[-1][2] == 3
