@@ -34,7 +34,16 @@ DEFAULTS: dict[str, Any] = {
                 # 为什么必须有：此前 resume 只看 TTL，链可无限续——claude 每轮重放
                 # 整段历史。2026-09-28 实测 #278→#281 单轮往返 7.3s→32.6s（4.5 倍），
                 # 模型往返占执行时间 75%。0/负值＝该项不设限。
-                "resume_max_depth": 3, "resume_max_tokens": 60000,
+                #
+                # resume_max_tokens 的口径在 2026-10-23 变过，阈值随之从 60000 抬到
+                # 1500000：relay 的 tokens 取自 claude 的 result.usage，而 claude-proxy
+                # 此前在流式收尾只回 output_tokens、把 input_tokens 丢了，tokens 于是
+                # 是**纯输出**；补回后它是**任务内所有 API 调用的 input+output 累加**
+                # （实测单轮基线 ~19.8k，一个 4 轮任务 result.usage.input_tokens=79734）。
+                # 同一个 60000 阈值会让**任何一个普通任务跑完就触顶**，追问链全断、
+                # 用户每轮都丢上下文。1500000 ≈ 两个 #280 量级任务，与旧阈值「约 2 轮」
+                # 的原意对齐。真正稳的闸门是下面的转写字节数（不依赖遥测口径）。
+                "resume_max_depth": 3, "resume_max_tokens": 1500000,
                 # 转写字节闸门：链上会话转写（--resume 要整段重放的东西）超过此
                 # 字节数即断链。为什么 token 闸门不够：claude-proxy 曾把流式 usage
                 # 的 input_tokens 丢掉，relay 的 tokens 退化成纯输出——2026-10-23

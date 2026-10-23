@@ -104,8 +104,10 @@ def test_resume_depth_cap(cfg, storage):
 
 def test_resume_token_cap(cfg, storage):
     """#280/#281 的真实量级：两轮就吃掉 57k tokens，第三轮触顶。
-    先关掉 depth 上限以隔离 token 判定（否则 3 次 note_chain 会先撞 depth）。"""
-    cfg._p.setdefault("ingress", {}).update(resume_max_depth=0)
+    先关掉 depth 上限以隔离 token 判定（否则 3 次 note_chain 会先撞 depth）。
+    阈值显式写死，不跟代码默认值走——默认值在 2026-10-23 因口径变化抬过一档。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=0,
+                                            resume_max_tokens=60000)
     sm = SessionManager(cfg, storage)
     s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
     sm.note_chain(s, 25864, "a")
@@ -113,6 +115,23 @@ def test_resume_token_cap(cfg, storage):
     sm.note_chain(s, 31332, "b")                     # 累计 57196 < 60000
     assert sm.resume_candidate(s) == 42
     sm.note_chain(s, 5000, "c")                      # 累计 62196 >= 60000
+    assert sm.resume_candidate(s) is None
+    assert "tokens" in sm.resume_break_reason(s)
+
+
+def test_resume_token_default_survives_input_tokens_accounting(cfg, storage):
+    """回归保护（2026-10-23）：claude-proxy 补回流式 input_tokens 后，relay 的
+    tokens 从「纯输出」变成「任务内所有 API 调用的 input+output 累加」——单轮基线
+    ~19.8k，实测一个 4 轮任务 result.usage.input_tokens=79734。若默认阈值还停在
+    旧的 60000，**任何一个普通任务跑完就触顶**，追问链全断、用户每轮丢上下文。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=0)
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
+    sm.note_chain(s, 79734, "一个 4 轮普通任务")       # 实测值
+    assert sm.resume_candidate(s) == 42               # 不许断
+    sm.note_chain(s, 600000, "一个 20 轮重任务")
+    assert sm.resume_candidate(s) == 42               # 两个重任务也不许断
+    sm.note_chain(s, 900000, "第三个")                 # 累计 1579734 >= 1500000
     assert sm.resume_candidate(s) is None
     assert "tokens" in sm.resume_break_reason(s)
 

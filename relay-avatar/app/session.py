@@ -146,7 +146,11 @@ class SessionManager:
         if max_depth > 0 and depth >= max_depth:
             return f"depth {depth}>={max_depth}"
         toks = int(s.get("chain_tokens") or 0)
-        max_toks = int(self.cfg.get("ingress", "resume_max_tokens", 60000))
+        # 兜底默认与 config.DEFAULTS 同值（1500000）。这个口径是「任务内所有 API
+        # 调用的 input+output 累加」，不是纯输出——2026-10-23 claude-proxy 补回
+        # input_tokens 后抬过一档，两处必须一起改，否则漏配时会退回旧的 60000、
+        # 一个普通任务跑完就断链。
+        max_toks = int(self.cfg.get("ingress", "resume_max_tokens", 1500000))
         if max_toks > 0 and toks >= max_toks:
             return f"tokens {toks}>={max_toks}"
         # 转写字节闸门：token 闸门量的是 relay 记的 tokens，而那个数在
