@@ -1076,6 +1076,17 @@ def test_send_marker_malformed_json_kept_in_text(av, cfg, shared):
     assert av.dws.sent == []
 
 
+def test_send_marker_bare_path_is_tolerated(av, cfg, shared):
+    _, wd = write_ready(cfg, shared)
+    p = _mk(wd[0] + "/2026-10/裸路径.html", "<html>x</html>")
+    s = sess_of(av)
+    body = f"正文\n\n```send_file\n{p}\n```"
+    clean, notes = av._consume_send_markers(body, s, 2, "200")
+    assert "```send_file" not in clean
+    assert any("[file]" in c and p in c for _, c in av.dws.sent)
+    assert any("已发文件" in n for n in notes)
+
+
 def test_drain_local_sends_file_end_to_end(av, cfg, shared):
     """全链路：local 出件 → 标记 → avatar 代投 → 正文回话（标记已剔除）。"""
     _, wd = write_ready(cfg, shared)

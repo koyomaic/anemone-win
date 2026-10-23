@@ -154,3 +154,43 @@ def test_list_query_maxlen_guards_long_paragraphs():
     long = "定时任务" + "的" * 60 + "有哪些"
     assert len(long) > P._LIST_QUERY_MAXLEN
     assert P._is_list_query(long) is False
+
+
+@pytest.mark.parametrize("text,name", [
+    ("绑定计划 每日数据更新跟踪回执 到本群", "每日数据更新跟踪回执"),
+    ("把计划「每日数据更新跟踪回执」绑定到本群", "每日数据更新跟踪回执"),
+    ("计划 每日数据更新跟踪回执 投递到本群", "每日数据更新跟踪回执"),
+    ("把任务 每日数据上传提醒 发送到本群", "每日数据上传提醒"),
+])
+def test_parse_plan_cmd_bind(text, name):
+    r = P.parse_plan_cmd(text)
+    assert r and r["cmd"] == "bind" and r["name"] == name
+
+
+@pytest.mark.parametrize("text,name", [
+    ("解绑计划 每日数据更新跟踪回执", "每日数据更新跟踪回执"),
+    ("取消绑定 每日数据更新跟踪回执", "每日数据更新跟踪回执"),
+    ("把计划「每日数据上传提醒」取消投递", "每日数据上传提醒"),
+])
+def test_parse_plan_cmd_unbind(text, name):
+    r = P.parse_plan_cmd(text)
+    assert r and r["cmd"] == "unbind" and r["name"] == name
+
+
+def test_parse_plan_cmd_update_time_and_desc():
+    r = P.parse_plan_cmd("修改计划 每日数据上传提醒 每天9点")
+    assert r == {"cmd": "update", "name": "每日数据上传提醒",
+                 "on_calendar": "*-*-* 09:00:00", "gloss": "每天 09:00"}
+    r = P.parse_plan_cmd("修改定时任务 每日数据上传提醒 描述：检查当日数据并输出回执")
+    assert r["cmd"] == "update" and r["name"] == "每日数据上传提醒"
+    assert r["description"] == "检查当日数据并输出回执"
+    r = P.parse_plan_cmd("调整计划「每日数据上传提醒」每天09:30 提醒上传数据")
+    assert r["on_calendar"] == "*-*-* 09:30:00"
+    assert r["description"] == "提醒上传数据"
+
+
+def test_direct_create_desc_and_name_are_cleaned():
+    r = P.parse_plan_cmd("定时任务：每日3点，生成鲁大师用户日度使用分析报告")
+    assert r["cmd"] == "create"
+    assert r["description"] == "生成鲁大师用户日度使用分析报告"
+    assert r["name"] == "生成鲁大师用户日度使用分析报告"

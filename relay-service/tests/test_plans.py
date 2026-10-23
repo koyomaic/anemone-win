@@ -87,6 +87,12 @@ def test_validate_action_delivery():
          "delivery": {"is_group": True, "conversation_id": "x" * 201}}) is not None
 
 
+def test_validate_action_allows_created_by_metadata():
+    assert plan_util.validate_action(
+        {"type": "task", "description": "x",
+         "created_by": {"uid": "200", "sender": "张三"}}) is None
+
+
 def test_name_re():
     assert plan_util.NAME_RE.match("daily-brief")
     assert plan_util.NAME_RE.match("日报_2026.09")

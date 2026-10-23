@@ -110,9 +110,11 @@ DEFAULTS: dict[str, Any] = {
                    "approval_timeout_minutes": 60,
                    # 计划投递绑定：创建计划时把当前会话写入 action.delivery，
                    # 计划任务结束后由 avatar 按绑定目标代投结果/文件。
-                   "plan_delivery_enabled": True,
-                   "plan_delivery_poll_sec": 15,
-                   "plan_delivery_max_attempts": 3},
+                    "plan_delivery_enabled": True,
+                    "plan_delivery_poll_sec": 15,
+                    "plan_delivery_max_attempts": 3,
+                    "plan_health_scan_sec": 3600,
+                    "plan_health_repeat_sec": 604800},
     "claude": {"permission_mode_super": "bypassPermissions",
                "permission_mode_l2": "default",
                "l2_allowed_tools": ["Read", "Glob", "Grep", "LS"],
@@ -156,8 +158,10 @@ DEFAULTS: dict[str, Any] = {
                  # 「删掉计划 每日原油」就能让 07:50 的日报静默消失。用户已明确
                  # **不动 relay schema**（不加 owner_uid 列），故在分身侧用名单止血。
                  # 名单按 plan.name 精确匹配；空列表＝不保护任何计划。
-                 "plan_protected": [],
-                 "profile_enforce": "strict", "sanitize": "on",
+                  "plan_protected": [],
+                  "plan_max_per_user": 20,
+                  "plan_max_total": 50,
+                  "profile_enforce": "strict", "sanitize": "on",
                  "rate_limit_daily_tasks": 100, "reprompt_cooldown_sec": 60,
                  "review_reprompt_cooldown_sec": 1800,
                  "review_reprompt_max": 2,

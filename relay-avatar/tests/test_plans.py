@@ -395,11 +395,32 @@ def test_marker_plan_gate_covers_mutating_ops_only(avatar):
 
 def test_plan_create_capped(avatar, cfg):
     """数量上限：每个计划到点都用分身凭据起真实任务，无上限即无限刷配额。"""
-    cfg._p.setdefault("security", {}).update(plan_max_per_user=2)
-    avatar.exec_relay.plans.extend([{"id": 1, "name": "a"}, {"id": 2, "name": "b"}])
+    cfg._p.setdefault("security", {}).update(plan_max_per_user=2,
+                                             plan_max_total=50)
+    avatar.exec_relay.plans.extend([
+        {"id": 1, "name": "a", "action": {"created_by": {"uid": "200"}}},
+        {"id": 2, "name": "b", "action": {"created_by": {"uid": "200"}}},
+    ])
     note = avatar._exec_plan_op(_spec(name="c"), "200")
     assert not avatar.exec_relay.created
     assert "上限" in note
+
+
+def test_plan_create_total_capped(avatar, cfg):
+    cfg._p.setdefault("security", {}).update(plan_max_per_user=20,
+                                             plan_max_total=2)
+    avatar.exec_relay.plans.extend([{"id": 1, "name": "a"},
+                                    {"id": 2, "name": "b"}])
+    note = avatar._exec_plan_op(_spec(name="c"), "200")
+    assert not avatar.exec_relay.created
+    assert "总数已达上限" in note
+
+
+def test_plan_create_records_creator(avatar):
+    avatar._exec_plan_op(_spec(name="creator"), "200", sender="张三")
+    assert len(avatar.exec_relay.created) == 1
+    action = avatar.exec_relay.created[0][2]
+    assert action["created_by"] == {"uid": "200", "sender": "张三"}
 
 
 def test_plan_ops_are_audited(avatar, cfg):
@@ -837,3 +858,107 @@ def test_blocked_openid_still_blocked_after_fallback(avatar):
     avatar.policy.blacklist.add(bad)
     assert avatar.policy.level_of(bad, bad, "坏人") == "BLOCKED"
     assert avatar._plan_gate(bad, "create", bad, "坏人") is not None
+
+
+GROUP_REPLY = {"is_group": True, "conversation_id": "cidGROUP==",
+               "open_dingtalk_id": "openSender", "sender": "张三"}
+
+
+def _add_plan(avatar, pid=1, name="日报", action=None, last_task_id=5):
+    p = {"id": pid, "name": name, "on_calendar": "*-*-* 08:00:00",
+         "enabled": True, "next_run": time.time() + 3600,
+         "last_task_id": last_task_id,
+         "action": action or {"type": "task", "description": "生成日报"}}
+    avatar.exec_relay.plans.append(p)
+    return p
+
+
+def test_bind_plan_to_current_group(avatar):
+    _add_plan(avatar)
+    note = avatar._exec_plan_op({"op": "bind", "name": "日报"}, "200",
+                                sender="张三", reply=GROUP_REPLY)
+    assert "已把计划「日报」的投递目标绑定到本群" in note
+    pid, fields = avatar.exec_relay.patched[-1]
+    assert pid == 1
+    assert fields["action"]["delivery"]["conversation_id"] == "cidGROUP=="
+    state = avatar._plan_delivery_state()
+    assert state["1"]["delivered_task_id"] == 5
+
+
+def test_bind_plan_ambiguous_or_missing(avatar):
+    note = avatar._exec_plan_op({"op": "bind", "name": "不存在"}, "200",
+                                reply=GROUP_REPLY)
+    assert "没找到计划" in note
+    _add_plan(avatar, 1, "日报A")
+    _add_plan(avatar, 2, "日报B")
+    note = avatar._exec_plan_op({"op": "bind", "name": "日报"}, "200",
+                                reply=GROUP_REPLY)
+    assert "匹配到多个" in note
+
+
+def test_unbind_requires_super(avatar):
+    _add_plan(avatar, action={"type": "task", "description": "x",
+                              "delivery": GROUP_REPLY})
+    note = avatar._exec_plan_op({"op": "unbind", "name": "日报"}, "200")
+    assert "仅超管可解除" in note
+    assert not avatar.exec_relay.patched
+    note = avatar._exec_plan_op({"op": "unbind", "name": "日报"}, "18434")
+    assert "已解除" in note
+    pid, fields = avatar.exec_relay.patched[-1]
+    assert "delivery" not in fields["action"]
+
+
+def test_update_plan_preserves_delivery(avatar):
+    delivery = {"is_group": True, "conversation_id": "cidGROUP==", "sender": "张三"}
+    _add_plan(avatar, action={"type": "task", "description": "旧",
+                              "delivery": delivery})
+    note = avatar._exec_plan_op(
+        {"op": "update", "name": "日报", "on_calendar": "*-*-* 09:00:00",
+         "description": "新描述"}, "200")
+    assert "已修改计划「日报」" in note
+    pid, fields = avatar.exec_relay.patched[-1]
+    assert pid == 1 and fields["on_calendar"] == "*-*-* 09:00:00"
+    assert fields["action"]["description"] == "新描述"
+    assert fields["action"]["delivery"] == delivery
+
+
+def test_update_protected_plan_requires_super(avatar, cfg):
+    cfg._p.setdefault("security", {})["plan_protected"] = ["日报"]
+    _add_plan(avatar)
+    note = avatar._exec_plan_op(
+        {"op": "update", "name": "日报", "on_calendar": "*-*-* 09:00:00"}, "200")
+    assert "仅超管可修改" in note
+    assert not avatar.exec_relay.patched
+    note = avatar._exec_plan_op(
+        {"op": "update", "name": "日报", "on_calendar": "*-*-* 09:00:00"}, "18434")
+    assert "已修改计划" in note
+
+
+def test_direct_bind_command_routes_before_brain(avatar, cfg):
+    cfg._p.setdefault("group", {}).update(enabled=True)
+    _add_plan(avatar)
+    avatar.dws.sent.clear()
+    e = ev("绑定计划 日报 到本群", n="80")
+    e["event_type"] = "user_im_message_receive_at"
+    e["conversation_id"] = "cidGROUP=="
+    avatar.on_event(e)
+    assert not avatar.exec_relay.submitted
+    assert avatar.exec_relay.patched
+    assert any("绑定到本群" in c for _, c in avatar.dws.sent)
+
+
+def test_plan_health_scan_flags_legacy_no_delivery(avatar, cfg):
+    cfg._p.setdefault("monitor", {}).update(alert_to="20102")
+    _add_plan(avatar, 1, "群发计划",
+              action={"type": "task", "description": "每日发送到中鲁群"})
+    _add_plan(avatar, 2, "内部计划",
+              action={"type": "task", "description": "落盘 shared/report"})
+    _add_plan(avatar, 3, "已绑定",
+              action={"type": "task", "description": "发送到群",
+                      "delivery": GROUP_REPLY})
+    avatar._plan_health_next = 0
+    avatar._scan_plan_health()
+    state = avatar._plan_health_state()
+    assert "1" in state and "2" not in state and "3" not in state
+    assert any("定时计划投递体检" in c for _, c in avatar.dws.sent)
+

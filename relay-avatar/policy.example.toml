@@ -144,6 +144,11 @@ approval_timeout_minutes = 60   # 仅用于审批通知文案（告知超管"多
 # 代价：local 通路无 relay 的 task_id，故不支持门禁审批/冲突检测/中途取消。
 l2_backend = "relay"           # L1/L2（含动态白名单）
 super_backend = "relay"        # super；走 local 时同样只读编排，**不用** bypassPermissions
+plan_delivery_enabled = true   # 计划创建时绑定当前会话，任务终态后由 avatar 代投结果/附件
+plan_delivery_poll_sec = 15
+plan_delivery_max_attempts = 3
+plan_health_scan_sec = 3600    # 体检 enabled 但无 delivery、描述却要求发送/推送的 legacy 计划
+plan_health_repeat_sec = 604800
 
 [claude]
 # tier → claude 权限映射（修 fenshen P0：L2 不再 bypassPermissions）
@@ -328,8 +333,9 @@ local_sandbox_net_allow = []
 profile_enforce = "strict"     # strict=dws_profile 配置后所有调用强制带，缺失硬告警拒发
 sanitize = "on"                # 注入清洗，不可关（代码忽略 off 值）
 rate_limit_daily_tasks = 9999  # 每用户日任务数上限（机队默认等同不限；收紧改小即可）
-plan_max_per_user = 20         # 每用户定时计划上限（每个计划到点都用分身凭据起真实
-                               # 任务，无上限即无限刷配额）；0＝不限
+plan_max_per_user = 20         # 每用户定时计划上限（按 action.created_by.uid 统计；每个计划
+                               # 到点都用分身凭据起真实任务，无上限即无限刷配额）；0＝不限
+plan_max_total = 50            # 本机计划总数硬上限（含 legacy 无归属计划）；0＝不限
 plan_protected = []            # 受保护计划名单（按 plan.name 精确匹配）：非 super 一律
                                # 不得删除/停用/启用，清单里显示 🔒。为什么需要：
                                # _plan_gate 只校验 tier 不校验归属，而 relay 侧

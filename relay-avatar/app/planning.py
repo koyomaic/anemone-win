@@ -69,6 +69,30 @@ _PLAN_NOUN_LOOSE = re.compile(r"计划|定时")
 _LIST_QUERY_MAXLEN = 40        # 长段落不劫持，交给大脑
 _LIST_QUERY_LOOSE_MAXLEN = 12  # 裸「计划」路径的句长上限
 
+_OPENQ = r"[「『\"'`“‘]"
+_CLOSEQ = r"[」』\"'`”’]"
+_QUOTE = r"[「『\"'`“”‘’]?"
+_PLAN_NOUN = r"(?:定时)?(?:计划|任务)"
+_BIND_TARGET = r"(?:本群|此群|当前群|这个群|这里)"
+_BIND_PREFIX_RE = re.compile(
+    r"^(?:绑定|绑|投递|推送|发送|发)\s*" + _PLAN_NOUN + r"?\s*" + _QUOTE +
+    r"(.+?)" + _QUOTE + r"\s*(?:到|至|给)?\s*" + _BIND_TARGET + r"$")
+_BIND_RE = re.compile(
+    r"^(?:请|帮我|麻烦|把|将)*\s*" + _PLAN_NOUN + r"?\s*" + _QUOTE +
+    r"(.+?)" + _QUOTE + r"\s*(?:绑定|绑|投递|推送|发送|发)\s*(?:到|至|给)?\s*" +
+    _BIND_TARGET + r"$")
+_UNBIND_RE = re.compile(
+    r"^(?:解绑|取消绑定|取消投递|移除投递|删除投递)\s*" + _PLAN_NOUN +
+    r"?\s*" + _QUOTE + r"(.+?)" + _QUOTE + r"$")
+_UNBIND_SUFFIX_RE = re.compile(
+    r"^(?:请|帮我|麻烦|把|将)*\s*" + _PLAN_NOUN + r"?\s*" + _QUOTE +
+    r"(.+?)" + _QUOTE + r"\s*(?:解绑|取消绑定|取消投递|移除投递)$")
+_UPDATE_RE = re.compile(
+    r"^(?:修改|调整|更新|更改)\s*" + _PLAN_NOUN + r"\s*"
+    r"(?:" + _OPENQ + r"(.+?)" + _CLOSEQ + r"|(\S+))"
+    r"\s*[:：]?\s*(.*)$", re.S)
+_DESC_PREFIX_RE = re.compile(r"^(?:描述|内容|任务描述|计划描述)\s*[:：]?\s*(.+)$", re.S)
+
 
 def _is_list_query(t: str) -> bool:
     """判定「这是在问有哪些定时计划」。见上方注释：list 只读，宁可多判不可漏判。"""
@@ -212,13 +236,19 @@ def _extract_desc(text: str, spans: list) -> str:
     s = "".join(chars)
     s = re.sub("|".join(MERIDIEM_PM + MERIDIEM_NOON + MERIDIEM_AM), "", s)
     s = re.sub(r"^(?:请|帮我|帮忙|给我|麻烦|然后|就|要|想|来|的)+", "", s.strip())
+    s = re.sub(r"^(?:到|为|改成|改为|设成|设为)\s*", "", s.strip())
+    s = re.sub(r"^(?:定时)?(?:任务|计划)\s*[:：,，、]+\s*", "", s.strip())
     s = re.sub(r"\s{2,}", " ", s).strip()
+    s = re.sub(r"^[,，、:：;；\s]+", "", s)
+    s = re.sub(r"[,，、:：;；\s]+$", "", s)
+    s = re.sub(r"([,，、])[,，、]+", r"\1", s)
     s = s.strip(" ，,、的然后就给我帮请麻烦:-—、")
     return s or "定时任务"
 
 
 def make_name(desc: str) -> str:
-    base = re.sub(r"[^A-Za-z0-9_.一-鿿-]", "", desc or "")[:16]
+    s = re.sub(r"^(?:定时)?(?:任务|计划)\s*[:：,，、]*\s*", "", str(desc or "").strip())
+    base = re.sub(r"[^A-Za-z0-9_.一-鿿-]", "", s)[:40]
     return base or "plan"
 
 
@@ -249,8 +279,55 @@ def parse_schedule(text: str) -> dict | None:
             "name": make_name(desc), "gloss": _gloss(kind, param, h, m)}
 
 
+def _clean_plan_name(name: str) -> str:
+    return re.sub(r"^[「『\"'`“”‘’\s]+|[」』\"'`“”‘’\s]+$", "", str(name or "")).strip()
+
+
+def parse_bind_cmd(text: str) -> dict | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _BIND_PREFIX_RE.match(t) or _BIND_RE.match(t)
+    if m:
+        name = _clean_plan_name(m.group(1))
+        if name:
+            return {"cmd": "bind", "name": name}
+    m = _UNBIND_RE.match(t) or _UNBIND_SUFFIX_RE.match(t)
+    if m:
+        name = _clean_plan_name(m.group(1))
+        if name:
+            return {"cmd": "unbind", "name": name}
+    return None
+
+
+def parse_update_cmd(text: str) -> dict | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _UPDATE_RE.match(t)
+    if not m:
+        return None
+    name = _clean_plan_name(m.group(1) or m.group(2) or "")
+    rest = (m.group(3) or "").strip()
+    if not name or not rest:
+        return None
+    dm = _DESC_PREFIX_RE.match(rest)
+    if dm:
+        desc = dm.group(1).strip()
+        return {"cmd": "update", "name": name, "description": desc} if desc else None
+    sch = parse_schedule(rest)
+    if not sch or sch.get("error"):
+        return None
+    out = {"cmd": "update", "name": name, "on_calendar": sch["on_calendar"],
+           "gloss": sch.get("gloss", "")}
+    desc = str(sch.get("description") or "").strip()
+    if desc and desc != "定时任务":
+        out["description"] = desc
+    return out
+
+
 def parse_plan_cmd(text: str) -> dict | None:
-    """识别计划命令。返回 {cmd: list|create|create_fail|delete|disable|enable, ...} 或 None。"""
+    """识别计划命令。返回 {cmd: list|create|create_fail|delete|disable|enable|bind|unbind|update, ...} 或 None。"""
     t = (text or "").strip()
     if not t:
         return None
@@ -266,6 +343,12 @@ def parse_plan_cmd(text: str) -> dict | None:
     m = re.match(r"^(?:计划|定时)\s*(?:启用|开启|恢复)\s*(\S+)$", t)
     if m:
         return {"cmd": "enable", "name": m.group(1)}
+    b = parse_bind_cmd(t)
+    if b:
+        return b
+    u = parse_update_cmd(t)
+    if u:
+        return u
     m = re.match(r"^(?:定时|计划)[\s:：]*(.+)$", t, re.S)
     if m:
         rest = m.group(1).strip()
