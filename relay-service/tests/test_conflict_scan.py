@@ -43,6 +43,60 @@ def test_is_volatile_matches_tool_caches():
     assert not is_volatile("shared/reports/日报.md", pats)
 
 
+# 增量任务水位文件（2026-10-23）。「财务智脑攻坚组群消息即时提炼」计划每 15 分钟
+# 触发一次，累计 32 单里 27 单（84%）判 conflict，冲突记录里该文件被命中 1140 次，
+# 而每单 changed_files **只有这一个水位文件**——纯伪冲突：白干 1.2h 机时、堆了 68MB
+# 冲突备份，还占并发槽跟真实用户任务抢。
+GONGJIANZU_WM = "shared/report/dingtalk-digest/state/gongjianzu.watermark.txt"
+
+
+def test_is_volatile_matches_watermark_state():
+    pats = DEFAULT_VOLATILE_PATTERNS
+    assert is_volatile(GONGJIANZU_WM, pats)                    # 线上真实路径
+    assert is_volatile("shared/report/x/state/y.watermark.txt", pats)
+    assert is_volatile("shared/report/x/state/y.watermark.json", pats)
+    assert is_volatile("shared/report/x/state/y.watermark", pats)
+    assert is_volatile("shared/report/dingtalk-digest/gongjianzu.watermark.txt", pats)
+    # 不能顺手把真实产出也豁免掉
+    for keep in ("shared/report/dingtalk-digest/20261023_攻坚组纪要.md",
+                 "shared/report/dingtalk-digest/state/digest.md",
+                 "shared/knowledge/ai-daily-sources/ledger.csv",
+                 "shared/knowledge/调价.md"):
+        assert not is_volatile(keep, pats), keep
+
+
+def test_watermark_only_task_produces_no_changed_files(tmp_path):
+    """无新消息的一轮：只重写水位 → scan["all"] 为空，不进冲突判定。"""
+    cfg = _cfg(tmp_path)
+    db = DB(cfg.db_path)
+    ws = Workspace(cfg, db)
+    tid = db.create_task(user="im-bridge", description="群消息增量提炼")
+    workdir = ws.prepare(db.task(tid))
+    _write(tmp_path, GONGJIANZU_WM, "2026-10-23T11:00:00+08:00")
+
+    scan = ws.scan(db.task(tid))
+    assert scan["all"] == []
+    assert scan["volatile"] == [GONGJIANZU_WM]
+    assert db.task(tid)["changed_files"] == []
+    # 水位不进 .result，也就不会被当冲突备份源（68MB 备份堆积就是这么来的）
+    assert not os.path.exists(os.path.join(workdir, ".result", GONGJIANZU_WM))
+
+
+def test_watermark_exempt_but_real_output_still_counted(tmp_path):
+    """有新消息的一轮：水位豁免，但真实纪要照常计入产出、照常参与冲突判定。"""
+    cfg = _cfg(tmp_path)
+    db = DB(cfg.db_path)
+    ws = Workspace(cfg, db)
+    tid = db.create_task(user="im-bridge", description="群消息增量提炼")
+    ws.prepare(db.task(tid))
+    _write(tmp_path, GONGJIANZU_WM, "2026-10-23T11:15:00+08:00")
+    _write(tmp_path, "shared/report/dingtalk-digest/20261023_攻坚组纪要.md", "纪要")
+
+    scan = ws.scan(db.task(tid))
+    assert scan["all"] == ["shared/report/dingtalk-digest/20261023_攻坚组纪要.md"]
+    assert scan["volatile"] == [GONGJIANZU_WM]
+
+
 def test_snap_skips_runtime_dirs(tmp_path):
     """虚拟环境/模型缓存/归档/台账不进基线快照，否则每任务要哈希数万无关文件（实测 ~76s）。"""
     _write(tmp_path, "shared/knowledge/调价.md", "口径")

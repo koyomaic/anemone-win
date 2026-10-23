@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, field
 
 
@@ -99,6 +100,16 @@ DEFAULT_VOLATILE_PATTERNS = [
     ".token_cache",
     "*.bak-*",           # 冲突备份自身产物（Workspace.backup_version 生成）
     "*.pyc",
+    # 增量任务的水位文件（约定路径 shared/report/<job>/state/<name>.watermark.txt）。
+    # 为什么必须豁免：这类文件**本来就该每轮重写**——它记的是"上次读到哪"，不是产出。
+    # 但冲突门禁只看"是否改了同一路径"，于是定时增量任务会跟自己上一轮撞车。
+    # 实测「财务智脑攻坚组群消息即时提炼」计划每 15 分钟触发一次，累计 32 单里
+    # 27 单（84%）判 conflict，冲突记录里该文件被命中 1140 次，而每单的
+    # changed_files **只有这一个水位文件**（无新消息时它不产出任何报告）——
+    # 即纯伪冲突：白干 1.2h 机时、堆了 68MB 冲突备份，还占并发槽跟真实用户任务抢。
+    # 豁免后 scan["all"] 为空 → 干净 done；有真实产出时那些产出照常参与冲突判定。
+    "*/state/*.watermark*",
+    "*.watermark.txt",   # 兜住没放在 state/ 下的写法
 ]
 
 # 低风险自动完成前缀：任务**仅新建**这些目录下的文件时，不再进入 review。
@@ -115,6 +126,39 @@ DEFAULT_AUTO_DONE_PREFIXES = [
     "shared/_migrate/",
     "shared/_inventory/",
     "shared/_upgrade-backup/",
+]
+
+# claude 引擎默认禁用的内置工具（透传为 --disallowedTools）。
+#
+# 为什么需要：claude-code 默认挂 26 个工具 + 63 个 slash command + 5 个 agent，
+# 光工具定义就占 **19788 token**——实测固定上下文 21539 token 里 89.8% 是它，
+# CLAUDE.md 只占 1567、CEO_PROMPT 486、19 个技能合计仅 185（技能只注入名字，
+# 描述走 Skill 工具懒加载）。这 21.5k 每一轮 LLM 往返都要重新 prefill 一遍，
+# 按实测 ~3000 tok/s 就是每轮 ~7s 纯固定开销；每会话中位 15 轮 → 每单 ~105s。
+#
+# 取舍依据是 314 个会话 / 6779 次工具调用的**真实使用统计**，不是拍脑袋：
+# 下面 7 个在全量历史里调用次数为 0。DesignSync 更是二进制里明写「only available
+# with claude.ai authentication... not supported through... other third-party
+# providers」——我们走 OpenAI 兼容代理，它根本不可用。
+#
+# 刻意**不砍**的（都有实测调用，砍了会降质）：
+#   TaskCreate(166次/42会话)、TaskUpdate(250次/40会话) —— 多步任务清单，高频
+#   Task(转写里名为 Agent，5次/3会话) + SendMessage(5次) —— 子agent 派发与
+#     恢复/取消，两者必须成对保留
+#   TaskStop/TaskGet/TaskList/TaskOutput —— TaskCreate 的配对，只砍会让后台任务
+#     变成停不掉的孤儿
+#   Skill(99次/93会话) —— 实测砍掉它 input 反而从 9724 涨到 11715：它是 19 个
+#     技能的懒加载入口，没了它 claude-code 会把技能元信息直接摊进系统提示
+#   WebFetch(8次)/WebSearch(12次) —— 用户明确要留；且各自只值 206/231 token
+# 实测：砍这 7 个后 26→19 工具、21539→15166 token，每轮省 6374（-29.6%）。
+DEFAULT_CLAUDE_DISALLOWED_TOOLS = [
+    "NotebookEdit",     # Jupyter .ipynb 编辑，无此业务
+    "DesignSync",       # 仅 claude.ai 鉴权可用，第三方 provider 下不可用
+    "EnterWorktree",    # git worktree 隔离；relay 任务本就各自独立 workdir
+    "ExitWorktree",
+    "ReportFindings",   # LSP 代码审查发现上报，需先配 LSP server
+    "ScheduleWakeup",   # 长驻会话定时唤醒；headless 一次性任务不适用
+    "CronDelete",
 ]
 
 
@@ -159,6 +203,21 @@ def _auto_done_prefixes_from_env() -> list[str]:
     return out
 
 
+def _claude_disallowed_tools_from_env() -> list[str]:
+    """RELAY_CLAUDE_DISALLOWED_TOOLS：逗号或空格分隔的工具名。
+
+    未设 → 用 DEFAULT_CLAUDE_DISALLOWED_TOOLS；显式设 `none`/`-` → 空列表
+    （＝一个都不禁，回到 claude-code 原生 26 工具），给排查「某工具被误禁」
+    留一条不用改代码的退路。
+    """
+    raw = os.environ.get("RELAY_CLAUDE_DISALLOWED_TOOLS", "").strip()
+    if not raw:
+        return list(DEFAULT_CLAUDE_DISALLOWED_TOOLS)
+    if raw.lower() in ("none", "-", "off"):
+        return []
+    return [t for t in re.split(r"[,\s]+", raw) if t]
+
+
 @dataclass
 class Settings:
     db_path: str
@@ -200,6 +259,10 @@ class Settings:
     engine: str = "opencode"  # opencode | claude
     agent_bin: str = ""
     model: str = ""
+    # claude 引擎禁用的内置工具（见 DEFAULT_CLAUDE_DISALLOWED_TOOLS 的取舍依据）。
+    # 空列表＝不禁任何工具。
+    claude_disallowed_tools: list[str] = field(
+        default_factory=lambda: list(DEFAULT_CLAUDE_DISALLOWED_TOOLS))
     log_path: str = ""
     xdg_config_home: str = ""
     dashboard_password: str = ""
@@ -313,6 +376,7 @@ class Settings:
             engine=os.environ.get("RELAY_ENGINE", "opencode"),
             agent_bin=os.environ.get("RELAY_AGENT_BIN", ""),
             model=os.environ.get("RELAY_MODEL", ""),
+            claude_disallowed_tools=_claude_disallowed_tools_from_env(),
             log_path=os.environ.get("RELAY_LOG", f"{root}/relay.log"),
             xdg_config_home=os.environ.get("RELAY_XDG_CONFIG_HOME", ""),
             dashboard_password=os.environ.get("RELAY_DASHBOARD_PASSWORD", ""),

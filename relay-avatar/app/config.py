@@ -19,7 +19,14 @@ DEFAULTS: dict[str, Any] = {
                  "owner_userid": "", "self_open_id": "", "dws_profile": "",
                  "sign": ""},
     "ingress": {"event_keys": ["user_im_message_receive_o2o_all"],
-                "idle_watchdog_sec": 270, "debounce_sec": 20,
+                "idle_watchdog_sec": 270,                 "debounce_sec": 20,
+                # 纯文本消息的聚合窗（缓冲里一旦出现附件标记就自动切回 debounce_sec）。
+                # 为什么不把 debounce_sec 直接调小：实测 1271 对真人相邻消息里 23.2%
+                # 间隔 ≤20s，全是「文字＋图片」「分条补充」这类真实组合请求，一刀切
+                # 缩短会把它们劈成两个任务、agent 没看到图就作答。纯文本劈开则只是
+                # 退化成 followup 追问（会 resume 上一条会话并注入摘要，可恢复），
+                # 代价小得多，故只对纯文本收紧。取值依据见 session.py 的间隔分布。
+                "debounce_text_sec": 12,
                 "followup_debounce_sec": 30, "session_ttl_sec": 1800,
                 # 重复请求去重：同一发起人在多个会话里发同一需求时只跑一次，
                 # 其余会话绑成额外投递目标（结果送到每一处）。

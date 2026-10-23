@@ -820,9 +820,8 @@ class Avatar:
                 self._swap_ack(s, "")
                 self._notify_session(s, "已放弃本轮内容。")
                 return
-            s["buffer"].append(text)
-            s["deadline"] = time.time() + int(
-                self.cfg.get("ingress", "debounce_sec", 20))
+            # 追加 + 重算窗口一律交给 session：窗口长度取决于当前缓冲有没有附件
+            self.sess.extend_buffer(s, text)
             return
         if st in ("RUNNING", "WAIT_APPROVAL", "WAIT_REVIEW", "FOLLOWUP",
                   "LOCAL"):

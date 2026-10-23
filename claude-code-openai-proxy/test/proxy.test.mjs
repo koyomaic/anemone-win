@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import path from 'node:path';
-import { createProxy } from '../proxy.mjs';
+import { createProxy, prefixTag } from '../proxy.mjs';
 
 const dictionary = path.join(import.meta.dirname, '..', 'redaction.entities.example.json');
 
@@ -16,8 +16,8 @@ async function startServer(handler) {
   };
 }
 
-async function startProxy(config) {
-  const proxy = createProxy(config);
+async function startProxy(config, deps) {
+  const proxy = createProxy(config, deps);
   await new Promise((resolve) => proxy.server.listen(0, '127.0.0.1', resolve));
   return {
     ...proxy,
@@ -336,4 +336,121 @@ test('openai passthrough keeps client stream_options untouched', async (t) => {
   });
   await readText(res);
   assert.deepEqual(upstreamBody.stream_options, { include_usage: false });
+});
+
+// ── 前缀稳定性诊断（PROXY_PREFIX_LOG）──
+//
+// 后端（vLLM 经 APISIX）做自动前缀缓存，命中与否决定每轮 prefill 是 ~1s 还是 ~3s。
+// 实测同一 12235-token 前缀连发 8 次耗时 3.33/3.01/0.89/1.02/1.09/2.09/0.96/2.96s，
+// 明显双峰、4 快 4 慢——网关轮询到多副本、只有部分副本缓存了这段前缀。OpenAI 兼容
+// 协议没有 cache_control，Anthropic 那套显式标记无处可打，所以只能把前缀做小做稳，
+// 再量出真实命中率去跟网关侧谈会话亲和。prefixTag 就是量它的尺子。
+
+const SYS = [{ role: 'system', content: '你是财务智脑。' }];
+const TOOLS = [{ type: 'function', function: { name: 'Bash', description: 'run' } }];
+
+test('prefixTag ignores the trailing user message', () => {
+  const a = prefixTag({ messages: [...SYS, { role: 'user', content: '任务A' }], tools: TOOLS });
+  const b = prefixTag({ messages: [...SYS, { role: 'user', content: '完全不同的任务B，长得多' }], tools: TOOLS });
+  assert.equal(a.tag, b.tag, '任务描述在尾部 user 消息里，不该影响前缀 tag');
+  assert.equal(a.sysChars, '你是财务智脑。'.length);
+  assert.equal(a.tools, 1);
+  assert.ok(a.tailChars < b.tailChars, 'tailChars 要能反映尾部可变体量');
+});
+
+test('prefixTag changes when system prompt or tools change', () => {
+  const base = prefixTag({ messages: SYS, tools: TOOLS });
+  const sys2 = prefixTag({ messages: [{ role: 'system', content: '你是别的助手。' }], tools: TOOLS });
+  const tool2 = prefixTag({ messages: SYS, tools: [...TOOLS, { type: 'function', function: { name: 'Read' } }] });
+  assert.notEqual(base.tag, sys2.tag);
+  assert.notEqual(base.tag, tool2.tag);
+  assert.equal(tool2.tools, 2);
+});
+
+test('prefixTag tolerates missing fields', () => {
+  const t = prefixTag({});
+  assert.equal(typeof t.tag, 'string');
+  assert.equal(t.tag.length, 12);
+  assert.equal(t.sysChars, 0);
+  assert.equal(t.tools, 0);
+  assert.equal(t.tailChars, 0);
+});
+
+test('PROXY_PREFIX_LOG emits one prefix line per streamed request', async (t) => {
+  const upstream = await startServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ delta: { role: 'assistant', content: '好' } }] }));
+      res.write(sseChunk({ choices: [], usage: { prompt_tokens: 12235, completion_tokens: 8 } }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy({
+    host: '127.0.0.1', port: 0,
+    baseURL: `http://127.0.0.1:${upstream.port}/v1`,
+    apiKey: 'test-key', model: 'm', routes: {},
+    redaction: { mode: 'strict', dictionary },
+  }, { env: { PROXY_PREFIX_LOG: '1' } });
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'm', max_tokens: 8, stream: true,
+        system: '你是财务智脑。',
+        messages: [{ role: 'user', content: '只回一个字：好' }],
+      }),
+    });
+    await readText(res);
+  } finally { console.log = orig; }
+
+  const hit = lines.find((l) => l.includes(' prefix '));
+  assert.ok(hit, `未见 prefix 日志：${lines.join('|').slice(0, 300)}`);
+  const rec = JSON.parse(hit.slice(hit.indexOf('{')));
+  assert.equal(rec.tag.length, 12);
+  assert.equal(rec.inTok, 12235);
+  assert.equal(rec.outTok, 8);
+  assert.ok(typeof rec.ms === 'number' && rec.ms >= 0);
+  assert.ok(rec.sysChars > 0);
+});
+
+test('prefix logging is off by default (zero overhead)', async (t) => {
+  const upstream = await startServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ delta: { content: '好' } }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy({
+    host: '127.0.0.1', port: 0,
+    baseURL: `http://127.0.0.1:${upstream.port}/v1`,
+    apiKey: 'test-key', model: 'm', routes: {},
+    redaction: { mode: 'strict', dictionary },
+  }, { env: {} });
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'm', max_tokens: 8, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await readText(res);
+  } finally { console.log = orig; }
+  assert.ok(!lines.some((l) => l.includes(' prefix ')), '默认不该打 prefix 日志');
 });

@@ -5,6 +5,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRedactor } from './redact.mjs';
 import { createStreamProcessor } from './redact-stream.mjs';
@@ -43,6 +44,39 @@ export function loadConfig(env = process.env, baseUrl = import.meta.url) {
     );
   }
   return { configPath, host, port, baseURL, apiKey, model, routes, redaction, env };
+}
+
+// ---------- 前缀稳定性诊断（PROXY_PREFIX_LOG=1 时启用） ----------
+//
+// 为什么需要：后端（vLLM 经 APISIX）做**自动前缀缓存**，命中与否直接决定每轮
+// prefill 是 ~1s 还是 ~3s。实测同一 12235-token 前缀连发 8 次，耗时
+// 3.33/3.01/0.89/1.02/1.09/2.09/0.96/2.96s——**明显双峰，4 快 4 慢**，符合
+// 「网关轮询到多个副本、只有部分副本的 KV 缓存里有这段前缀」。
+// OpenAI 兼容协议没有 cache_control 字段，Anthropic 那套显式缓存标记在这里
+// **无处可打**（这也是 cache_read_input_tokens 恒为 0 的原因：后端不按
+// Anthropic 口径回报缓存账）。所以能做的只有两件事：把前缀做小、把前缀做稳，
+// 然后**量出真实命中率**去跟网关侧谈会话亲和。这个 tag 就是量它的尺子。
+//
+// tag = sha256(system 消息 + tools 定义)——即跨轮跨任务应当字节不变的那一段。
+// 任务描述在末尾的 user 消息里，不参与 tag，故同一台机器上所有任务的前缀 tag
+// 应当相同；若日志里 tag 频繁变化，说明有可变内容混进了前缀，缓存必然打不中。
+export function prefixTag(body) {
+  const msgs = Array.isArray(body?.messages) ? body.messages : [];
+  const sys = msgs.filter((m) => m && m.role === 'system');
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  const sysText = sys.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
+  const rest = msgs.filter((m) => m && m.role !== 'system');
+  const h = crypto.createHash('sha256');
+  h.update(sysText);
+  h.update('\u0000');
+  h.update(JSON.stringify(tools));
+  return {
+    tag: h.digest('hex').slice(0, 12),
+    sysChars: sysText.length,
+    tools: tools.length,
+    // 尾部可变部分体量：前缀命中后，真正要现算的就是这一段
+    tailChars: rest.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length), 0),
+  };
 }
 
 // ---------- Anthropic request -> OpenAI request ----------
@@ -322,11 +356,14 @@ export function createProxy(config, deps = {}) {
     return out.json;
   }
 
-  async function streamTranslate(upstream, res, reqModel, route, map) {
+  async function streamTranslate(upstream, res, reqModel, route, map, ptag) {
     const send = (event, data) =>
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
     const msgId = 'msg_' + Math.random().toString(36).slice(2);
+    // 本次流式往返的起点，仅供 prefix 诊断日志算 ms（外层 redactRequest 里那个
+    // 同名 started 是它自己的局部变量，这里取不到）。
+    const streamStartedAt = Date.now();
     let nextIndex = 0;
     let openIndex = -1;
     let textIndex = -1;
@@ -481,6 +518,16 @@ export function createProxy(config, deps = {}) {
         usage: { input_tokens: inputTokens, output_tokens: outputTokens },
       });
       send('message_stop', { type: 'message_stop' });
+      // 前缀稳定性/缓存命中诊断（PROXY_PREFIX_LOG=1 才打，默认零开销）。
+      // 同一 tag 下 ms 呈双峰＝后端多副本、只有部分副本缓存了这段前缀；
+      // tag 频繁变化＝有可变内容混进了前缀，缓存必然打不中。
+      if (env.PROXY_PREFIX_LOG && ptag) {
+        log('prefix', JSON.stringify({
+          tag: ptag.tag, sysChars: ptag.sysChars, tools: ptag.tools,
+          tailChars: ptag.tailChars, inTok: inputTokens, outTok: outputTokens,
+          ms: Number((Date.now() - streamStartedAt).toFixed(1)),
+        }));
+      }
       res.end();
     }
   }
@@ -613,6 +660,8 @@ export function createProxy(config, deps = {}) {
     if (!redacted) return;
     openaiBody = redacted.body;
     debugDump(openaiBody);
+    // 在脱敏**之后**取 tag：量的是真正上送给后端的那一段前缀
+    const ptag = env.PROXY_PREFIX_LOG ? prefixTag(openaiBody) : null;
 
     let up;
     try {
@@ -637,7 +686,7 @@ export function createProxy(config, deps = {}) {
         'cache-control': 'no-cache',
         connection: 'keep-alive',
       });
-      return await streamTranslate(up, res, body.model, route, redacted.map);
+      return await streamTranslate(up, res, body.model, route, redacted.map, ptag);
     }
     const j = await up.json();
     const processed = processNonStreamResponse(j, redacted.map);

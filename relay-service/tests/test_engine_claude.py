@@ -64,8 +64,83 @@ def test_build_cmd_opencode_untouched(tmp_path):
     assert cmd[1] == "run" and "--auto" in cmd
     assert cmd[cmd.index("-m") + 1] == "m1"
     assert cmd[cmd.index("-s") + 1] == "ses_x"
-    for flag in ("--dangerously-skip-permissions", "--output-format", "--mcp-config"):
+    for flag in ("--dangerously-skip-permissions", "--output-format", "--mcp-config",
+                 "--disallowedTools"):
         assert flag not in cmd
+
+
+# ---- 内置工具裁剪（2026-10-23）----
+#
+# claude-code 默认挂 26 个工具，光工具定义就占 19788 token——实测固定上下文
+# 21539 token 里 89.8% 是它（CLAUDE.md 只 1567、CEO_PROMPT 486、19 个技能合计
+# 仅 185）。这 21.5k 每轮 LLM 往返都要重新 prefill，按 ~3000 tok/s 就是每轮
+# ~7s 纯固定开销。禁用清单按 314 会话 / 6779 次调用的真实使用统计挑，只砍
+# 全量历史里调用次数为 0 的 7 个：26→19 工具、21539→15166 token。
+
+_A_GROUP = {"NotebookEdit", "DesignSync", "EnterWorktree", "ExitWorktree",
+            "ReportFindings", "ScheduleWakeup", "CronDelete"}
+
+# 有实测调用、砍了会降质的工具，必须永远留在白名单外
+_MUST_KEEP = {"Bash", "Read", "Write", "Edit", "Skill", "Task", "SendMessage",
+              "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput",
+              "TaskStop", "WebFetch", "WebSearch"}
+
+
+def test_default_disallowed_tools_is_exactly_a_group():
+    from app.config import DEFAULT_CLAUDE_DISALLOWED_TOOLS
+    assert set(DEFAULT_CLAUDE_DISALLOWED_TOOLS) == _A_GROUP
+
+
+def test_default_disallowed_tools_never_touches_used_ones():
+    """回归保护：TaskCreate(166次)/TaskUpdate(250次)/Skill(99次)/WebFetch(8次)
+    等都有实测调用，绝不能进禁用清单。第一版清单曾误砍 TaskCreate/TaskUpdate。"""
+    from app.config import DEFAULT_CLAUDE_DISALLOWED_TOOLS
+    assert not (set(DEFAULT_CLAUDE_DISALLOWED_TOOLS) & _MUST_KEEP)
+
+
+def test_build_cmd_claude_disallowed_tools(tmp_path):
+    ex = Executor(_cfg(tmp_path))
+    cmd = ex.build_cmd(str(tmp_path), "p", None)
+    assert "--disallowedTools" in cmd
+    val = cmd[cmd.index("--disallowedTools") + 1]
+    # 逗号连成单个 argv（与 avatar exec_local 既有写法一致），实测 claude 认这种形式
+    assert set(val.split(",")) == _A_GROUP
+    assert not (_MUST_KEEP & set(val.split(",")))
+
+
+def test_build_cmd_claude_disallowed_tools_custom(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.claude_disallowed_tools = ["NotebookEdit", "DesignSync"]
+    cmd = Executor(cfg).build_cmd(str(tmp_path), "p", None)
+    assert cmd[cmd.index("--disallowedTools") + 1] == "NotebookEdit,DesignSync"
+
+
+def test_build_cmd_claude_disallowed_tools_empty(tmp_path):
+    """空列表＝一个都不禁，回到 claude-code 原生 26 工具。"""
+    cfg = _cfg(tmp_path)
+    cfg.claude_disallowed_tools = []
+    assert "--disallowedTools" not in Executor(cfg).build_cmd(str(tmp_path), "p", None)
+    cfg.claude_disallowed_tools = ["  ", ""]
+    assert "--disallowedTools" not in Executor(cfg).build_cmd(str(tmp_path), "p", None)
+
+
+def test_settings_claude_disallowed_tools_from_env(monkeypatch, tmp_path):
+    from app.config import Settings
+    monkeypatch.setenv("RELAY_WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("RELAY_CLAUDE_DISALLOWED_TOOLS", raising=False)
+    assert set(Settings.from_env().claude_disallowed_tools) == _A_GROUP
+
+    monkeypatch.setenv("RELAY_CLAUDE_DISALLOWED_TOOLS", "NotebookEdit, DesignSync")
+    assert Settings.from_env().claude_disallowed_tools == ["NotebookEdit", "DesignSync"]
+
+    # 空格分隔也认
+    monkeypatch.setenv("RELAY_CLAUDE_DISALLOWED_TOOLS", "NotebookEdit DesignSync")
+    assert Settings.from_env().claude_disallowed_tools == ["NotebookEdit", "DesignSync"]
+
+    # 显式关闭：排查「某工具被误禁」时不用改代码
+    for off in ("none", "NONE", "-", "off"):
+        monkeypatch.setenv("RELAY_CLAUDE_DISALLOWED_TOOLS", off)
+        assert Settings.from_env().claude_disallowed_tools == []
 
 
 # ---- build_env ----

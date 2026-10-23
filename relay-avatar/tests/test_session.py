@@ -261,3 +261,73 @@ def test_note_chain_tolerates_bad_transcript_bytes(cfg, storage):
     sm.note_chain(s, 100, "z", transcript_bytes=-5)
     assert s["chain_depth"] == 3
     assert int(s.get("chain_bytes") or 0) == 0
+
+
+# ── 聚合窗双档（2026-10-23）──
+#
+# 实测 98 会话 / 1271 对真人相邻消息，23.2% 间隔 ≤20s，抽样全是「文字＋图片」
+# 「分条补充」这类真实组合请求，所以不能一刀切缩短窗口——那会把请求劈成两个任务、
+# agent 没看到图就作答。改为按缓冲内容分档：含附件标记走长窗（20s），纯文本走短窗
+# （12s，劈开也只是退化成 followup 追问，会 resume 并注入摘要，可恢复）。
+
+
+def test_debounce_pure_text_uses_short_window(cfg, storage):
+    sm = SessionManager(cfg, storage)
+    s = sm.get_or_create("o:a", "张三", "a", make_ev(), False)
+    sm.start_buffering(s, "小财通请回答：为什么差旅报销提交时会提示异常")
+    assert s["state"] == "BUFFERING"
+    assert s["deadline"] - time.time() <= 12 + 1
+    assert s["deadline"] - time.time() > 8            # 确实是短窗，不是长窗
+
+
+def test_debounce_attachment_uses_long_window(cfg, storage):
+    sm = SessionManager(cfg, storage)
+    s = sm.get_or_create("o:a", "张三", "a", make_ev(), False)
+    sm.start_buffering(s, "[图片消息](mediaId=@lQLPKdNjhYoVdinNAvPNAxCw)")
+    assert s["deadline"] - time.time() > 18           # 含附件 → 长窗 20s
+
+
+def test_debounce_attachment_markers_all_recognized(cfg, storage):
+    """钉钉各类附件消息的占位文本都要认出来，漏一个就会把带图请求劈开。"""
+    sm = SessionManager(cfg, storage)
+    for txt in ("[图片消息](mediaId=@abc)", "[文件] 报表.xlsx fileId: XY12",
+                "[视频] mediaId=@v", "[语音] mediaId=@a", "见 mediaId=@x",
+                "fileId: ABC123", "fileId：ABC123"):
+        s = sm.get_or_create("o:a", "张三", "a", make_ev(), False)
+        sm.start_buffering(s, txt)
+        assert s["deadline"] - time.time() > 18, f"未识别为附件：{txt!r}"
+
+
+def test_extend_buffer_appends_and_slides_window(cfg, storage):
+    """BUFFERING 期间再来一条：追加进缓冲，窗口从这条起重新计（滑动 debounce）。"""
+    sm = SessionManager(cfg, storage)
+    s = sm.get_or_create("o:a", "张三", "a", make_ev(), False)
+    sm.start_buffering(s, "这会有空吗？")
+    time.sleep(0.05)
+    sm.extend_buffer(s, "一起看下这个问题？")
+    assert s["buffer"] == ["这会有空吗？", "一起看下这个问题？"]
+    assert s["deadline"] - time.time() > 11           # 窗口被推后了
+
+
+def test_extend_buffer_upgrades_to_long_window_on_attachment(cfg, storage):
+    """线上真实形态：先发文字（短窗），5s 后补一张图 → 窗口必须自动升成长窗，
+    否则图还没到就 flush，agent 只看到文字没看到图就作答。"""
+    sm = SessionManager(cfg, storage)
+    s = sm.get_or_create("o:a", "姜腾飞", "a", make_ev(), False)
+    sm.start_buffering(s, "你好，你是谁？你能做什么工作？")
+    short = s["deadline"]
+    assert short - time.time() <= 13
+    sm.extend_buffer(s, "[图片消息](mediaId=@lQLP)")
+    assert s["deadline"] > short                      # 窗口被延长
+    assert s["deadline"] - time.time() > 18
+    assert len(s["buffer"]) == 2
+
+
+def test_debounce_zero_disables_wait(cfg, storage):
+    """设 0 即关闭该档等待，给运维留口子。"""
+    cfg._p.setdefault("ingress", {}).update(debounce_text_sec=0, debounce_sec=0)
+    sm = SessionManager(cfg, storage)
+    s = sm.get_or_create("o:a", "张三", "a", make_ev(), False)
+    sm.start_buffering(s, "随便问一句")
+    assert s["deadline"] <= time.time()
+    assert sm.due() and sm.due()[0][2] == "buffer"    # 立刻可 flush

@@ -7,7 +7,13 @@
 """
 from __future__ import annotations
 
+import re
 import time
+
+# 附件标记：钉钉把图片/文件/视频/语音消息渲染成这些占位文本（实测入站事件里
+# 形如「[图片消息](mediaId=@lQLP…)」「[文件] xxx fileId: yyy」）。
+ATTACHMENT_MARK_RE = re.compile(
+    r"\[图片消息\]|\[文件\]|\[视频\]|\[语音\]|mediaId=|fileId[:：]")
 
 
 class SessionManager:
@@ -110,11 +116,41 @@ class SessionManager:
                     and now - s.get("last_activity", 0) > ttl]:
             del self.sessions[key]
 
+    # ── 聚合窗（debounce）──
+    #
+    # 为什么分两档而不是一刀切缩短：实测 98 个会话 / 1271 对真人相邻消息，
+    # **23.2% 的间隔 ≤20s**，且抽样全是真实的多条组合请求——「你好，你是谁？」
+    # →5s 后补一张图、「跑着跑着京小智崩了」→5s 后补截图、「这会有空吗？」→8s
+    # 后补「一起看下这个问题？」。窗口砍到 0 会把这些劈成两个任务，agent 只看到
+    # 文字没看到图就作答，那是**质量事故**，不是快。
+    #
+    # 但含附件与纯文本的间隔分布不同（60s 内样本）：
+    #   涉及图片/文件 n=100  中位 9s   p75 28s  → 20s 窗只兜住 65%
+    #   纯文本         n=420  中位 17s  p75 24s  → 20s 窗兜住 54.8%，12s 兜住 ~47%
+    # 所以：**缓冲里一旦出现附件标记就用长窗**（这类劈开代价最大），纯文本用短窗
+    # （劈开也只是退化成 followup 追问，会 resume 上一条会话并注入摘要，可恢复）。
+    # 两档都可在 policy.toml 调，设 0 即关闭该档等待。
+
+    def _debounce_sec(self, s: dict) -> int:
+        """本轮聚合窗长度：缓冲含附件标记 → 长窗；纯文本 → 短窗。"""
+        buf = "\n".join(str(x) for x in (s.get("buffer") or []))
+        if ATTACHMENT_MARK_RE.search(buf):
+            return int(self.cfg.get("ingress", "debounce_sec", 20))
+        return int(self.cfg.get("ingress", "debounce_text_sec", 12))
+
     def start_buffering(self, s: dict, text: str):
         s["buffer"] = [text]
         s["state"] = "BUFFERING"
-        s["deadline"] = time.time() + int(
-            self.cfg.get("ingress", "debounce_sec", 20))
+        s["deadline"] = time.time() + self._debounce_sec(s)
+
+    def extend_buffer(self, s: dict, text: str):
+        """BUFFERING 期间又来一条：追加，并把窗口从这条起重新计（滑动 debounce）。
+
+        必须走这里而不是在调用方直接改 deadline——窗口长度取决于**当前缓冲内容**
+        （有没有附件），两处各算一遍迟早算岔。
+        """
+        s.setdefault("buffer", []).append(text)
+        s["deadline"] = time.time() + self._debounce_sec(s)
 
     def start_followup_window(self, s: dict):
         s["state"] = "FOLLOWUP"

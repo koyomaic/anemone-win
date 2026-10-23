@@ -359,6 +359,14 @@ class Executor:
             cmd += ["--model", self.cfg.model]
         if resume_session:
             cmd += ["--resume", resume_session]
+        # 裁掉用不到的内置工具：工具定义占固定上下文的大头（实测 26 工具时
+        # 21539 token 里 19788 是 claude-code 自带的系统提示+工具定义），每轮
+        # LLM 往返都要重新 prefill 一遍。禁用清单与取舍依据见 config.py 的
+        # DEFAULT_CLAUDE_DISALLOWED_TOOLS。
+        disallowed = [str(t).strip() for t in (self.cfg.claude_disallowed_tools or []) if str(t).strip()]
+        if disallowed:
+            # 逗号连成单个 argv，与 avatar exec_local 的既有写法一致
+            cmd += ["--disallowedTools", ",".join(disallowed)]
         mcp_cfg = os.path.join(workdir, ".xdg", "claude-mcp.json")
         if os.path.isfile(mcp_cfg):
             cmd += ["--mcp-config", mcp_cfg, "--strict-mcp-config"]

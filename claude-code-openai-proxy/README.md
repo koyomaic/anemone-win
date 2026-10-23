@@ -67,6 +67,7 @@ chmod 600 config.json      # 里面有密钥，务必收紧权限
 | `UPSTREAM_API_KEY` | `apiKey` | —（必填） |
 | `UPSTREAM_MODEL` | `model` | —（必填） |
 | `PROXY_DEBUG` | 打印每次请求的 role 序列并 dump **脱敏后** body 到 `/tmp/claude_proxy_last_<port>.json` | 关闭 |
+| `PROXY_PREFIX_LOG` | 每次流式请求打一行 `prefix {...}`：前缀 tag（`sha256(system+tools)` 前 12 位）、`sysChars`/`tools`/`tailChars`、`inTok`/`outTok`、`ms`。用于量后端**自动前缀缓存**的真实命中率——同一 tag 下 `ms` 呈双峰即网关轮询到多副本、只有部分副本缓存了该前缀；tag 频繁变化则有可变内容混进了前缀。默认关闭（关闭时连 tag 都不计算，零开销） | 关闭 |
 
 `config.json` 还支持按请求模型名分流：
 

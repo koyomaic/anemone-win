@@ -20,7 +20,13 @@ sign = ""
 # 群@ 事件（user_im_message_receive_at）仅在 [group] enabled=true 时订阅
 event_keys = ["user_im_message_receive_o2o_all"]
 idle_watchdog_sec = 270        # 事件流空闲多久强制重连（钉钉长连接 ~300s 静默断）
-debounce_sec = 20              # 聚合窗口
+debounce_sec = 20              # 聚合窗口（缓冲里含图片/文件等附件标记时用这一档）
+# 纯文本消息的聚合窗。为什么不直接把 debounce_sec 调小：实测 98 会话 / 1271 对真人
+# 相邻消息里 23.2% 间隔 ≤20s，抽样全是「文字＋图片」「分条补充」这类真实组合请求，
+# 一刀切缩短会劈成两个任务、agent 没看到图就作答（质量事故）。纯文本劈开只是退化成
+# followup 追问（resume 上一条会话并注入摘要，可恢复），代价小得多，故只收紧纯文本。
+# 60s 内间隔分布：涉及附件 n=100 中位 9s / p75 28s；纯文本 n=420 中位 17s / p75 24s。
+debounce_text_sec = 12
 followup_debounce_sec = 30     # 任务结束后追问聚合窗口
 session_ttl_sec = 1800         # 会话上下文（resume_from）有效期
 # ── resume 上下文预算（2026-09-28 P0-1）──
