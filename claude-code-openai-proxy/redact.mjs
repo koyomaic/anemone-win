@@ -71,8 +71,13 @@ export function normalizeWithMap(input) {
     const norm = ch.normalize('NFKC').toLowerCase();
     for (const nc of norm) {
       chars.push(nc);
-      starts.push(i);
-      ends.push(i + ch.length);
+      // starts/ends 必须按 norm.text 的 code unit 索引：AC search 以 code unit 定位，
+      // 而代理对（emoji 等 astral 字符）1 码点占 2 code unit，只 push 一次会让
+      // 其后所有匹配的 norm→orig 映射错位，替换打偏 → 别名残留 → fail-closed。
+      for (let u = 0; u < nc.length; u += 1) {
+        starts.push(i);
+        ends.push(i + ch.length);
+      }
     }
     i += ch.length;
   }
@@ -105,11 +110,13 @@ export class AcAutomaton {
     const norm = normalizeSimple(word);
     if (!norm) return;
     let node = this.root;
-    for (const ch of norm) {
+    // 按 code unit 建 trie，与 search() 的 code unit 扫描一致（含代理对的别名才能命中）
+    for (let i = 0; i < norm.length; i += 1) {
+      const ch = norm[i];
       if (!node.next.has(ch)) node.next.set(ch, new AcNode());
       node = node.next.get(ch);
     }
-    node.out.push({ ...meta, length: [...norm].length, norm });
+    node.out.push({ ...meta, length: norm.length, norm });
     this.size += 1;
   }
 

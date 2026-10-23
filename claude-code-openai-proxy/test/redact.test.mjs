@@ -155,3 +155,36 @@ test('dictionary can disable default patterns', () => {
   assert.ok(out.includes('[[CO-X-01]]'));
   assert.ok(out.includes('13800138000'));
 });
+
+test('surrogate-pair emoji do not misalign entity replacement (regression: relay task#1326)', () => {
+  // 🔒/🤖 为代理对（1 码点 2 code unit），… 经 NFKC 1→3 展开。
+  // 旧实现 starts/ends 按码点建、AC search 按 code unit 定位：emoji 出现在别名
+  // 之前时 norm→orig 映射错位，替换打偏、别名残留 → assertNoEntities fail-closed，
+  // 整个请求 503（claude 重试耗尽后任务失败）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redact-'));
+  const p = path.join(dir, 'entities.json');
+  fs.writeFileSync(p, JSON.stringify({
+    placeholderSalt: 'E1',
+    entities: [{ id: '01', type: 'CO', canonical: '示例集团控股有限公司', aliases: ['示例集团', '示例'] }],
+  }));
+  const r = makeRedactor(p);
+  const state = createState();
+  const text = '🔒锁…前文提到示例集团控股有限公司，中间还有🤖表情与省略号…之后示例集团再次出现';
+  const out = r.redactText(text, state);
+  assert.ok(!out.includes('示例'));
+  assert.equal(out, '🔒锁…前文提到[[CO-E1-01]]，中间还有🤖表情与省略号…之后[[CO-E1-01]]再次出现');
+  assert.equal(state.hits.CO, 2);
+});
+
+test('astral-plane aliases match (code-unit trie)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redact-'));
+  const p = path.join(dir, 'entities.json');
+  fs.writeFileSync(p, JSON.stringify({
+    placeholderSalt: 'E2',
+    entities: [{ id: '01', type: 'CO', canonical: '🔒保密单位' }],
+  }));
+  const r = makeRedactor(p);
+  const state = createState();
+  const out = r.redactText('联系🔒保密单位处理', state);
+  assert.equal(out, '联系[[CO-E2-01]]处理');
+});
