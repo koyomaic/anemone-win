@@ -1,7 +1,7 @@
 ---
 name: ludashi-usage-daily-report
-version: 1.0.0
-description: 生成《鲁大师用户日度使用分析报告》。当用户说"出昨天的使用分析报告""盘点今天谁用了鲁大师""日度使用分析""用户活跃日报""重点用户活跃情况""谁在用分身""使用量统计""生成 usage 日报"时使用。负责按固定模板盘点全渠道会话/人工提问/重点用户活跃/交付成功率/静默追踪，数据取自 relay 现役 PG 与本机 audit·events·rounds 日志。不做周报（走周报流程）、不做单任务查询（走 relay 台账）。
+version: 1.1.0
+description: 生成《鲁大师用户日度使用分析报告》并支持确定性群播快路径。当用户说"出昨天的使用分析报告""盘点今天谁用了鲁大师""日度使用分析""用户活跃日报""重点用户活跃情况""谁在用分身""使用量统计""生成 usage 日报""每日群播报""在此群播报""绑定群播""群播日报""日报发本群"时使用。负责按固定模板盘点全渠道会话/人工提问/重点用户活跃/交付成功率/静默追踪，数据取自 relay 现役 PG 与本机 audit·events·rounds 日志。不做周报（走周报流程）、不做单任务查询（走 relay 台账）。
 ---
 
 # 鲁大师用户日度使用分析报告
@@ -66,6 +66,32 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
    **不再输出逐会话卡片、渠道长表、cron 明细表和附录长表**；如需排障，查 facts.json
    或 relay 台账，不要把完整件重新拉长。
 
+## 群播快路径（2026-10-23 规则）
+
+当用户说「每日在此群播报」「日报发本群」「绑定群播」「群播日报」时，**不要开放式探索全链路**。
+群播只是把已生成的完整件投递到当前会话，并创建/更新 relay 计划；完整件仍由日报流程负责。
+
+确定性入口：
+
+```bash
+S=/mnt/vol-eltaah12/workspace/shared/skills/ludashi-usage-daily-report/scripts
+
+# 日常群播：复用昨日完整件，输出摘要＋send_file 标记
+python3 $S/group_broadcast.py --out-dir "$PWD/output"
+
+# 一次性绑定当前群：输出 ```plan``` 标记，默认每日 09:00，错开 08:45 日报计划
+python3 $S/group_broadcast.py --emit-plan --plan-time 09:00:00
+```
+
+硬规则：
+
+1. `group_broadcast.py` 只读预采集 `facts-<昨日>.json` 与 `shared/report/自检报告/<YYYY-MM>/` 中已存在的完整件；**不跑 `usage_collect.py`、不重新渲染、不补写建议、不直连 dws**。
+2. facts 缺失、`source != pg_authoritative`、完整件不存在或仍有 `{{待填` 时一律 fail-closed，按退出码如实报告，不得自行补救或编造。
+3. 日常群播计划描述必须直接调用 `group_broadcast.py`，并写明「禁止探索代码/计划/定时器」。
+4. 群播计划默认 `09:00:00`，必须错开既有日报渲染/推送计划（本机计划 #12 为 `08:45:00`），避免并发抢跑时完整件尚未生成。
+5. 一次性绑定时，若已有同名/同用途计划，应更新既有计划，不要重复创建；无法更新时先向用户说明既有计划名与时点。
+6. `send_file` 路径必须在本任务 `output/` 或 `work/` 内；脚本用 `--out-dir "$PWD/output"` 自动复制完整件副本。
+
 ## 每日自动化：两段式（宿主机采集 → 沙箱渲染）
 
 **为什么必须拆两段**：本地任务沙箱的 `local_sandbox_hide` 整体隐藏 `relay.env`
@@ -80,7 +106,7 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 |---|---|---|---|---|
 | ① 采集 | 宿主机 systemd `ludashi-usage-collect.timer`，每日 **07:45**（drop-in 覆盖，含 60s 抖动）；**机队默认停用**，仅 `boot.env` 设 `USAGE_REPORT_TIMER=1` 的机器启用 | `boot/usage-collect.sh` → `usage_collect.py` | 需要 `RELAY_DB`（宿主机可读） | `shared/tmp/usage/facts-<日>.json`（含 `display_name`） |
 | ② 渲染落盘 | 本机 relay 计划（新能源机为 **#6「ludashi-usage-daily-report-group」**，每日 **08:00**；计划号/时刻按机自定） | `render_report.py` ＋ 补叙述 ＋ 落盘 ＋ 台账（**不做任何 dws 发送**） | 不需要（纯标准库，系统 python3 即可） | `shared/report/自检报告/<YYYY-MM>/…md` |
-| ③ 群推送 | 宿主机 systemd `usage-report-send.timer`，每日 **08:30:00** 准点（**本机私有单元，不在仓库 `boot/`**，其他机无） | `usage-report-send.sh`：轮询落盘报告 → 生成摘要 → 发钉钉群 | 宿主机 dws 凭据（不经沙箱门禁） | 群消息（摘要＋报告文件） |
+| ③ 群推送 | 二选一：宿主机 systemd `usage-report-send.timer`（**本机私有单元，不在仓库 `boot/`**，其他机无），或 relay 群播计划（本机 **#27「鲁大师用户日度使用分析-每日群播」**，每日 **09:00**，delivery 绑定目标群） | `usage-report-send.sh`，或 `group_broadcast.py`：复用已落盘完整件 → 生成摘要 → 输出 `send_file` 标记，由分身代投 | 宿主机 dws 凭据（不经沙箱门禁）；relay 计划路径不需要任务自持 dws 凭据 | 群消息（摘要＋报告文件） |
 
 > ②③ 拆分原因：沙箱内**所有** dws 发送命令被门禁拦成 `pending_approval`（群发必拦），
 > 故渲染留在沙箱、发送移到宿主机。计划 action 必须明令禁止 agent 自行发送。
@@ -139,6 +165,7 @@ description: 生成《鲁大师用户日度使用分析报告》。当用户说"
 | `boot/ludashi-usage-collect.timer` | `/etc/systemd/system/…timer` | 19d |
 | `boot.env` 的 `USAGE_REPORT_TIMER` | 每机一份、不入库、存在即不覆盖 | 12（生成）／19d（消费） |
 | 本技能全部文件 | `shared/skills/ludashi-usage-daily-report/` | 21b |
+| `scripts/group_broadcast.py` | 群播确定性快路径，随本技能同步 | 21b |
 | `avatar/usage-report-recipients.json` | 本机收件人，**不在技能目录内**（见铁律 8） | 不同步 |
 
 `ludashi-usage-collect.service` 刻意**不加** `InaccessiblePaths`——它的全部意义就是能读

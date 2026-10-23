@@ -181,7 +181,8 @@ def test_local_timeout_uses_heavy_budget_for_report_tasks(cfg, storage, audit,
                                                           policy, shared):
     local_ready(cfg, shared)
     ex = make_ex(cfg, storage, audit, policy)
-    assert ex.local_timeout("整理一下鲁大师智能体项目进度及使用情况报告") == 300
+    assert ex.local_timeout("整理一下鲁大师智能体项目进度及使用情况报告") == 180
+    assert ex.local_timeout("鲁大师用户日度使用分析每日在此群播报") == 180
     assert ex.local_timeout("今天有多少人跟鲁大师对话了") == 600
 
 

@@ -118,13 +118,17 @@ DEFAULTS: dict[str, Any] = {
                 "session_ttl_sec": 3600, "reply_timeout_sec": 600,
                 # 重报告/装配类任务在 local 通路的短预算：超过即带阶段摘要升级 relay，
                 # 避免 local 白烧 10 分钟后 relay 再从零探索（2026-10-21 #1173→#1175）。
-                "heavy_local_timeout_sec": 300,
-                "heavy_local_patterns": [
-                    r"(整理|生成|制作|输出|装配|优化).{0,16}(报告|报表|方案|卡片|汇报|台账)",
-                    r"项目进度",
-                    r"使用情况报告",
-                    r"(?i)(html|模板|骨架|render_report|质检|机检)",
-                ],
+                 "heavy_local_timeout_sec": 180,
+                 "heavy_local_patterns": [
+                     r"(整理|生成|制作|输出|装配|优化).{0,16}(报告|报表|方案|卡片|汇报|台账)",
+                     r"项目进度",
+                     r"使用情况报告",
+                     r"(?i)(html|模板|骨架|render_report|质检|机检)",
+                     r"(每日|每天|每周|每月|定时|周期|到点).{0,24}(播报|群播|推送|发送|发|提醒|报告|报表|计划|任务)",
+                     r"(播报|群播|推送|发送|发|提醒).{0,24}(每日|每天|每周|每月|定时|周期|到点)",
+                     r"(创建|新建|建立|设置|配置|加入|添加|修改|调整|删除|停用|启用|绑定).{0,20}(计划|定时|任务|提醒|播报|群播|推送)",
+                     r"(?i)(cron|timer|schedule|broadcast)",
+                 ],
                 "local_partial_summary_chars": 1500},
     "security": {"l2_lockdown": True,
                  "l2_sandbox_dir": f"{DEFAULT_WORKSPACE}/shared/work",

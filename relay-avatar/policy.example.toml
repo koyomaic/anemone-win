@@ -166,14 +166,18 @@ l3_permission_prompts = "none"
 l3_disallowed_tools = "Bash Write Edit MultiEdit WebFetch WebSearch"
 session_ttl_sec = 3600
 reply_timeout_sec = 600        # local 执行看门狗（超时 kill）
-# 重报告/装配类任务的 local 短预算。命中 heavy_local_patterns 后，超过该时长即
-# 带阶段摘要升级 relay，避免 local 白烧 10 分钟、relay 再从零探索。
-heavy_local_timeout_sec = 300
+# 重报告/装配/定时播报类任务的 local 短预算。命中 heavy_local_patterns 后，超过该
+# 时长即带阶段摘要升级 relay，避免 local 白烧 10 分钟、relay 再从零探索。
+heavy_local_timeout_sec = 180
 heavy_local_patterns = [
-  "(整理|生成|制作|输出|装配|优化).{0,16}(报告|报表|方案|卡片|汇报|台账)",
-  "项目进度",
-  "使用情况报告",
-  "(?i)(html|模板|骨架|render_report|质检|机检)",
+  '(整理|生成|制作|输出|装配|优化).{0,16}(报告|报表|方案|卡片|汇报|台账)',
+  '项目进度',
+  '使用情况报告',
+  '(?i)(html|模板|骨架|render_report|质检|机检)',
+  '(每日|每天|每周|每月|定时|周期|到点).{0,24}(播报|群播|推送|发送|发|提醒|报告|报表|计划|任务)',
+  '(播报|群播|推送|发送|发|提醒).{0,24}(每日|每天|每周|每月|定时|周期|到点)',
+  '(创建|新建|建立|设置|配置|加入|添加|修改|调整|删除|停用|启用|绑定).{0,20}(计划|定时|任务|提醒|播报|群播|推送)',
+  '(?i)(cron|timer|schedule|broadcast)',
 ]
 local_partial_summary_chars = 1500
 
