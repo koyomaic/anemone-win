@@ -1,7 +1,7 @@
 ---
 name: team-agent-relay
-version: 1.4.3
-description: 团队远程执行中转服务,经 dws 认证大脑在团队服务器上跑任务(共享工具/知识库/钉钉身份)。用于"在服务器上跑任务、写经营月报、查知识库、用钉钉收发、上传/下载文件(≤10MB)"。能力:提交任务、实时直播进展、续会话、变更核查、文件上传/下载、取消;多公司装多包并存。
+version: 1.4.4
+description: 团队远程执行中转服务,经 dws 认证大脑在团队服务器上跑任务(共享工具/知识库/钉钉身份)。用于"在服务器上跑任务、写经营月报、查知识库、用钉钉收发、上传/下载文件(≤10MB)、建/管定时计划(每天8点跑X)"。能力:提交任务、实时直播进展、续会话、变更核查、文件上传/下载、取消、定时计划增删改查;多公司装多包并存。
 ---
 
 # 团队中转服务
@@ -69,6 +69,12 @@ token 只接受用户本人提供，绝不猜测/复用示例值；token 不落�
 | 取消 | `S cancel 42` |
 | review 核查后确认 | `S confirm 42` |
 | **审批高危拦截**（任务停在 `pending_approval`，如钉钉群发被拦） | `S approve 42 --decision approve`（放行续跑）／ `S approve 42 --decision deny`（拒绝置 failed） |
+| **建定时计划**（每天/每周到点自动跑） | `S plan create --name 每日X --on-calendar "*-*-* 08:30:00" --description "到点要跑的任务描述" [-t 目录] [--read-only] [--urgent] [--disabled]` |
+| 看有哪些计划 / 只看某人的 | `S plan list` ／ `S plan list --owner 岳林` |
+| 查计划详情（含 action 全文） | `S plan get 8` ／ `S plan get --name 每日X` |
+| 停用 / 启用 | `S plan disable 8` ／ `S plan enable --name 每日X` |
+| 改计划（名字/日历/描述/目录） | `S plan update 8 --on-calendar "*-*-* 09:00:00" --description "新描述"` |
+| 删计划 | `S plan delete 8` ／ `S plan delete --name 每日X` |
 | 版本对照（客户端/服务端/是否需升级） | `S version` |
 | 列出全部公司配置 | `S profiles`（token 打码） |
 
@@ -86,6 +92,15 @@ token 只接受用户本人提供，绝不猜测/复用示例值；token 不落�
 - **单文件 ≤10MB**（客户端先拦，服务端超限返回 `"http": 413`）；超大文件告知用户拆小或走人工通道
 - 典型用法：任务需要输入材料 → 先 `upload` 再 `run "…读取 data/9月.xlsx…"`；任务产出文件 → 完成后 `download` 给用户
 - 不要用任务描述里塞 base64 的方式传文件（旧法，已废弃）
+
+**定时计划（plan）**：
+- `on_calendar` 用 systemd OnCalendar 表达式：每天 08:30 写 `*-*-* 08:30:00`，每周一 09:00 写 `Mon *-*-* 09:00:00`，每月 1 号写 `*-*-01 08:00:00`；表达式无效返回 `"http": 422`
+- `--name` 规则：1-64 个字母/数字/中文/`._-`；重名返回 `"http": 409`（改名或先删旧的）
+- `get/enable/disable/update/delete` 可用计划 id（位置参数）**或** `--name` 定位；名字零命中返回 `PLAN_NOT_FOUND`、多命中返回 `NAME_NOT_UNIQUE` + `candidates`（把候选给用户挑，别自己选第一个）
+- 权限：任何已认证主体都能建（`owner_name` 自动记调用者），但**非管理员只能改/删自己的计划**，动别人的返回 `"http": 403 only owner or admin`
+- `update` 只提交显式给出的字段；`--read-only` 只能置真、不能取消（要取消就重建）
+- **关键边界（务必先告知用户）**：计划到点触发的任务仍在**沙箱**内跑，钉钉群发/多接收人发送照样停 `pending_approval`，无人 approve 会 60 分钟超时终止。所以「到点自动发群」的计划要么把投递交给分身/宿主机侧，要么计划只做「取数 → 生成 → 落盘共享区」，发送另由宿主机定时件完成
+- 与钉钉分身的关系：走分身对话时由分身解析 ```plan``` 标记带凭据代办（另有 L2+ 门禁）；走桥时用 `S plan` 直接建。两条路写的是同一张计划表，**不要两边重复建同名计划**
 
 ## 工作流
 

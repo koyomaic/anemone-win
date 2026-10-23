@@ -54,7 +54,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 # 打包时由 pack.sh 写入：本技能所代表的 dws 认证大脑名（同时作为缺省 profile 名）。
 # 源模板留空 → 缺省 profile 回落 "default"。
@@ -576,6 +576,132 @@ def cmd_approve(args, cfg):
     out(payload)
 
 
+def _plan_locate(cfg, args):
+    """位置参数 id 或 --name → (plan_id, plan|None)。零命中/多命中都算失败。"""
+    if getattr(args, "id", None):
+        return int(args.id), None
+    nm = (getattr(args, "name", "") or "").strip()
+    if not nm:
+        out({"error": True, "detail": "需要计划 id（位置参数）或 --name"})
+        sys.exit(2)
+    status, payload = req("GET", cfg, "/plans")
+    if status == 401:
+        fail(3, status, payload)
+    plans = payload.get("plans") or []
+    hits = ([p for p in plans if p.get("name") == nm]
+            or [p for p in plans if nm in (p.get("name") or "")])
+    if len(hits) != 1:
+        out({"error": True,
+             "detail": "PLAN_NOT_FOUND" if not hits else "NAME_NOT_UNIQUE",
+             "candidates": [{"id": p.get("id"), "name": p.get("name"),
+                             "owner_name": p.get("owner_name")} for p in hits]})
+        sys.exit(1)
+    return int(hits[0]["id"]), hits[0]
+
+
+def cmd_plan(args, cfg):
+    """定时计划管理。服务端 /plans 只要求已认证主体（设备签名即可，不需 admin），
+    owner_name 自动记调用者；非 admin 只能改/删自己的计划。
+
+    注意：计划到点触发的任务仍在沙箱内跑，钉钉群发等高危命令照样走审批门禁——
+    需要"到点自动发消息"的计划，投递要交给分身或宿主机侧执行。
+    """
+    op = args.op
+    if op == "list":
+        status, payload = req("GET", cfg, "/plans")
+        if status == 401:
+            fail(3, status, payload)
+        plans = payload.get("plans") or []
+        if args.owner:
+            plans = [p for p in plans if p.get("owner_name") == args.owner]
+        out({"plans": [{k: p.get(k) for k in
+                        ("id", "name", "owner_name", "on_calendar", "enabled",
+                         "next_run", "last_run", "last_task_id")}
+                       for p in plans]})
+        return
+
+    if op == "create":
+        missing = [f for f in ("name", "on_calendar", "description")
+                   if not (getattr(args, f, "") or "").strip()]
+        if missing:
+            out({"error": True, "detail": "create 缺少必填项", "missing": missing,
+                 "hint": 'plan create --name 每日X --on-calendar "*-*-* 08:30:00" '
+                         '--description "到点要跑的任务描述"'})
+            sys.exit(2)
+        action = {"type": "task", "description": args.description,
+                  "priority": args.priority, "read_only": args.read_only,
+                  "targets": [t.strip() for t in args.targets.split(",")
+                              if t.strip()]}
+        if args.project:
+            action["project"] = args.project
+        body = {"name": args.name.strip(),
+                "on_calendar": args.on_calendar.strip(),
+                "action": action, "enabled": not args.disabled}
+        status, payload = req("POST", cfg, "/plans", body)
+        if status == 201:
+            out(payload)
+            return
+        fail(3 if status == 401 else 1, status, payload)
+
+    pid, _ = _plan_locate(cfg, args)
+    if op == "get":
+        status, payload = req("GET", cfg, f"/plans/{pid}")
+        if status == 401:
+            fail(3, status, payload)
+        if status != 200:
+            fail(1, status, payload)
+        out(payload)
+        return
+    if op == "delete":
+        status, payload = req("DELETE", cfg, f"/plans/{pid}")
+        if status == 401:
+            fail(3, status, payload)
+        if status != 200:
+            fail(1, status, payload)
+        out(payload)
+        return
+
+    patch = {}
+    if op in ("enable", "disable"):
+        patch["enabled"] = (op == "enable")
+    else:  # update：只提交显式给出的字段；action 类字段先取现值再合并
+        if args.name:
+            patch["name"] = args.name.strip()
+        if args.on_calendar:
+            patch["on_calendar"] = args.on_calendar.strip()
+        if args.description or args.targets or args.project or args.read_only:
+            st, cur = req("GET", cfg, f"/plans/{pid}")
+            if st == 401:
+                fail(3, st, cur)
+            if st != 200:
+                fail(1, st, cur)
+            act = dict(cur.get("action") or {})
+            act["type"] = "task"
+            if not act.get("description"):
+                act["description"] = args.description or ""
+            if args.description:
+                act["description"] = args.description
+            if args.targets:
+                act["targets"] = [t.strip() for t in args.targets.split(",")
+                                  if t.strip()]
+            if args.project:
+                act["project"] = args.project
+            if args.read_only:
+                act["read_only"] = True
+            patch["action"] = act
+        if not patch:
+            out({"error": True, "detail": "update 未提供任何要改的字段",
+                 "hint": "可用 --name/--on-calendar/--description/--targets/"
+                         "--project/--read-only"})
+            sys.exit(2)
+    status, payload = req("PATCH", cfg, f"/plans/{pid}", patch)
+    if status == 401:
+        fail(3, status, payload)
+    if status != 200:
+        fail(1, status, payload)
+    out(payload)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="relay", description="团队中转服务客户端")
     common = argparse.ArgumentParser(add_help=False)
@@ -665,6 +791,27 @@ def main() -> None:
     p.add_argument("--decision", choices=["approve", "deny"], required=True,
                    help="approve=放行该命令续跑; deny=置 failed")
     p.set_defaults(fn=cmd_approve)
+
+    p = sub.add_parser("plan", parents=[common],
+                       help="定时计划：list/create/get/enable/disable/update/delete")
+    p.add_argument("op", choices=["list", "create", "get", "enable",
+                                  "disable", "update", "delete"])
+    p.add_argument("id", nargs="?", type=int, default=None,
+                   help="计划 id（get/enable/disable/update/delete；也可用 --name 定位）")
+    p.add_argument("--name", default="",
+                   help="create：计划名（1-64 个字母/数字/中文/._-）；其他 op：按名定位")
+    p.add_argument("--on-calendar", default="",
+                   help='systemd OnCalendar 表达式，如 "*-*-* 08:30:00"')
+    p.add_argument("--description", default="",
+                   help="create：到点要跑的任务描述（必填）；update：改描述")
+    p.add_argument("--priority", choices=["normal", "urgent"], default="normal")
+    p.add_argument("--targets", default="", help="逗号分隔的共享区目标目录")
+    p.add_argument("--project", default="")
+    p.add_argument("--read-only", action="store_true",
+                   help="只读任务（update 时只能置真，不能取消）")
+    p.add_argument("--disabled", action="store_true", help="create：建好即停用")
+    p.add_argument("--owner", default="", help="list：按 owner_name 过滤")
+    p.set_defaults(fn=cmd_plan)
 
     args = ap.parse_args()
     cfg = load_cfg(args.profile)
