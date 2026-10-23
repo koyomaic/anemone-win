@@ -48,6 +48,9 @@ export function loadConfig(env = process.env, baseUrl = import.meta.url) {
 // ---------- Anthropic request -> OpenAI request ----------
 export function toOpenAI(body, routeModel) {
   const out = { model: routeModel, stream: !!body.stream };
+  // 流式必须显式索要 usage 尾包，否则上游不回 prompt_tokens/completion_tokens，
+  // 下游（claude-code）拿到的 input_tokens 恒为 0，上下文预算闸门全瞎。
+  if (out.stream) out.stream_options = { include_usage: true };
   out.max_tokens = body.max_tokens ?? 1024;
   if (body.temperature != null) out.temperature = body.temperature;
   if (body.top_p != null) out.top_p = body.top_p;
@@ -468,10 +471,14 @@ export function createProxy(config, deps = {}) {
       if (textProc) logDlp(textProc.state);
       for (const proc of toolProcs.values()) logDlp(proc.state);
       closeBlock();
+      // input_tokens 必须在这里回传：message_start 发出时上游 usage 尾包还没到，
+      // 只能先填 0；真实值随最后一个 chunk 到达，故在 message_delta 补齐。
+      // 少了它 claude-code 记到的 input_tokens 恒为 0（实测 106 个回合全 0），
+      // relay 的 tokens 字段退化成纯输出，avatar 的 resume 上下文预算闸门失效。
       send('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: finish || 'end_turn', stop_sequence: null },
-        usage: { output_tokens: outputTokens },
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
       });
       send('message_stop', { type: 'message_stop' });
       res.end();

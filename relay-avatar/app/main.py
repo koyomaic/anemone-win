@@ -896,7 +896,8 @@ class Avatar:
         self.st.archive_round(tid, f"confirm-{outcome}", r)
         self._swap_ack(s, "done_text_emotion" if outcome == "done" else "")
         if isinstance(r, dict) and r.get("id"):
-            self.sess.note_chain(s, r.get("tokens"), self._chain_digest(r))
+            self.sess.note_chain(s, r.get("tokens"), self._chain_digest(r),
+                                 self._transcript_bytes(r))
         s["task_id"] = None
         s["last_task_id"] = tid
         s.pop("review_followup_notified", None)
@@ -2091,6 +2092,33 @@ class Avatar:
             if su not in (uid, sid):
                 self._dm(su, txt)
 
+    def _transcript_bytes(self, row: dict) -> int:
+        """上一任务会话转写的字节数＝resume 链会被整段重放的真实体量。
+
+        为什么不看 tokens：relay 的 tokens 来自 claude 事件流的 usage，而
+        claude-proxy 曾在流式收尾只回 output_tokens、把 input_tokens 丢掉，
+        tokens 于是退化成纯输出——2026-10-23 宋连杰一个 181s 录屏经
+        378→380→382→384→386 五任务共用一个 session，累积 15 个图片块 /
+        6.11MB base64、转写 12.66MB，chain_tokens 却只有 48387，60000 的
+        token 闸门纹丝不动，一句话追问（#382）也跑满 134s。字节数不依赖任何
+        遥测，量的一定是会上送的东西。
+
+        按 session_id 在 users/*/.claude/projects/*/ 下 glob，不自己拼 projects
+        子目录名：那是 claude-code 按它看到的 cwd 编码的，可能是符号链接解析后的
+        真实路径（本机 /mnt/vol-eltaah12 → /mnt/vol-71srnryd），拼错就静默失效。
+        best-effort：量不到返回 0（＝该项不设限），绝不因它影响主流程。
+        """
+        sid = str(row.get("session_id") or "").strip()
+        if not sid or "/" in sid or sid in (".", ".."):
+            return 0
+        try:
+            root = C.workspace_dir() / "users"
+            for p in root.glob(f"*/.claude/projects/*/{sid}.jsonl"):
+                return p.stat().st_size
+        except OSError:
+            pass
+        return 0
+
     def _chain_digest(self, row: dict) -> str:
         """上一任务 result → 接续摘要：剥标记后优先取 agent 收尾自总结。
 
@@ -3074,13 +3102,15 @@ class Avatar:
             self._send_result(s, row)
             self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
-            self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row))
+            self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row),
+                                 self._transcript_bytes(row))
         elif status == "conflict":
             self._send_result(s, row, prefix="✅ 办好了，但检测到文件冲突，"
                                              "请人工复核。")
             self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
-            self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row))
+            self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row),
+                                 self._transcript_bytes(row))
         elif status == "failed":
             err = (row.get("error") or "未知错误")[:300]
             self._card_final(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import os
 import re
@@ -200,6 +201,136 @@ def _state_dirname(user: str) -> str:
     return u
 
 
+# ── resume 前剥离历史图片 ──
+#
+# 为什么必须做：--resume 把整段历史重放给模型，图片块由 claude-proxy 转成
+# image_url(data:<mime>;base64,...) 原样上送。实测 2026-10-23 宋连杰一个 181s
+# 录屏，经 378→380→382→384→386 五任务共用一个 session，累积 15 个图片块、
+# 6.11MB base64，转写涨到 12.66MB；每回合都要整体重算 prefill，一句话追问
+# （#382）也跑满 134s。图片在它出现的那一轮已被模型看过，resume 时纯属死重。
+#
+# 只动两处，行数与 JSON 结构不变：
+#   message.content 里的 image 块 → text 占位（这才是上送载荷本体）
+#   toolUseResult.file.base64     → "<stripped>"（本地副本，占近一半体积）
+# 保留 media_type / dimensions / originalSize 并写进占位文本，模型仍知道
+# 「这里曾有张 2100x2349 的 jpeg」，需要时可以重新 Read 原文件。
+
+_IMG_PLACEHOLDER = "[图片已省略以节省上下文: {meta}]"
+
+
+def _find_transcript(state_dir: str, session_id: str) -> str | None:
+    """在 CLAUDE_CONFIG_DIR/projects/*/<sid>.jsonl 里定位会话转写。
+
+    不自己拼 projects 下的子目录名：那是 claude-code 按它自己看到的 cwd 编码的，
+    而 cwd 可能是符号链接解析后的真实路径（本机 /mnt/vol-eltaah12 →
+    /mnt/vol-71srnryd），拼错就静默失效。按 session_id glob 最稳。
+    """
+    root = os.path.join(state_dir, "projects")
+    if not session_id or not os.path.isdir(root):
+        return None
+    # 防路径穿越：session_id 会拼进 glob 模式，含分隔符/上跳的一律不认
+    # （与 _state_dirname 同一套口径）。
+    if "/" in session_id or "\\" in session_id or session_id in (".", ".."):
+        return None
+    hits = glob.glob(os.path.join(root, "*", f"{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def strip_transcript_images(path: str) -> tuple[int, int]:
+    """把转写里的 base64 图片载荷换成文本占位。返回 (剥离块数, 省下字节数)。
+
+    原地原子改写；首次剥离时留一份 .bak-imgstrip 滚动备份（同名覆盖，故每个
+    会话最多多占一份），便于回滚。无图片时零改动、不产生备份。
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return 0, 0
+    before = sum(len(x.encode("utf-8")) for x in lines)
+    blocks = 0
+    out: list[str] = []
+    for line in lines:
+        s = line.rstrip("\n")
+        if not s.strip() or ('"image"' not in s and '"base64"' not in s):
+            out.append(line)
+            continue
+        try:
+            o = json.loads(s)
+        except ValueError:
+            out.append(line)  # 坏行原样保留，绝不因剥离弄坏转写
+            continue
+        hit = 0
+        meta: dict = {}
+        tur = o.get("toolUseResult")
+        if isinstance(tur, dict) and tur.get("type") == "image":
+            f_ = tur.get("file")
+            if isinstance(f_, dict):
+                meta = {"media_type": f_.get("type"),
+                        "dimensions": f_.get("dimensions") or {},
+                        "originalSize": f_.get("originalSize")}
+                b64 = f_.get("base64")
+                if isinstance(b64, str) and len(b64) > 200:
+                    f_["base64"] = "<stripped>"
+                    hit += 1
+
+        def _ph(m: dict) -> dict:
+            bits = [str(m.get("media_type") or "image")]
+            d = m.get("dimensions") or {}
+            if d.get("originalWidth"):
+                bits.append(f"{d['originalWidth']}x{d['originalHeight']}")
+            if m.get("originalSize"):
+                bits.append(f"{m['originalSize'] / 1000:.0f}KB")
+            return {"type": "text",
+                    "text": _IMG_PLACEHOLDER.format(meta=" ".join(bits))}
+
+        m = o.get("message")
+        if isinstance(m, dict) and isinstance(m.get("content"), list):
+            for i, b in enumerate(m["content"]):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "image":
+                    src = b.get("source") or {}
+                    mm = dict(meta)
+                    mm.setdefault("media_type", src.get("media_type"))
+                    m["content"][i] = _ph(mm)
+                    hit += 1
+                    continue
+                inner = b.get("content")
+                if not isinstance(inner, list):
+                    continue
+                for j, x in enumerate(inner):
+                    if isinstance(x, dict) and x.get("type") == "image":
+                        src = x.get("source") or {}
+                        mm = dict(meta)
+                        mm.setdefault("media_type", src.get("media_type"))
+                        inner[j] = _ph(mm)
+                        hit += 1
+        if not hit:
+            out.append(line)  # 本行无图片：原样保留，不重排 JSON
+            continue
+        blocks += hit
+        out.append(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+    if not blocks:
+        return 0, 0
+    body = "".join(out)
+    saved = before - len(body.encode("utf-8"))
+    bak = path + ".bak-imgstrip"
+    try:
+        if not os.path.exists(bak):
+            with open(bak, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        tmp = path + ".tmp-imgstrip"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        return 0, 0
+    return blocks, max(saved, 0)
+
+
+
 class Executor:
     """以无头方式驱动 agent CLI（opencode / claude），逐行解析 JSON 事件流。"""
 
@@ -238,6 +369,32 @@ class Executor:
             cmd += ["--append-system-prompt-file", sys_prompt]
         return cmd
 
+    def _claude_state_dir(self, user: str) -> str:
+        """claude 会话/信任态的持久目录（= CLAUDE_CONFIG_DIR）。
+
+        放 users/<user>/.claude 而非 workdir/home：终态清理会删 home/，
+        跨任务 --resume 就断了。build_env 注入环境变量、_strip_resume_images
+        定位转写，两处必须同源，故收敛成一个方法。
+        """
+        return os.path.join(self.cfg.users_root, _state_dirname(user), ".claude")
+
+    def _strip_resume_images(self, resume_session: str, user: str,
+                             task_id: int, publish) -> None:
+        """resume 前把历史图片载荷换成文本占位（详见 strip_transcript_images）。
+
+        失败一律静默放过：剥离只是优化，绝不能因为它让任务跑不起来。
+        """
+        try:
+            path = _find_transcript(self._claude_state_dir(user), resume_session)
+            if not path:
+                return
+            blocks, saved = strip_transcript_images(path)
+            if blocks:
+                publish(task_id, t="imgstrip", blocks=blocks,
+                        saved_kb=round(saved / 1024))
+        except Exception:
+            pass
+
     def build_env(self, workdir: str, xdg_config: str | None = None,
                   user: str = "") -> dict:
         env = _scrubbed_environ()
@@ -262,7 +419,7 @@ class Executor:
             env["IS_SANDBOX"] = "1"
             # 会话/信任态放持久目录（users/<user>/.claude），躲开终态清理删 home/，
             # 跨任务 --resume 才可用；鉴权与模型走 relay.env 的 ANTHROPIC_* 透传。
-            state = os.path.join(self.cfg.users_root, _state_dirname(user), ".claude")
+            state = self._claude_state_dir(user)
             os.makedirs(state, exist_ok=True)
             env["CLAUDE_CONFIG_DIR"] = state
             # 单轮 LLM 调用保护。task_timeout 只管整个任务，管不到单轮：实测
@@ -291,6 +448,10 @@ class Executor:
                   exempt_cmd: str | None = None, user: str = "",
                   on_long=None) -> AgentResult:
         xdg = shared_knowledge.prepare_run(workdir, self.cfg)
+        if resume_session and self.cfg.engine == "claude":
+            # 必须在 build_cmd 之前：--resume 一旦带上，claude-code 就会把整段
+            # 历史（含图片 base64）重放上送。
+            self._strip_resume_images(resume_session, user, task_id, publish)
         cmd = self.build_cmd(workdir, prompt, resume_session)
         env = self.build_env(workdir, xdg, user)
         if data_dir:

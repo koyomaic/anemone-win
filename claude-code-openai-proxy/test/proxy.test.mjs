@@ -236,3 +236,104 @@ test('routes select upstream and model', async (t) => {
   assert.equal(seenUrl, '/routed/v1/chat/completions');
   assert.equal(seenBody.model, 'upstream-routed');
 });
+
+// 流式 usage 必须把 input_tokens 一并回传（2026-10-23）。
+// 此前 message_delta 只带 output_tokens，claude-code 记到的 input_tokens 恒为 0
+// （实测一条 resume 链 106 个回合全 0），relay 的 tokens 退化成纯输出，avatar 的
+// resume 上下文预算闸门对图片载荷完全瞎：转写已 12.66MB，chain_tokens 才 48387。
+test('anthropic stream reports input_tokens and asks upstream for usage', async (t) => {
+  let upstreamBody = null;
+  const upstream = await startServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({
+        choices: [{ delta: { role: 'assistant', content: '好了' } }],
+      }));
+      // OpenAI 兼容网关的 usage 尾包（choices 为空）
+      res.write(sseChunk({
+        choices: [],
+        usage: { prompt_tokens: 123456, completion_tokens: 789, total_tokens: 124245 },
+      }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy({
+    host: '127.0.0.1',
+    port: 0,
+    baseURL: `http://127.0.0.1:${upstream.port}/v1`,
+    apiKey: 'test-key',
+    model: 'm',
+    routes: {},
+    redaction: { mode: 'strict', dictionary },
+  });
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'm',
+      max_tokens: 128,
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  const text = await readText(res);
+
+  // 显式索要 usage 尾包，否则上游根本不回 prompt_tokens
+  assert.deepEqual(upstreamBody.stream_options, { include_usage: true });
+
+  const delta = text
+    .split('\n')
+    .filter((l) => l.startsWith('data: '))
+    .map((l) => JSON.parse(l.slice(6)))
+    .find((e) => e.type === 'message_delta');
+  assert.ok(delta, `未收到 message_delta：${text.slice(0, 400)}`);
+  assert.equal(delta.usage.input_tokens, 123456);
+  assert.equal(delta.usage.output_tokens, 789);
+});
+
+// stream_options 只在 anthropic 路由注入（那条路上 claude-code 说 Anthropic 协议，
+// 永远不会自己带 stream_options）。/v1/chat/completions 是 OpenAI 兼容直通，
+// 客户端自己负责 usage，代理不得改写——否则会把调用方显式关掉的 usage 又打开。
+test('openai passthrough keeps client stream_options untouched', async (t) => {
+  let upstreamBody = null;
+  const upstream = await startServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ delta: { content: 'ok' } }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy({
+    host: '127.0.0.1',
+    port: 0,
+    baseURL: `http://127.0.0.1:${upstream.port}/v1`,
+    apiKey: 'test-key',
+    model: 'm',
+    routes: {},
+    redaction: { mode: 'strict', dictionary },
+  });
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'm',
+      stream: true,
+      stream_options: { include_usage: false },
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  await readText(res);
+  assert.deepEqual(upstreamBody.stream_options, { include_usage: false });
+});

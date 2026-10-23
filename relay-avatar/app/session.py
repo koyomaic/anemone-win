@@ -149,6 +149,15 @@ class SessionManager:
         max_toks = int(self.cfg.get("ingress", "resume_max_tokens", 60000))
         if max_toks > 0 and toks >= max_toks:
             return f"tokens {toks}>={max_toks}"
+        # 转写字节闸门：token 闸门量的是 relay 记的 tokens，而那个数在
+        # claude-proxy 丢掉流式 input_tokens 期间退化成纯输出，对图片载荷完全
+        # 瞎（2026-10-23 录屏链 chain_tokens=48387 / 转写 12.66MB，闸门没拦）。
+        # 字节数量的一定是 --resume 会整段重放的东西，且不依赖任何遥测。
+        byts = int(s.get("chain_bytes") or 0)
+        max_bytes = int(self.cfg.get("ingress", "resume_max_transcript_bytes",
+                                     2000000))
+        if max_bytes > 0 and byts >= max_bytes:
+            return f"transcript {byts}>={max_bytes}"
         return None
 
     def resume_break_reason(self, s: dict) -> str | None:
@@ -165,11 +174,22 @@ class SessionManager:
         over = self.chain_over_budget(s)
         return f"budget:{over}" if over else None
 
-    def note_chain(self, s: dict, tokens, digest: str = ""):
-        """任务完成时累加链上预算，并记下接续摘要（供断链后注入）。"""
+    def note_chain(self, s: dict, tokens, digest: str = "",
+                   transcript_bytes: int = 0):
+        """任务完成时累加链上预算，并记下接续摘要（供断链后注入）。
+
+        transcript_bytes 是**赋值不是累加**：一条链上所有任务共用同一个会话
+        转写，最新那次的文件大小就是整条链的体量。0＝没量到，保留原值不动
+        （量不到不该把已有判定擦掉）。
+        """
         s["chain_depth"] = int(s.get("chain_depth") or 0) + 1
         try:
             s["chain_tokens"] = int(s.get("chain_tokens") or 0) + max(int(tokens or 0), 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if int(transcript_bytes or 0) > 0:
+                s["chain_bytes"] = int(transcript_bytes)
         except (TypeError, ValueError):
             pass
         if digest:
@@ -182,3 +202,4 @@ class SessionManager:
         """
         s["chain_depth"] = 0
         s["chain_tokens"] = 0
+        s["chain_bytes"] = 0

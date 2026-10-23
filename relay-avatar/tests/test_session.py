@@ -166,3 +166,79 @@ def test_resume_break_reason_no_last_task(cfg, storage):
     s = sm.get_or_create("o:a", "张三", "a", make_ev(), False)
     assert sm.resume_break_reason(s) == "none"
     assert sm.resume_candidate(s) is None
+
+
+# ── resume 转写字节闸门（2026-10-23）──
+#
+# token 闸门量的是 relay 记的 tokens，而那个数在 claude-proxy 丢掉流式
+# input_tokens 期间退化成纯输出，对图片载荷完全瞎：宋连杰一个 181s 录屏经
+# 378→380→382→384→386 五任务共用一个 session，累积 15 个图片块 / 6.11MB
+# base64、转写 12.66MB，chain_tokens 却只有 48387，60000 的闸门纹丝不动，
+# 一句话追问（#382）也跑满 134s。字节数不依赖遥测，量的一定是会被重放的载荷。
+
+
+def test_resume_transcript_bytes_cap(cfg, storage):
+    """#380→#384 的真实量级：tokens 远未触顶，转写已 12.66MB → 必须断链。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=0,
+                                            resume_max_tokens=0)
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "宋连杰", "a", make_ev(), False))
+    sm.note_chain(s, 14282, "378", transcript_bytes=1_200_000)
+    assert sm.resume_candidate(s) == 42               # 1.2MB < 2MB，照旧 resume
+    sm.note_chain(s, 29579, "384", transcript_bytes=12_657_332)
+    assert sm.resume_candidate(s) is None
+    assert "transcript" in sm.resume_break_reason(s)
+    assert sm.resume_break_reason(s).startswith("budget:")   # 断链要注入摘要
+
+
+def test_resume_transcript_bytes_assigns_not_accumulates(cfg, storage):
+    """一条链共用同一个转写：记最新大小，不是逐轮累加（否则第二轮就虚高触顶）。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=0,
+                                            resume_max_tokens=0)
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
+    sm.note_chain(s, 100, "a", transcript_bytes=900_000)
+    sm.note_chain(s, 100, "b", transcript_bytes=1_100_000)
+    assert s["chain_bytes"] == 1_100_000              # 不是 2_000_000
+    assert sm.resume_candidate(s) == 42
+
+
+def test_resume_transcript_bytes_zero_keeps_previous(cfg, storage):
+    """量不到（0）不该把已有判定擦掉——否则一次 glob 失手就等于关掉闸门。"""
+    cfg._p.setdefault("ingress", {}).update(resume_max_depth=0,
+                                            resume_max_tokens=0)
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
+    sm.note_chain(s, 100, "a", transcript_bytes=9_000_000)
+    sm.note_chain(s, 100, "b", transcript_bytes=0)
+    assert s["chain_bytes"] == 9_000_000
+    assert sm.resume_candidate(s) is None
+
+
+def test_resume_transcript_bytes_zero_disables_cap(cfg, storage):
+    """0/负值＝不设限，与 depth/tokens 两项同款运维口子。"""
+    cfg._p.setdefault("ingress", {}).update(
+        resume_max_depth=0, resume_max_tokens=0, resume_max_transcript_bytes=0)
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
+    sm.note_chain(s, 100, "a", transcript_bytes=999_000_000)
+    assert sm.resume_candidate(s) == 42
+
+
+def test_reset_chain_clears_bytes(cfg, storage):
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
+    sm.note_chain(s, 100, "旧摘要", transcript_bytes=9_000_000)
+    sm.reset_chain(s)
+    assert s["chain_bytes"] == 0 and s["chain_depth"] == 0
+    assert s["chain_digest"] == "旧摘要"              # 摘要仍保留
+
+
+def test_note_chain_tolerates_bad_transcript_bytes(cfg, storage):
+    sm = SessionManager(cfg, storage)
+    s = _live(sm, sm.get_or_create("o:a", "张三", "a", make_ev(), False))
+    sm.note_chain(s, 100, "x", transcript_bytes=None)
+    sm.note_chain(s, 100, "y", transcript_bytes="not-a-number")
+    sm.note_chain(s, 100, "z", transcript_bytes=-5)
+    assert s["chain_depth"] == 3
+    assert int(s.get("chain_bytes") or 0) == 0

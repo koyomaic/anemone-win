@@ -14,7 +14,8 @@ import pytest
 
 from app.config import Settings
 from app.db import DB
-from app.executor import Executor, _parse_claude, _state_dirname
+from app.executor import (Executor, _find_transcript, _parse_claude,
+                          _state_dirname, strip_transcript_images)
 from app.main import _session_if_same_engine
 from app.shared_knowledge import _claude_mcp_entry, prepare_run
 
@@ -430,3 +431,131 @@ exit 0
     assert "Separator" not in str(t.get("error") or ""), t
     assert t["status"] in ("review", "done"), t
     assert str(t.get("result") or "").startswith("x" * 1000)
+
+
+# ---- resume 前剥离历史图片（2026-10-23）----
+#
+# --resume 把整段历史重放给模型，图片块由 claude-proxy 转成
+# image_url(data:<mime>;base64,...) 原样上送。实测宋连杰一个 181s 录屏经
+# 378→380→382→384→386 五任务共用一个 session，累积 15 个图片块 / 6.11MB
+# base64、转写 12.66MB，每回合整体重算 prefill，一句话追问（#382）跑满 134s。
+
+_B64 = "A" * 5000
+
+
+def _img_line(sid: str = "ses1", b64: str = _B64) -> str:
+    """照生产转写的真实结构造一行含图 tool_result（message.content + toolUseResult 双份）。"""
+    return json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": [{
+            "tool_use_id": "chatcmpl-tool-1", "type": "tool_result",
+            "content": [{"type": "image", "source": {
+                "type": "base64", "data": b64, "media_type": "image/jpeg"}}]}]},
+        "toolUseResult": {"type": "image", "file": {
+            "base64": b64, "type": "image/jpeg", "originalSize": 724106,
+            "dimensions": {"originalWidth": 2100, "originalHeight": 2349}}},
+        "sessionId": sid,
+    }, ensure_ascii=False)
+
+
+def _write_transcript(tmp_path, sid: str, lines: list[str], user: str = "u1"):
+    d = tmp_path / "users" / user / ".claude" / "projects" / "-mnt-vol-x-workspace-tasks-378"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{sid}.jsonl"
+    p.write_text("".join(x + "\n" for x in lines), encoding="utf-8")
+    return str(p)
+
+
+def test_strip_transcript_images_replaces_payload(tmp_path):
+    plain = json.dumps({"type": "assistant", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "看到了"}]}})
+    p = _write_transcript(tmp_path, "ses1", [plain, _img_line(), plain])
+    before = os.path.getsize(p)
+    blocks, saved = strip_transcript_images(p)
+    assert blocks == 2 and saved > 0                   # message.content + toolUseResult
+    body = open(p, encoding="utf-8").read()
+    assert _B64 not in body                            # base64 载荷已清干净
+    assert len(body.splitlines()) == 3                 # 行数不变
+    assert os.path.getsize(p) < before
+    objs = [json.loads(x) for x in body.splitlines()]
+    blk = objs[1]["message"]["content"][0]["content"][0]
+    assert blk["type"] == "text"                       # 换成文本占位，结构仍合法
+    assert "2100x2349" in blk["text"] and "image/jpeg" in blk["text"]
+    assert "724KB" in blk["text"]                      # 元信息保留，模型知道曾有图
+    assert objs[1]["toolUseResult"]["file"]["base64"] == "<stripped>"
+    assert objs[1]["toolUseResult"]["file"]["originalSize"] == 724106
+    assert objs[0] == json.loads(plain)                # 无图行原样保留，不重排 JSON
+
+
+def test_strip_transcript_images_noop_without_images(tmp_path):
+    plain = json.dumps({"type": "assistant", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "hi"}]}})
+    p = _write_transcript(tmp_path, "ses1", [plain, plain])
+    raw = open(p, encoding="utf-8").read()
+    assert strip_transcript_images(p) == (0, 0)
+    assert open(p, encoding="utf-8").read() == raw     # 零改动
+    assert not os.path.exists(p + ".bak-imgstrip")     # 无图不产生备份
+
+
+def test_strip_transcript_images_tolerates_bad_line(tmp_path):
+    bad = '{"type":"user","message":<<< 不是合法 JSON'
+    p = _write_transcript(tmp_path, "ses1", [bad, _img_line()])
+    blocks, _ = strip_transcript_images(p)
+    assert blocks == 2
+    lines = open(p, encoding="utf-8").read().splitlines()
+    assert lines[0] == bad                             # 坏行原样保留，绝不弄坏转写
+    assert _B64 not in lines[1]
+
+
+def test_strip_transcript_images_backup_written_once(tmp_path):
+    """滚动备份只留一份：首次剥离时落盘，之后同名覆盖，不随轮次无限堆积。"""
+    p = _write_transcript(tmp_path, "ses1", [_img_line()])
+    strip_transcript_images(p)
+    bak = p + ".bak-imgstrip"
+    assert os.path.exists(bak) and _B64 in open(bak, encoding="utf-8").read()
+    first = os.path.getsize(bak)
+    strip_transcript_images(p)                         # 已无图 → 不再改写
+    assert os.path.getsize(bak) == first
+
+
+def test_strip_transcript_images_missing_file(tmp_path):
+    assert strip_transcript_images(str(tmp_path / "nope.jsonl")) == (0, 0)
+
+
+def test_find_transcript_globs_by_session_id(tmp_path):
+    """按 session_id glob，不自己拼 projects 子目录名。
+
+    那个目录名是 claude-code 按它看到的 cwd 编码的，可能是符号链接解析后的真实
+    路径（本机 /mnt/vol-eltaah12 → /mnt/vol-71srnryd），拼错就静默失效。
+    """
+    p = _write_transcript(tmp_path, "ses-abc", [_img_line("ses-abc")])
+    state = str(tmp_path / "users" / "u1" / ".claude")
+    assert _find_transcript(state, "ses-abc") == p
+    assert _find_transcript(state, "ses-missing") is None
+    assert _find_transcript(state, "") is None
+    assert _find_transcript(str(tmp_path / "no-such-dir"), "ses-abc") is None
+    # 防路径穿越：session_id 会拼进 glob 模式，含分隔符/上跳的一律不认
+    assert _find_transcript(state, "../../etc/passwd") is None
+    assert _find_transcript(state, "../ses-abc") is None
+
+
+def test_executor_strip_resume_images_end_to_end(tmp_path):
+    """Executor._strip_resume_images：按 users_root + user 定位并剥离，事件上报体量。"""
+    p = _write_transcript(tmp_path, "ses-e2e", [_img_line("ses-e2e")], user="宋连杰")
+    ex = Executor(_cfg(tmp_path))
+    ev = []
+    ex._strip_resume_images("ses-e2e", "宋连杰", 384, lambda tid, **kw: ev.append((tid, kw)))
+    assert _B64 not in open(p, encoding="utf-8").read()
+    assert ev and ev[0][0] == 384
+    assert ev[0][1]["t"] == "imgstrip" and ev[0][1]["blocks"] == 2
+    assert ev[0][1]["saved_kb"] > 0
+
+
+def test_executor_strip_resume_images_never_raises(tmp_path):
+    """剥离只是优化：定位不到 / 权限炸了都必须静默放过，绝不能让任务跑不起来。"""
+    ex = Executor(_cfg(tmp_path))
+    ev = []
+    ex._strip_resume_images("ses-gone", "u1", 1, lambda tid, **kw: ev.append(tid))
+    assert ev == []
+    ex._strip_resume_images("../../etc/passwd", "u1", 1, lambda tid, **kw: ev.append(tid))
+    assert ev == []

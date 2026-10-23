@@ -35,6 +35,14 @@ DEFAULTS: dict[str, Any] = {
                 # 整段历史。2026-09-28 实测 #278→#281 单轮往返 7.3s→32.6s（4.5 倍），
                 # 模型往返占执行时间 75%。0/负值＝该项不设限。
                 "resume_max_depth": 3, "resume_max_tokens": 60000,
+                # 转写字节闸门：链上会话转写（--resume 要整段重放的东西）超过此
+                # 字节数即断链。为什么 token 闸门不够：claude-proxy 曾把流式 usage
+                # 的 input_tokens 丢掉，relay 的 tokens 退化成纯输出——2026-10-23
+                # 宋连杰一个 181s 录屏经 378→380→382→384→386 五任务链累积 15 个
+                # 图片块 / 6.11MB base64，转写 12.66MB，而 chain_tokens 只有 48387，
+                # 60000 的闸门纹丝不动，一句话追问（#382）跑满 134s。字节数不依赖
+                # 任何遥测，量的一定是会被重放的载荷。0/负值＝不设限。
+                "resume_max_transcript_bytes": 2000000,
                 "resume_digest_chars": 2000,
                 "poll_sec": 3, "result_max_chars": 3000,
                 "ack_emoji": "奋斗", "submit_emoji": "",
