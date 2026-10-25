@@ -105,9 +105,10 @@ chmod 600 config.json      # 里面有密钥，务必收紧权限
 }
 ```
 
-> 注意：`routes` 只认 **object-map** 格式；数组形式（`[{"match":[...]}]`）是
-> 无效配置，会被静默忽略、全部走默认上游（healthz 的 `routes` 字段显示 `"0"`
-> 即此症状）。
+> 注意：`routes` 的正典格式是 **object-map**。数组形式（`[{"match":[...], ...}]`）
+> 是历史漂移，曾长期被静默忽略（healthz 的 `routes` 显示 `"0"` 即该症状）；
+> 2026-10-25 起启动时会**归一化激活**（按 `match` 展开为 object-map，journal 打
+> `routes normalized from array format` 一行），但仍建议改写为 object-map 正典格式。
 
 ### 2. 运行
 

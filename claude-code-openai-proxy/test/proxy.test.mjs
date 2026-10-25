@@ -850,3 +850,65 @@ test('passthrough stream: parallel tool blocks intact, thinking restored, signat
     assert.deepEqual(JSON.parse(json), JSON.parse(args), `${id} 参数必须完整可解析`);
   }
 });
+
+// ── 数组 routes 归一化（机队切换通道，2026-10-25）──
+// 各机 config 里 2026-09-22 写入的数组形态 aigateway 路由曾是死配置（静默忽略）。
+// 归一化让代码更新即激活直通，无需逐机改私有 config。
+
+test('array-format routes normalized: healthz lists models and passthrough activates', async (t) => {
+  let hitUrl = null; let hitKey = null;
+  const upstream = await startServer((req, res) => {
+    hitUrl = req.url; hitKey = req.headers['x-api-key'];
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'msg_arr', type: 'message', role: 'assistant', model: 'pt-model',
+        content: [{ type: 'text', text: '数组路由已激活' }],
+        stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 2 },
+      }));
+    });
+  });
+  const proxy = await startProxy({
+    host: '127.0.0.1', port: 0,
+    baseURL: 'http://127.0.0.1:1/v1', apiKey: 'k', model: 'm',
+    routes: [{ match: ['pt-model', 'pt-other'],
+               baseURL: `http://127.0.0.1:${upstream.port}/v1`,
+               apiKey: 'arr-key', mode: 'anthropic' }],
+    redaction: { mode: 'strict', dictionary },
+  });
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const health = await (await fetch(`http://127.0.0.1:${proxy.port}/healthz`)).json();
+  assert.ok(health.routes.includes('pt-model') && health.routes.includes('pt-other'),
+            `healthz 应列模型名而非 "0"：${JSON.stringify(health.routes)}`);
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'pt-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const json = await res.json();
+  assert.equal(hitUrl, '/v1/messages', '应走直通 /messages 而非 /chat/completions');
+  assert.equal(hitKey, 'arr-key', '数组条目里的私有 key 必须随迁');
+  assert.equal(json.content[0].text, '数组路由已激活');
+});
+
+test('openai path: 200 with empty body becomes explicit 502, not fake success', async (t) => {
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(''); });
+  });
+  const proxy = await startProxy({
+    host: '127.0.0.1', port: 0,
+    baseURL: `http://127.0.0.1:${upstream.port}/v1`,
+    apiKey: 'k', model: 'm', routes: {},
+    redaction: { mode: 'strict', dictionary },
+  });
+  t.after(() => { upstream.close(); proxy.close(); });
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'm', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(res.status, 502);
+  const err = await res.json();
+  assert.ok(err.error.message.includes('empty or non-JSON'));
+});

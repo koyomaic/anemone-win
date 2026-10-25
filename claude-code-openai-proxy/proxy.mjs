@@ -267,9 +267,30 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// 数组形态 routes（历史漂移：[{match:[...], baseURL, apiKey, mode}]）曾被**静默
+// 忽略**——2026-09-22 写入的 aigateway 直通路由因此死了一个多月（healthz 的
+// routes 显示 "0" 即症状）。现归一化激活：按 match 列表展开成 object-map（后
+// 出现的条目覆盖同名模型）；每机私有 key 留在每机 config 里，代码不携带钥匙。
+// object-map（README 正典格式）原样返回。
+export function normalizeRoutes(routes) {
+  if (!routes || typeof routes !== 'object') return {};
+  if (!Array.isArray(routes)) return routes;
+  const out = {};
+  for (const entry of routes) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { match, ...rest } = entry;
+    for (const m of Array.isArray(match) ? match : []) {
+      if (typeof m === 'string' && m) out[m] = { ...rest };
+    }
+  }
+  log('routes normalized from array format →', Object.keys(out).join(',') || '(empty)');
+  return out;
+}
+
 export function createProxy(config, deps = {}) {
   const env = deps.env || process.env;
   const fetchImpl = deps.fetch || fetch;
+  config = { ...config, routes: normalizeRoutes(config.routes) };
   const redactor = config.redaction ? createRedactor(config.redaction) : null;
   if (redactor && !redactor.ready) {
     log('redaction enabled but dictionary unavailable; proxy will fail closed:', redactor.error);
@@ -998,7 +1019,19 @@ export function createProxy(config, deps = {}) {
       });
       return await streamTranslate(up, res, body.model, route, redacted.map, ptag);
     }
-    const j = await up.json();
+    let j;
+    try {
+      j = await up.json();
+    } catch {
+      // 200 但空体/非 JSON：典型症状是路由指到了不说 OpenAI 协议的端点
+      // （如 aigateway 的 /chat/completions 废端点，实测回 200 空体）。
+      // 真相回传优先：明确 502，绝不包装成空回复让 claude-code 打哑谜。
+      log('upstream returned 200 with empty/non-JSON body; route misconfigured?');
+      return sendJson(res, 502, {
+        type: 'error',
+        error: { type: 'api_error', message: 'upstream returned empty or non-JSON body (route/protocol misconfigured?)' },
+      });
+    }
     const processed = processNonStreamResponse(j, redacted.map);
     const anth = fromOpenAI(processed, body.model, route.model);
     return sendJson(res, 200, anth);
