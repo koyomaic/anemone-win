@@ -6,8 +6,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
+import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -57,6 +60,10 @@ class AgentResult:
     # 故 tokens=0、最终文本也常常是空的（#146 第 1 段实测 files=0 text=0，其实一直在
     # 跑工具查数据）。只看文件与文本会把"正在采集数据"误判成"毫无进展"而停掉续跑。
     tool_calls: int = 0
+    # 本段 JSON 解析失败的工具输入数（__unparsedToolInput 签名），管道切碎护栏的
+    # 分子；分母复用 tool_calls（切碎时头+尾碎片都计入，比值趋近 100%，基线 ~0）。
+    # 判据与阈值见 pipeline_shred_suspect()。
+    tool_verrs: int = 0
     # 子进程退出码，原样保留不字符串化。上层要区分「被信号打断」与「agent 自己
     # 报错」时靠它——从 error 文案里正则抠数字，一改字就静默失效（与 timed_out
     # 用独立布尔而非 startswith("timeout after") 同一个理由）。
@@ -76,6 +83,79 @@ def signal_name(rc: int) -> str:
         return signal.Signals(signo).name
     except ValueError:
         return f"signal {signo}"
+
+
+def pipeline_shred_suspect(res: AgentResult, cfg) -> str:
+    """工具参数解析被拒超阈值 → 疑似**平台管道缺陷**（不是模型问题）。
+
+    2026-10-23 事故：8790 代理的流式脱敏保留区在块切换时不刷新，工具参数被切成
+    「头部截断 JSON＋定长尾巴」两个同 id 碎片，双双 InputValidationError；两天
+    56% 逻辑调用被拒、~2 亿 input token 白烧，而错误文案全程甩锅模型（"You
+    sent … could not be parsed as JSON"），两天无人察觉方向错了。本护栏把签名
+    计数翻译成平台侧真相：error 标注＋审计＋钉钉告警（alert_pipeline_shred）。
+
+    阈值依据：__unparsedToolInput 是「解析失败」签名，基线 ~0（09-15→10-22 五周
+    全机队日均 ≤4 次且多为 schema 错、不走此签名）；事故期占比 41-58%。
+    min_count 防小样本误报（2 次调用 1 次被拒＝50% 不足以定罪管道）。
+    返回标注文案；未达阈值返回空串。
+    """
+    min_count = max(1, int(getattr(cfg, "tool_verr_min_count", 5)))
+    if res.tool_verrs < min_count:
+        return ""
+    uses = max(res.tool_calls, 1)
+    ratio = res.tool_verrs / uses
+    if ratio < float(getattr(cfg, "tool_verr_min_ratio", 0.25)):
+        return ""
+    return (f"疑似平台管道缺陷（非模型问题）：工具参数解析被拒 "
+            f"{res.tool_verrs}/{uses} 次（{ratio:.0%}）——请检查 claude-proxy "
+            f"流式转换/脱敏保留区，故障签名与排查口诀见知识库 #8105")
+
+
+# 告警冷却锚点（进程级）。事故期每个任务都会触发判定，不冷却会把收件人打爆：
+# 第一条送达真相，后续靠审计线兜底，修复后自然归零。
+_last_pipeline_alert = 0.0
+
+
+async def alert_pipeline_shred(task_id: int, user: str, note: str, cfg) -> bool:
+    """管道缺陷钉钉直聊告警。与 boot.sh notify_failure 同一套种子登录态
+    （临时 HOME 软链 dws-cli-seed，token 轮换发生在种子上、无复制竞态）；
+    无种子时退回本机 root 登录态。带冷却（默认 1h）。返回是否实际发送。
+
+    绝不抛异常：告警是旁路，失败只丢告警、不得影响任务收尾。
+    """
+    global _last_pipeline_alert
+    to = (getattr(cfg, "pipeline_alert_to", "") or "").strip()
+    if not to:
+        return False
+    now = time.time()
+    cooldown = float(getattr(cfg, "pipeline_alert_cooldown_sec", 3600) or 0)
+    if now - _last_pipeline_alert < cooldown:
+        return False
+    _last_pipeline_alert = now
+    msg = (f"【relay管道预警·{socket.gethostname()}】任务 #{task_id}（{user}）："
+           f"{note}；{time.strftime('%F %T')}")
+    seed = getattr(cfg, "dws_seed_dir", "") or ""
+    env = dict(os.environ)
+    work = ""
+    try:
+        if seed and os.path.isdir(seed):
+            work = tempfile.mkdtemp(prefix="relay-alert-")
+            os.makedirs(os.path.join(work, ".local", "share"), exist_ok=True)
+            os.symlink(seed, os.path.join(work, ".local", "share", "dws-cli"))
+            env["HOME"] = work
+        else:
+            env["HOME"] = "/root"
+        proc = await asyncio.create_subprocess_exec(
+            "dws", "chat", "+dm", "--to", to, "--content", msg,
+            "--yes", "--format", "json",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL, env=env)
+        return (await proc.wait()) == 0
+    except Exception:
+        return False
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)   # 只删软链，种子不受影响
 
 
 def _parse_opencode(line: str) -> dict | None:
@@ -126,6 +206,14 @@ def _parse_claude(line: str) -> dict | None:
                 out["agent_event"] = {"kind": "text", "text": block["text"][:2000]}
             elif block.get("type") == "tool_use":
                 inp = block.get("input") or {}
+                out["tool_use_n"] = out.get("tool_use_n", 0) + 1
+                # 管道切碎签名：claude-code 把 JSON 解析失败的工具输入包成
+                # __unparsedToolInput {"raw":…,"len":…}。2026-10-23 代理保留区
+                # 事故里它成对出现（同 id 头部+定长尾巴）；正常条件下模型参数
+                # 解析失败率 ~0（09-15→10-22 五周基线 0.2% 且多为 schema 错而非
+                # 解析错），故此签名几乎只在平台管道缺陷时出现。
+                if isinstance(inp, dict) and "__unparsedToolInput" in inp:
+                    out["tool_verr_n"] = out.get("tool_verr_n", 0) + 1
                 out["agent_event"] = progress.agent_tool_event(
                     block.get("name", ""), inp)
                 if str(block.get("name", "")).lower() == "bash":
@@ -534,6 +622,7 @@ class Executor:
                     res.text += parsed.get("text", "")
                 res.tokens += parsed.get("tokens", 0)
                 res.cost += parsed.get("cost", 0.0)
+                res.tool_verrs += parsed.get("tool_verr_n", 0)
                 aev = parsed.get("agent_event")
                 if aev:
                     if aev.get("kind") == "tool":

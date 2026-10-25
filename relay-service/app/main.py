@@ -665,7 +665,8 @@ document.getElementById("btn-pl-new").addEventListener("click",async()=>{
 });
 refresh();setInterval(()=>{refresh();if(document.getElementById("view-tokens").style.display!=="none")refreshTokens();if(document.getElementById("view-plans").style.display!=="none"){refreshPlans();refreshTimers()}},10000);
 </script></body></html>"""
-from .executor import Executor, signal_name
+from .executor import (Executor, alert_pipeline_shred, pipeline_shred_suspect,
+                       signal_name)
 from .scheduler import Scheduler
 from .targets import find_conflicts
 
@@ -1017,6 +1018,9 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     # 热路径不碰 DB，重启丢签名最坏只是 fail-open 多给一段（段号在 resume_hint 里，
     # 重启不丢，硬上界仍然生效）。
     seg_progress: dict[int, tuple] = {}
+    # 旁路后台任务（管道预警钉钉告警等）的强引用池：create_task 的返回值不持有
+    # 会被 GC 提前回收（asyncio 只存弱引用），任务可能跑到一半消失。
+    _bg_tasks: set = set()
     sched: Scheduler | None = None  # set in lifespan
     # 计划内重启标志，lifespan 收尾时置位。run_task 据此把「被 SIGTERM 打断」的任务
     # 退回 queued 而不是判 failed：否则每次部署都把在跑的任务打成失败、还回用户一句
@@ -1076,6 +1080,22 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             on_long=_on_long,
         )
         finished = time.time()
+        # ── 管道切碎护栏（2026-10-25）──
+        # __unparsedToolInput 签名超阈值 → 审计留痕 + error 标注（让分身把「疑似
+        # 平台缺陷」而非「模型参数错误」转述给用户）+ 钉钉告警（带冷却，旁路不
+        # 阻塞收尾）。事故背景与阈值依据见 executor.pipeline_shred_suspect 注释。
+        shred_note = pipeline_shred_suspect(res, cfg)
+        if shred_note:
+            audit.line(task_id, row["user"], "pipeline_shred_suspect",
+                       f"verr={res.tool_verrs}/{res.tool_calls} seg={seg}")
+            bus.publish(task_id, t="pipeline_warn", detail=shred_note)
+            if (res.error and res.error != "cancelled"
+                    and not res.error.startswith("blocked:")):
+                res.error = f"{res.error}｜{shred_note}"
+            _t = asyncio.create_task(
+                alert_pipeline_shred(task_id, row["user"], shred_note, cfg))
+            _bg_tasks.add(_t)
+            _t.add_done_callback(_bg_tasks.discard)
         db.set(task_id,
                session_id=res.session_id or "",
                engine=cfg.engine,

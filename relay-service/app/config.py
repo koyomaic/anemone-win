@@ -256,6 +256,17 @@ class Settings:
     # 重试次数。注意环境变量名是 CLAUDE_CODE_MAX_RETRIES，**不是** MAX_RETRIES
     # （后者在 claude 二进制里 0 命中，只作为前者的后缀存在）；内部钳位上限 15。
     api_max_retries: int = 3
+    # ── 管道切碎护栏（2026-10-25；事故与判据见 executor.pipeline_shred_suspect）──
+    # 单任务 __unparsedToolInput 签名 ≥ min_count 且占 tool_calls 比 ≥ min_ratio
+    # → error/审计标注「疑似平台管道缺陷」＋钉钉告警（带冷却）。基线签名 ~0、
+    # 事故期 41-58%；min_count=5 防小样本误报。alert_to 空＝只审计不告警。
+    tool_verr_min_count: int = 5
+    tool_verr_min_ratio: float = 0.25
+    pipeline_alert_to: str = "王洪彬"
+    pipeline_alert_cooldown_sec: float = 3600.0
+    # dws 种子登录态目录（与 boot.sh notify_failure 同源）；目录不存在时告警
+    # 退回本机 root 登录态直发。
+    dws_seed_dir: str = "/mnt/vol-eltaah12/workspace/shared/secrets/dws-cli-seed/dws-cli"
     engine: str = "opencode"  # opencode | claude
     agent_bin: str = ""
     model: str = ""
@@ -373,6 +384,16 @@ class Settings:
             api_first_byte_timeout_ms=float(
                 os.environ.get("RELAY_API_FIRST_BYTE_TIMEOUT_MS", "60000")),
             api_max_retries=int(os.environ.get("RELAY_API_MAX_RETRIES", "3")),
+            tool_verr_min_count=int(
+                os.environ.get("RELAY_TOOL_VERR_MIN_COUNT", "5")),
+            tool_verr_min_ratio=float(
+                os.environ.get("RELAY_TOOL_VERR_MIN_RATIO", "0.25")),
+            pipeline_alert_to=os.environ.get("RELAY_PIPELINE_ALERT_TO", "王洪彬"),
+            pipeline_alert_cooldown_sec=float(
+                os.environ.get("RELAY_PIPELINE_ALERT_COOLDOWN_SEC", "3600")),
+            dws_seed_dir=os.environ.get(
+                "RELAY_DWS_SEED_DIR",
+                "/mnt/vol-eltaah12/workspace/shared/secrets/dws-cli-seed/dws-cli"),
             engine=os.environ.get("RELAY_ENGINE", "opencode"),
             agent_bin=os.environ.get("RELAY_AGENT_BIN", ""),
             model=os.environ.get("RELAY_MODEL", ""),

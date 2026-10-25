@@ -634,3 +634,54 @@ def test_executor_strip_resume_images_never_raises(tmp_path):
     assert ev == []
     ex._strip_resume_images("../../etc/passwd", "u1", 1, lambda tid, **kw: ev.append(tid))
     assert ev == []
+
+
+# ---- 管道切碎护栏（2026-10-25；事故见知识库 #8105 补记）----
+
+def _assistant_ev(*blocks):
+    return json.dumps({"type": "assistant",
+                       "message": {"content": list(blocks)}})
+
+
+def test_parse_claude_counts_unparsed_tool_input():
+    """__unparsedToolInput 签名（管道切碎的铁证）必须被计数。"""
+    out = _parse_claude(_assistant_ev(
+        {"type": "tool_use", "id": "t1", "name": "Bash",
+         "input": {"__unparsedToolInput": {"raw": '{"command": "sto', "len": 27}}},
+        {"type": "tool_use", "id": "t2", "name": "Bash",
+         "input": {"command": "ls"}},
+    ))
+    assert out["tool_use_n"] == 2
+    assert out["tool_verr_n"] == 1
+
+
+def test_parse_claude_clean_stream_has_no_verr():
+    out = _parse_claude(_assistant_ev(
+        {"type": "tool_use", "id": "t1", "name": "Bash",
+         "input": {"command": "ls"}},
+    ))
+    assert out["tool_use_n"] == 1
+    assert "tool_verr_n" not in out
+
+
+def test_pipeline_shred_suspect_thresholds(tmp_path):
+    from app.executor import AgentResult, pipeline_shred_suspect
+    cfg = _cfg(tmp_path)
+    # 事故形态：占比高、次数多 → 触发
+    note = pipeline_shred_suspect(AgentResult(tool_calls=10, tool_verrs=8), cfg)
+    assert "平台管道缺陷" in note and "8/10" in note
+    # 小样本不触发（min_count=5：4 次全拒也不定罪管道）
+    assert pipeline_shred_suspect(AgentResult(tool_calls=4, tool_verrs=4), cfg) == ""
+    # 占比不足不触发（100 次里 6 次异常：记审计即可，不够定罪）
+    assert pipeline_shred_suspect(AgentResult(tool_calls=100, tool_verrs=6), cfg) == ""
+    # 基线：零签名
+    assert pipeline_shred_suspect(AgentResult(tool_calls=50, tool_verrs=0), cfg) == ""
+
+
+def test_pipeline_shred_suspect_custom_thresholds(tmp_path):
+    from app.executor import AgentResult, pipeline_shred_suspect
+    cfg = _cfg(tmp_path)
+    cfg.tool_verr_min_count = 2
+    cfg.tool_verr_min_ratio = 0.5
+    assert pipeline_shred_suspect(AgentResult(tool_calls=4, tool_verrs=2), cfg) != ""
+    assert pipeline_shred_suspect(AgentResult(tool_calls=5, tool_verrs=2), cfg) == ""
