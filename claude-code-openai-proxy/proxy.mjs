@@ -224,7 +224,14 @@ export function fromOpenAI(json, reqModel, fallbackModel) {
     try {
       input = JSON.parse(tc.function?.arguments || '{}');
     } catch {
+      // 兜底信封不能静默：__raw 派发出去必然吃 InputValidationError，日志里
+      // 必须留下"上游给了非法参数 JSON"的真相（长度+finish_reason 供区分
+      // 截断还是乱码），否则又变成"看起来像模型错"的哑巴故障。
       input = { __raw: tc.function?.arguments ?? '' };
+      log('warn: unparseable tool arguments wrapped as __raw',
+          JSON.stringify({ id: tc.id, name: tc.function?.name,
+                           bytes: (tc.function?.arguments || '').length,
+                           finish: choice.finish_reason }));
     }
     content.push({
       type: 'tool_use',

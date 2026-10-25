@@ -205,3 +205,52 @@ test('astral-plane aliases match (code-unit trie)', () => {
   const out = r.redactText('联系🔒保密单位处理', state);
   assert.equal(out, '联系[[CO-E2-01]]处理');
 });
+
+// ── 切点劈开完整匹配 → DLP 安全网破洞（2026-10-25 全面审计）──
+// 与占位符切点缺陷同类：cut = buf.length - hold 扫过一个**已完整存在于 buf**
+// 的别名/凭据时，头段过 dlpText 匹配不上（不完整）被原样放行，尾段同样漏——
+// 真名/密钥碎片直接漏进响应。hold 只保护"流末尾未完整"的情形，保护不了
+// "切点扫过中部完整匹配"。
+
+test('stream DLP never leaks entity split by cut point', () => {
+  const r = makeRedactor();
+  const proc = createStreamProcessor(r, new Map());
+  const full = '前'.repeat(40) + '示例集团控股有限公司' + '后'.repeat(60);
+  let out = '';
+  for (let i = 0; i < full.length; i += 5) out += proc.push(full.slice(i, i + 5));
+  out += proc.flush();
+  assert.ok(out.includes('[DLP-BLOCKED:CO]'), `实体应被 DLP 掩码: ${out.slice(30, 90)}`);
+  for (const frag of ['示例集团', '控股', '有限公司']) {
+    assert.ok(!out.includes(frag), `真名碎片泄漏: ${frag}`);
+  }
+});
+
+test('stream DLP never leaks credential split by cut point', () => {
+  const r = makeRedactor();
+  const proc = createStreamProcessor(r, new Map());
+  const key = 'sk-' + 'A1b2C3d4E5f6G7h8'.repeat(4);   // 67 字符，超过 hold 窗口
+  const text = 'prefix '.repeat(10) + key + ' suffix.';
+  let out = '';
+  for (let i = 0; i < text.length; i += 7) out += proc.push(text.slice(i, i + 7));
+  out += proc.flush();
+  assert.ok(out.includes('[CREDENTIAL_REDACTED]'), '凭据应被掩码');
+  assert.ok(!out.includes('A1b2C3d4E5f6G7h8A1b2'), `凭据碎片泄漏: ${out.slice(60, 140)}`);
+});
+
+// 回归（2026-10-25 审计）：切点落在 '[[' 两括号之间时 head 只剩孤 '['，
+// 双括号检查抓不到 → 占位符碎漏。按 delta 粒度扫射验证任何流式切分下
+// 占位符都完整还原。
+test('placeholder survives any delta granularity (single-bracket cut regression)', () => {
+  const r = makeRedactor();
+  const state = createState();
+  r.redactText('示例集团控股有限公司', state);   // 建 map：CO-TEST-CO-01
+  const final = '回执：[[CO-TEST-CO-01]] 已送达，后续还有足够长的文本把切点推过占位符位置。';
+  const want = '回执：示例集团控股有限公司 已送达，后续还有足够长的文本把切点推过占位符位置。';
+  for (const ds of [1, 2, 3, 4, 5, 7, 11, 13, 29]) {
+    const proc = createStreamProcessor(r, state.map);
+    let out = '';
+    for (let i = 0; i < final.length; i += ds) out += proc.push(final.slice(i, i + ds));
+    out += proc.flush();
+    assert.equal(out, want, `delta=${ds} 时占位符被切漏`);
+  }
+});

@@ -204,6 +204,13 @@ export function loadDictionary(dictPath) {
     const entity = { type, id, canonical, placeholder, core, aliases };
     entities.push(entity);
     for (const alias of aliases) {
+      // JSON 不安全字符（引号/反斜杠/控制符）入词典即拒载（fail-closed）：
+      // restoreText 对工具参数是**字符串级**回填，值里带 `"` 或 `\` 会让回填后
+      // 的参数 JSON 非法 → 整个调用变 InputValidationError。宁可加载期报错，
+      // 不可运行期静默切碎参数。
+      if (/["\\\u0000-\u001f]/.test(alias)) {
+        throw new Error(`entity ${id}: alias contains JSON-unsafe character (quote/backslash/control)`);
+      }
       const norm = normalizeSimple(alias);
       maxAliasLength = Math.max(maxAliasLength, alias.length, norm.length);
       ac.add(alias, {
@@ -568,22 +575,57 @@ export class StreamProcessor {
   _process(final) {
     if (!this.buf) return '';
     let cut = final ? this.buf.length : Math.max(0, this.buf.length - this.hold);
-    // 切点不得落在占位符 [[…]] 内部：落在里面就回退到占位符起点，让它整体留在
-    // 保留区，等 ']]' 到齐后下一轮完整还原。否则头尾两段分别过 restoreText 都
-    // 匹配不上——原始占位符直接漏进工具参数与交付文本（2026-10-23 起实测两天
-    // 50 处：tool_use 37 ＋ text 13，如 task#1405 交付正文带 [[ORG-32F6-01]]）。
-    // 字面 '[[' 迟迟不闭合也无害：切点回退只压住 '[[' 起的尾巴，之前的正文照常
-    // 流出，final flush 兜底放行。
-    if (!final && cut > 0) {
-      const head = this.buf.slice(0, cut);
-      const open = head.lastIndexOf('[[');
-      if (open >= 0 && head.indexOf(']]', open) < 0) cut = open;
-    }
+    if (!final && cut > 0) cut = this._safeCut(cut);
     if (cut <= 0) return '';
     let chunk = this.buf.slice(0, cut);
     this.buf = this.buf.slice(cut);
     chunk = this.redactor.processText(chunk, this.map, this.state);
     return chunk;
+  }
+
+  // 切点不得落进任何「完整匹配」内部：占位符 [[…]]、词典别名、凭据正则。落进
+  // 去会把匹配劈成头尾两段，两段各自过 restore/DLP 都匹配不上——占位符原样漏
+  // 出、真名/密钥碎片裸漏。三类都实测/实证过：占位符 2026-10-23 起两天漏 50 处
+  // （tool_use 37＋text 13）；别名与凭据 2026-10-25 审计用测试实证（切点扫过
+  // buf 中部完整匹配时，hold 窗口只护得住"流末尾未完整"的情形，护不住这种）。
+  // buf 恒小（≈hold＋单个 delta），全量扫描成本可忽略。三类检查都只会把切点
+  // 往前拉，拉完须整体复查（新切点可能又落进更靠前的另一类匹配），故循环到
+  // 稳定；匹配互不重叠，实际至多两三轮，4 次为硬上限。
+  // 字面 '[[' 迟迟不闭合也无害：回退只压住 '[[' 起的尾巴，之前的正文照常流出，
+  // final flush 兜底放行。已知边界：PEM 私钥块这类"必须整体才匹配"的超长模式
+  // 无法靠切点回退保护（可检测前缀＝整块），防线在请求侧整串脱敏——模型根本
+  // 看不到真凭据，响应侧 DLP 只是防回显的保险网。
+  _safeCut(cut) {
+    const dict = this.redactor?.dict;
+    for (let guard = 0; guard < 4 && cut > 0; guard += 1) {
+      const before = cut;
+      const head = this.buf.slice(0, cut);
+      const open = head.lastIndexOf('[[');
+      if (open >= 0 && head.indexOf(']]', open) < 0) cut = open;
+      // 单个 '[' 收尾也必须回退：切点恰好落在 '[[' 两括号之间时，head 里只有
+      // 孤 '['，上面的 '[[' 检查抓不到——放行后剩余 '[CORE]]' 永远配不上双括号，
+      // 整个占位符碎着漏出（2026-10-25 delta=3 实测复现，晨间修复的漏网边界）。
+      else if (head.endsWith('[')) cut -= 1;
+      if (dict) {
+        const { norm, matches } = scanEntities(this.buf, dict);
+        for (const m of matches) {
+          const rs = norm.starts[m.start];
+          const re = norm.ends[m.end - 1];
+          if (rs < cut && cut < re) { cut = rs; break; }
+        }
+        for (const cred of dict.credentials) {
+          // matchAll 内部克隆正则，不污染共享 re 的 lastIndex
+          for (const mm of this.buf.matchAll(cred.re)) {
+            if (mm.index < cut && cut < mm.index + mm[0].length) {
+              cut = mm.index;
+              break;
+            }
+          }
+        }
+      }
+      if (cut === before) break;
+    }
+    return cut;
   }
 }
 
