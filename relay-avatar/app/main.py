@@ -784,6 +784,21 @@ class Avatar:
                 self._swap_ack(s, "")
                 self.st.archive_round(tid, "deny", r)
                 return
+            if self._kw(cmd, "cancel"):
+                # 待审批时说「取消」＝不放行、终止（与「拒绝」同效）。此前落到
+                # reprompt 被吞掉——用户连发「取消」只收到重复的门禁提示
+                # （2026-10-25 赵兴峰反馈，与 review 态吞取消同源）。
+                tid = s.get("task_id")
+                r = self.exec_relay.approve(tid, "deny", uid)
+                self._notify_session(s, "🚫 已取消，任务终止。")
+                self._card_final(
+                    s, f"🍂 **已取消 🚫**\n\n"
+                       "门禁待审批时取消，任务终止", 3)
+                s["state"] = "IDLE"
+                s["task_id"] = None
+                self._swap_ack(s, "")
+                self.st.archive_round(tid, "cancel-as-deny", r)
+                return
             self._reprompt(s)
             return
         if st == "WAIT_REVIEW" and s.get("task_id"):
@@ -792,6 +807,16 @@ class Avatar:
                 return
             if self._kw(cmd, "conflict") or self._kw(cmd, "deny"):
                 self._confirm_review(s, "conflict", uid)
+                return
+            if self._kw(cmd, "cancel"):
+                # review＝活已办完、等人过目，「取消」回收不了产出。此前被当新
+                # 需求吞进 followups 并回「冲突确认」提示，用户实测「取消失效」
+                # （2026-10-25 赵兴峰反馈）。如实告知语义并给出出口，不改任务态：
+                # 真不要产出走「冲突」（置 conflict 留人工复核，文件有备份）。
+                self._notify_session(
+                    s, "🍂 这件已经办完了，「取消」回收不了产出。\n"
+                       "认可结果请回「确认」收尾；不要这份产出或想让人工复核，"
+                       "请回「冲突」标记。")
                 return
             if self._is_noise(cmd):
                 self._react(s, "noise_emoji")

@@ -998,3 +998,42 @@ def test_knowledge_intake_rules_respects_skip(avatar):
 
 def test_knowledge_intake_rules_no_keyword(avatar):
     assert avatar._knowledge_intake_rules("生成日报", "18434") == ""
+
+
+# ── 「取消」在 WAIT_REVIEW / WAIT_APPROVAL 不再被吞（2026-10-25 赵兴峰反馈）──
+
+def test_wait_review_cancel_explains_not_swallowed(avatar):
+    """review 态发「取消」：此前被当新需求吞进 followups 并回「冲突确认」提示，
+    用户实测「取消失效」。现在须如实告知语义（活已办完、取消不回收产出）并给出
+    确认/冲突两个出口，任务态与 followups 都不动。"""
+    s, tid = _start_review(avatar, "301")
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("取消", n="302"))
+    assert s["state"] == "WAIT_REVIEW"
+    assert avatar.exec_relay.tasks[tid]["status"] == "review"
+    assert not s["followups"]
+    assert any("办完了" in t and "冲突" in t for t in texts(avatar))
+    assert not any("新需求已记录" in t for t in texts(avatar))
+
+
+def test_wait_approval_cancel_terminates(avatar):
+    """待审批态发「取消」＝不放行、终止（与「拒绝」同效）。此前落到 reprompt
+    被吞，用户连发「取消」只收到重复门禁提示。"""
+    avatar.on_event(ev("删库跑路", n="303"))
+    s = avatar.sess.sessions["o:sid200"]
+    avatar._flush(s, uid="200")
+    tid = s["task_id"]
+    avatar.exec_relay.tasks[tid] = {"id": tid, "status": "pending_approval",
+                                    "blocked_cmd": "rm -rf /",
+                                    "error": "blocked:rm: rm -rf /"}
+    avatar._poll_sessions()
+    assert s["state"] == "WAIT_APPROVAL"
+    calls = []
+    orig = avatar.exec_relay.approve
+    avatar.exec_relay.approve = (
+        lambda t, d, uid="": (calls.append((t, d)), orig(t, d, uid))[1])
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("取消", n="304"))
+    assert calls == [(tid, "deny")]
+    assert s["state"] == "IDLE" and s["task_id"] is None
+    assert any("已取消，任务终止" in t for t in texts(avatar))
