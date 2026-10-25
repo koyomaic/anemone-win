@@ -567,7 +567,18 @@ export class StreamProcessor {
 
   _process(final) {
     if (!this.buf) return '';
-    const cut = final ? this.buf.length : Math.max(0, this.buf.length - this.hold);
+    let cut = final ? this.buf.length : Math.max(0, this.buf.length - this.hold);
+    // 切点不得落在占位符 [[…]] 内部：落在里面就回退到占位符起点，让它整体留在
+    // 保留区，等 ']]' 到齐后下一轮完整还原。否则头尾两段分别过 restoreText 都
+    // 匹配不上——原始占位符直接漏进工具参数与交付文本（2026-10-23 起实测两天
+    // 50 处：tool_use 37 ＋ text 13，如 task#1405 交付正文带 [[ORG-32F6-01]]）。
+    // 字面 '[[' 迟迟不闭合也无害：切点回退只压住 '[[' 起的尾巴，之前的正文照常
+    // 流出，final flush 兜底放行。
+    if (!final && cut > 0) {
+      const head = this.buf.slice(0, cut);
+      const open = head.lastIndexOf('[[');
+      if (open >= 0 && head.indexOf(']]', open) < 0) cut = open;
+    }
     if (cut <= 0) return '';
     let chunk = this.buf.slice(0, cut);
     this.buf = this.buf.slice(cut);

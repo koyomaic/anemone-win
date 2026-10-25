@@ -373,6 +373,15 @@ export function createProxy(config, deps = {}) {
     const tools = new Map();
     const textProc = redactor ? createStreamProcessor(redactor, map) : null;
     const toolProcs = new Map();
+    // 已关闭的块索引。Anthropic 协议禁止对同一 index 二次 content_block_start，
+    // 重开会被 claude-code 当成**新的 tool_use（同 id）**——2026-10-23 事故根因：
+    // 脱敏 StreamProcessor 对每段文本/工具参数保留末尾 hold（当时 27）字符等待
+    // 跨块匹配，而旧实现只在流结束的 finally 里统一 flush；flush 时块早已关闭，
+    // sendText/sendToolArgs 便重开已关闭块补发尾巴 → 每个逻辑调用被切成
+    // 「头部（截断 JSON）＋尾巴（27B 碎片）」两个 tool_use，双双 InputValidationError。
+    // 10-23/24 两天 3,381 次逻辑调用被拒 1,898 次（56%），并发调用 97-100% 被切、
+    // 单调用带前置文本 99.8% 被切，两天烧掉 ~2 亿 input token（缓存命中恒 0）。
+    const closedBlocks = new Set();
 
     const openBlock = (index, block) => {
       send('content_block_start', {
@@ -382,9 +391,37 @@ export function createProxy(config, deps = {}) {
       });
       openIndex = index;
     };
+    // 把当前打开块的脱敏保留区刷进**该块自身**（关块前必须做，否则尾巴丢给
+    // 流末尾，见上）。flush 后 buf 清空，重复调用安全。
+    const flushOpenBlock = () => {
+      if (openIndex < 0) return;
+      if (openIndex === textIndex && textProc) {
+        const t = textProc.flush();
+        if (t) send('content_block_delta', {
+          type: 'content_block_delta',
+          index: textIndex,
+          delta: { type: 'text_delta', text: t },
+        });
+        return;
+      }
+      for (const [oi, proc] of toolProcs) {
+        const st = tools.get(oi);
+        if (st && st.ai === openIndex) {
+          const t = proc.flush();
+          if (t) send('content_block_delta', {
+            type: 'content_block_delta',
+            index: st.ai,
+            delta: { type: 'input_json_delta', partial_json: t },
+          });
+          return;
+        }
+      }
+    };
     const closeBlock = () => {
       if (openIndex >= 0) {
+        flushOpenBlock();
         send('content_block_stop', { type: 'content_block_stop', index: openIndex });
+        closedBlocks.add(openIndex);
         openIndex = -1;
       }
     };
@@ -392,6 +429,9 @@ export function createProxy(config, deps = {}) {
       if (!text) return;
       if (textIndex < 0) textIndex = nextIndex++;
       if (openIndex !== textIndex) {
+        // 文本块已关闭后又来文本（上游交错，罕见）：另开**新 index** 的文本块续写。
+        // 文本块可多段拼接，新开合法；重开旧 index 非法。
+        if (closedBlocks.has(textIndex)) textIndex = nextIndex++;
         closeBlock();
         openBlock(textIndex, { type: 'text', text: '' });
       }
@@ -404,6 +444,12 @@ export function createProxy(config, deps = {}) {
     const sendToolArgs = (st, args) => {
       if (!args) return;
       if (openIndex !== st.ai) {
+        if (closedBlocks.has(st.ai)) {
+          // 工具块关闭后又收到同 index 的参数＝上游真交错（现有网关从未出现）。
+          // 无处合法续写：记真相并丢弃，绝不重开块（重开＝复制 10-23 切碎事故）。
+          log(`warn: tool args after block close dropped (id=${st.id} ${args.length}B)`);
+          return;
+        }
         closeBlock();
         openBlock(st.ai, { type: 'tool_use', id: st.id, name: st.name, input: {} });
       }
@@ -453,10 +499,9 @@ export function createProxy(config, deps = {}) {
           };
           tools.set(oi, st);
           openBlock(st.ai, { type: 'tool_use', id: st.id, name: st.name, input: {} });
-        } else if (openIndex !== st.ai) {
-          closeBlock();
-          openBlock(st.ai, { type: 'tool_use', id: st.id, name: st.name, input: {} });
         }
+        // 既有 index 的块切换交给 sendToolArgs（带 closedBlocks 守卫）；此处不得
+        // 重开块——旧实现的 else-if 重开正是切碎事故的帮凶之一。
         if (tcd.id && !st.id) st.id = tcd.id;
         if (tcd.function?.name && !st.name) st.name = tcd.function.name;
         const args = tcd.function?.arguments;
@@ -500,14 +545,38 @@ export function createProxy(config, deps = {}) {
     } catch (e) {
       log('stream error:', e.message);
     } finally {
-      if (textProc) sendText(textProc.flush());
+      // closeBlock 已内联 flushOpenBlock：当前打开块的脱敏保留区先刷进该块再关。
+      // 其余块在切换关闭时已各自刷过——不存在「流末统一 flush 时块已关闭、只能
+      // 重开补发」的旧路径（那正是 10-23 切碎事故的根因）。
+      closeBlock();
+      // 兜底：整段文本从未超出保留窗口（≤hold 字符的短文本）时文本块从未打开，
+      // 保留区里的全文必须新开一块发出，否则静默丢字。
+      if (textProc) {
+        const t = textProc.flush();
+        if (t) {
+          if (textIndex < 0 || closedBlocks.has(textIndex)) textIndex = nextIndex++;
+          send('content_block_start', {
+            type: 'content_block_start',
+            index: textIndex,
+            content_block: { type: 'text', text: '' },
+          });
+          send('content_block_delta', {
+            type: 'content_block_delta',
+            index: textIndex,
+            delta: { type: 'text_delta', text: t },
+          });
+          send('content_block_stop', { type: 'content_block_stop', index: textIndex });
+          closedBlocks.add(textIndex);
+        }
+      }
+      // 兜底：工具块必先于其 proc 打开，正常不会有残留；有残留说明走了未知路径，
+      // 记日志留痕（真相回传优先于静默吞掉）。
       for (const [oi, proc] of toolProcs) {
-        const st = tools.get(oi);
-        if (st) sendToolArgs(st, proc.flush());
+        const rem = proc.flush();
+        if (rem) log(`warn: orphan tool holdback dropped (oi=${oi} ${rem.length}B)`);
       }
       if (textProc) logDlp(textProc.state);
       for (const proc of toolProcs.values()) logDlp(proc.state);
-      closeBlock();
       // input_tokens 必须在这里回传：message_start 发出时上游 usage 尾包还没到，
       // 只能先填 0；真实值随最后一个 chunk 到达，故在 message_delta 补齐。
       // 少了它 claude-code 记到的 input_tokens 恒为 0（实测 106 个回合全 0），
@@ -569,6 +638,24 @@ export function createProxy(config, deps = {}) {
         logDlp(proc.state);
       }
     };
+    // 单个 choice 的保留区尾巴。必须在转发 finish_reason 块**之前**刷：OpenAI
+    // 客户端见到 finish_reason 即停止累积，等到 [DONE] 再 flushAll 就晚了，
+    // 尾巴会被静默丢弃（参数截断成非法 JSON）。flush 幂等，flushAll 兜底不重复。
+    const flushChoice = (ci) => {
+      if (!redactor) return;
+      for (const [key, proc] of procs) {
+        const parts = key.split(':');
+        if (parts[1] !== String(ci)) continue;
+        const rem = proc.flush();
+        if (!rem) continue;
+        if (parts[0] === 'tool') {
+          write(chunkFor(ci, { tool_calls: [{ index: Number(parts[2]), function: { arguments: rem } }] }));
+        } else {
+          write(chunkFor(ci, { [parts[0]]: rem }));
+        }
+        logDlp(proc.state);
+      }
+    };
 
     try {
       const reader = upstream.body.getReader();
@@ -608,8 +695,7 @@ export function createProxy(config, deps = {}) {
           }
           last = json;
           for (const [ci, choice] of (json.choices || []).entries()) {
-            const delta = choice?.delta;
-            if (!delta) continue;
+            const delta = choice?.delta || {};
             for (const field of ['content', 'reasoning', 'reasoning_content']) {
               if (typeof delta[field] === 'string' && delta[field].length) {
                 const proc = getProc(`${field}:${ci}`);
@@ -628,6 +714,7 @@ export function createProxy(config, deps = {}) {
                 else delete tcd.function.arguments;
               }
             }
+            if (choice?.finish_reason) flushChoice(ci);
           }
           write(json);
         }

@@ -130,6 +130,23 @@ test('stream processor restores placeholders split across chunks', () => {
   assert.equal(out, '示例集团控股有限公司');
 });
 
+// 回归（2026-10-25）：占位符后跟随超过保留窗口的正文时，旧实现的切点会落进
+// 占位符内部，头尾两段各自 restoreText 都匹配不上——原始占位符直接漏进工具
+// 参数与交付文本（10-23 起两天实测 50 处：tool_use 37 ＋ text 13）。
+test('stream processor never cuts inside a placeholder', () => {
+  const r = makeRedactor();
+  const state = createState();
+  const redacted = r.redactText('示例集团控股有限公司', state);   // [[CO-TEST-CO-01]]
+  const proc = createStreamProcessor(r, state.map);
+  const tail1 = '尾部十三字符补足窗口测试用';
+  const tail2 = '第二段继续补充一些内容确保越过保留窗口后再收尾。';
+  let out = proc.push(`回执：${redacted}${tail1}`);
+  out += proc.push(tail2);
+  out += proc.flush();
+  assert.equal(out, `回执：示例集团控股有限公司${tail1}${tail2}`);
+  assert.ok(!out.includes('[['), `原始占位符漏出: ${out.slice(0, 60)}`);
+});
+
 test('stream processor masks DLP across chunks', () => {
   const r = makeRedactor();
   const proc = createStreamProcessor(r, new Map());

@@ -454,3 +454,213 @@ test('prefix logging is off by default (zero overhead)', async (t) => {
   } finally { console.log = orig; }
   assert.ok(!lines.some((l) => l.includes(' prefix ')), '默认不该打 prefix 日志');
 });
+
+// ── 2026-10-23「切碎事故」回归 ──
+// 脱敏 StreamProcessor 对每段文本/工具参数保留末尾 hold 字符等待跨块匹配，旧实现
+// 只在流结束的 finally 里统一 flush；彼时内容块早已关闭，sendText/sendToolArgs 会
+// **重开已关闭块**（同 id 重复 content_block_start），claude-code 视为新 tool_use：
+// 每个逻辑调用被切成「头部（截断 JSON）＋尾巴（定长 hold 碎片）」，双双
+// InputValidationError（__unparsedToolInput {"raw":…,"len":27}）。实测 10-23/24
+// 两天 3,381 次逻辑调用被拒 1,898 次（56%）：并发调用 97-100% 被切、单调用带
+// 前置文本 99.8% 被切、纯工具单调用 2.6% 幸存；两天烧掉 ~2 亿 input token。
+// 修复：关块前先把该块保留区刷进块自身；已关闭块永不重开（文本另开新 index，
+// 工具参数记 warn 丢弃）；流末兜底从未开块的短文本。
+
+function parseAnthropicEvents(text) {
+  const events = [];
+  for (const line of text.split('\n')) {
+    if (line.startsWith('data: ')) events.push(JSON.parse(line.slice(6)));
+  }
+  return events;
+}
+
+function blockText(events, index, deltaType, field) {
+  return events
+    .filter((e) => e.type === 'content_block_delta' && e.index === index
+      && e.delta.type === deltaType)
+    .map((e) => e.delta[field])
+    .join('');
+}
+
+const STRICT = (port) => ({
+  host: '127.0.0.1',
+  port: 0,
+  baseURL: `http://127.0.0.1:${port}/v1`,
+  apiKey: 'test-key',
+  model: 'm',
+  routes: {},
+  redaction: { mode: 'strict', dictionary },
+});
+
+test('anthropic stream: parallel tool calls stay intact, no block reopened', async (t) => {
+  const args = [
+    JSON.stringify({ command: "find /data/reports -name '*.csv' | head -20 && echo ALPHA-OK" }),
+    JSON.stringify({ command: "find /data/reports -name '*.pdf' | head -20 && echo BETA-OK" }),
+    JSON.stringify({ command: "find /data/reports -name '*.xlsx' | head -20 && echo GAMMA-OK" }),
+  ];
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ index: 0, delta: { role: 'assistant', content: '我来依次检查三个目录并把结果汇总给你' } }] }));
+      for (let i = 0; i < 3; i++) {
+        res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `call_${i}`, type: 'function', function: { name: 'Bash', arguments: '' } }] } }] }));
+        res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: args[i].slice(0, 30) } }] } }] }));
+        res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: args[i].slice(30) } }] } }] }));
+      }
+      res.write(sseChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }));
+      res.write(sseChunk({ choices: [], usage: { prompt_tokens: 100, completion_tokens: 60 } }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy(STRICT(upstream.port));
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'm', max_tokens: 256, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const events = parseAnthropicEvents(await readText(res));
+
+  const starts = events.filter((e) => e.type === 'content_block_start');
+  const idxs = starts.map((e) => e.index);
+  assert.equal(new Set(idxs).size, idxs.length, `重复 content_block_start：${JSON.stringify(idxs)}`);
+
+  const toolStarts = starts.filter((e) => e.content_block.type === 'tool_use');
+  assert.equal(toolStarts.length, 3, '应恰有 3 个 tool_use 块');
+  for (let i = 0; i < 3; i++) {
+    const st = toolStarts.find((e) => e.content_block.id === `call_${i}`);
+    assert.ok(st, `缺 call_${i} 的 tool_use 块`);
+    const json = blockText(events, st.index, 'input_json_delta', 'partial_json');
+    assert.deepEqual(JSON.parse(json), JSON.parse(args[i]), `call_${i} 参数不完整（被切碎）`);
+  }
+
+  const textStart = starts.find((e) => e.content_block.type === 'text');
+  assert.ok(textStart, '缺文本块');
+  assert.equal(blockText(events, textStart.index, 'text_delta', 'text'),
+               '我来依次检查三个目录并把结果汇总给你');
+
+  const stops = events.filter((e) => e.type === 'content_block_stop').map((e) => e.index);
+  for (const i of idxs) assert.ok(stops.includes(i), `块 ${i} 未关闭`);
+  assert.ok(events.some((e) => e.type === 'message_stop'));
+});
+
+test('anthropic stream: short tool args (< hold) fully delivered at close', async (t) => {
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_s', type: 'function', function: { name: 'Bash', arguments: '' } }] } }] }));
+      res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command":"ls"}' } }] } }] }));
+      res.write(sseChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy(STRICT(upstream.port));
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'm', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const events = parseAnthropicEvents(await readText(res));
+  const starts = events.filter((e) => e.type === 'content_block_start');
+  assert.equal(starts.length, 1);
+  const json = blockText(events, starts[0].index, 'input_json_delta', 'partial_json');
+  assert.deepEqual(JSON.parse(json), { command: 'ls' });
+  assert.ok(events.some((e) => e.type === 'content_block_stop' && e.index === starts[0].index));
+});
+
+test('anthropic stream: short text-only reply (never opened block) not lost', async (t) => {
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ index: 0, delta: { content: '好的' } }] }));
+      res.write(sseChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy(STRICT(upstream.port));
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'm', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const events = parseAnthropicEvents(await readText(res));
+  const starts = events.filter((e) => e.type === 'content_block_start');
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].content_block.type, 'text');
+  assert.equal(blockText(events, starts[0].index, 'text_delta', 'text'), '好的');
+  assert.ok(events.some((e) => e.type === 'content_block_stop'));
+  assert.ok(events.some((e) => e.type === 'message_stop'));
+});
+
+test('anthropic stream: placeholder split across tool-arg deltas still restored', async (t) => {
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_r', type: 'function', function: { name: 'Bash', arguments: '' } }] } }] }));
+      res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command": "echo 报告 [[CO-TEST-' } }] } }] }));
+      res.write(sseChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 'CO-01]] 已送达 done-marker" }' } }] } }] }));
+      res.write(sseChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy(STRICT(upstream.port));
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    // 请求里带实体 → 请求侧脱敏生成 map，响应侧才能还原上游回显的占位符
+    body: JSON.stringify({ model: 'm', max_tokens: 64, stream: true, messages: [{ role: 'user', content: '请通知示例集团控股有限公司' }] }),
+  });
+  const events = parseAnthropicEvents(await readText(res));
+  const starts = events.filter((e) => e.type === 'content_block_start');
+  assert.equal(starts.length, 1);
+  const json = blockText(events, starts[0].index, 'input_json_delta', 'partial_json');
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.command, 'echo 报告 示例集团控股有限公司 已送达 done-marker');
+});
+
+test('openai stream: holdback tail flushed before finish_reason chunk', async (t) => {
+  const full = '这是一段足够长的回复文本，用来确保超出脱敏保留窗口从而产生尾巴';
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(sseChunk({ id: 'x1', choices: [{ index: 0, delta: { content: full.slice(0, 20) } }] }));
+      res.write(sseChunk({ id: 'x1', choices: [{ index: 0, delta: { content: full.slice(20) } }] }));
+      res.write(sseChunk({ id: 'x1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  const proxy = await startProxy(STRICT(upstream.port));
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const text = await readText(res);
+  const chunks = text.split('\n').filter((l) => l.startsWith('data: ') && !l.includes('[DONE]'))
+    .map((l) => JSON.parse(l.slice(6)));
+  const finishPos = chunks.findIndex((c) => c.choices?.[0]?.finish_reason);
+  const lastContentPos = chunks.reduce((acc, c, i) => (c.choices?.[0]?.delta?.content ? i : acc), -1);
+  assert.ok(finishPos >= 0, '缺 finish_reason 块');
+  assert.ok(lastContentPos < finishPos, `尾巴(${lastContentPos})必须在 finish_reason(${finishPos}) 之前`);
+  const joined = chunks.map((c) => c.choices?.[0]?.delta?.content || '').join('');
+  assert.equal(joined, full);
+});
