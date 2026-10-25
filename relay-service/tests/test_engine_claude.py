@@ -685,3 +685,22 @@ def test_pipeline_shred_suspect_custom_thresholds(tmp_path):
     cfg.tool_verr_min_ratio = 0.5
     assert pipeline_shred_suspect(AgentResult(tool_calls=4, tool_verrs=2), cfg) != ""
     assert pipeline_shred_suspect(AgentResult(tool_calls=5, tool_verrs=2), cfg) == ""
+
+
+def test_parse_claude_result_tokens_include_cache_fields():
+    """直通模式下提示缓存生效：input_tokens 骤降、大头进 cache_read——但缓存读
+    ≠上下文变小，tokens 必须是上下文真值（avatar 续跑预算闸门依赖）。"""
+    ev = {"type": "result", "result": "done", "session_id": "s1",
+          "usage": {"input_tokens": 18, "output_tokens": 30,
+                    "cache_read_input_tokens": 33732,
+                    "cache_creation_input_tokens": 2000}}
+    out = _parse_claude(json.dumps(ev))
+    assert out["tokens"] == 18 + 30 + 33732 + 2000
+
+
+def test_parse_claude_result_tokens_without_cache_fields_unchanged():
+    """翻译路径无 cache 字段：口径与历史一致（input+output）。"""
+    ev = {"type": "result", "result": "ok",
+          "usage": {"input_tokens": 100, "output_tokens": 50}}
+    out = _parse_claude(json.dumps(ev))
+    assert out["tokens"] == 150

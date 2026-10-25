@@ -664,3 +664,189 @@ test('openai stream: holdback tail flushed before finish_reason chunk', async (t
   const joined = chunks.map((c) => c.choices?.[0]?.delta?.content || '').join('');
   assert.equal(joined, full);
 });
+
+// ── Anthropic 直通模式（mode:'anthropic'，2026-10-25）──
+// 上游原生说 Anthropic 协议（aigateway 实测：格式/流式/缓存/thinking 全支持），
+// 直通转发只就地改 delta 文本，content_block_stop 即协议级刷新点——翻译层的
+// 块重构/收尾猜测（两起切碎事故根源）整类消失，cache_control 得以保留（缓存
+// 命中实测 cache_read=33732）。
+
+function ptProxy(upstreamPort) {
+  return startProxy({
+    host: '127.0.0.1', port: 0,
+    baseURL: 'http://127.0.0.1:1/v1',
+    apiKey: 'k', model: 'm',
+    routes: {
+      'pt-model': {
+        baseURL: `http://127.0.0.1:${upstreamPort}/v1`,
+        apiKey: 'pt-key', model: 'upstream-model', mode: 'anthropic',
+      },
+    },
+    redaction: { mode: 'strict', dictionary },
+  });
+}
+
+function anthEvents(text) {
+  return text.split('\n').filter((l) => l.startsWith('data: '))
+    .map((l) => JSON.parse(l.slice(6)));
+}
+
+function writeAnthSse(res, events) {
+  for (const e of events) res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+}
+
+test('passthrough: request redacted, note first, cache_control kept, error verbatim', async (t) => {
+  let upstreamBody = null; let upstreamUrl = ''; let upstreamKey = '';
+  const upstream = await startServer((req, res) => {
+    upstreamUrl = req.url; upstreamKey = req.headers['x-api-key'];
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'msg_1', type: 'message', role: 'assistant', model: 'upstream-model',
+        content: [{ type: 'text', text: '完成 [[CO-TEST-CO-01]]' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 33732 },
+      }));
+    });
+  });
+  const proxy = await ptProxy(upstream.port);
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'pt-model', max_tokens: 64,
+      system: [{ type: 'text', text: '你是助手。敏感方：示例集团控股有限公司', cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: '查询示例集团控股有限公司的报价' }],
+    }),
+  });
+  const json = await res.json();
+  assert.equal(upstreamUrl, '/v1/messages');
+  assert.equal(upstreamKey, 'pt-key');
+  assert.equal(upstreamBody.model, 'upstream-model');
+  const s = JSON.stringify(upstreamBody);
+  assert.ok(s.includes('[[CO-TEST-CO-01]]'));
+  assert.ok(!s.includes('示例集团'));
+  assert.ok(upstreamBody.system[0].text.includes('脱敏占位符'), '系统注记须为第一块');
+  assert.deepEqual(upstreamBody.system[1].cache_control, { type: 'ephemeral' }, 'cache_control 必须原位保留');
+  assert.equal(json.content[0].text, '完成 示例集团控股有限公司');
+  assert.equal(json.usage.cache_read_input_tokens, 33732, 'usage 缓存字段原生透传');
+});
+
+test('passthrough: upstream error status and body forwarded verbatim', async (t) => {
+  const errBody = { type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } };
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(errBody));
+    });
+  });
+  const proxy = await ptProxy(upstream.port);
+  t.after(() => { upstream.close(); proxy.close(); });
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'pt-model', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(res.status, 429);
+  assert.deepEqual(await res.json(), errBody);
+});
+
+test('passthrough stream: restore across deltas, flush before stop, usage visible', async (t) => {
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      writeAnthSse(res, [
+        { type: 'message_start', message: { id: 'msg_s', type: 'message', role: 'assistant', model: 'upstream-model', content: [], usage: { input_tokens: 18, output_tokens: 0, cache_read_input_tokens: 33732 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '结果 [[CO-TEST-' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'CO-01]] 完成，尾巴还要足够长把切点推过占位符之后才行。' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 30 } },
+        { type: 'message_stop' },
+      ]);
+      res.end();
+    });
+  });
+  const proxy = await ptProxy(upstream.port);
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'pt-model', max_tokens: 128, stream: true,
+      messages: [{ role: 'user', content: '请分析示例集团控股有限公司' }],
+    }),
+  });
+  const events = anthEvents(await readText(res));
+  const textOut = events
+    .filter((e) => e.type === 'content_block_delta' && e.delta.type === 'text_delta')
+    .map((e) => e.delta.text).join('');
+  assert.equal(textOut, '结果 示例集团控股有限公司 完成，尾巴还要足够长把切点推过占位符之后才行。');
+  const types = events.map((e) => e.type);
+  assert.ok(types.lastIndexOf('content_block_delta') < types.indexOf('content_block_stop'),
+            '保留区尾巴必须在 content_block_stop 之前补发');
+  const ms = events.find((e) => e.type === 'message_start');
+  assert.equal(ms.message.usage.cache_read_input_tokens, 33732);
+  assert.ok(types.includes('message_stop'));
+});
+
+test('passthrough stream: parallel tool blocks intact, thinking restored, signature kept', async (t) => {
+  const args0 = JSON.stringify({ command: "ls /tmp/alpha && echo ALPHA-OK-123" });
+  const args1 = JSON.stringify({ command: "ls /tmp/betaa && echo BETA-OK-456" });
+  const split = (s, n) => [s.slice(0, n), s.slice(n, Math.floor((n + s.length) / 2)), s.slice(Math.floor((n + s.length) / 2))];
+  const upstream = await startServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const ev = [
+        { type: 'message_start', message: { id: 'msg_t', type: 'message', role: 'assistant', model: 'upstream-model', content: [], usage: { input_tokens: 5, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '先查 [[CO-TEST-' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'CO-01]] 的两个目录再汇总' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig-abc' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'call_a', name: 'Bash', input: {} } },
+      ];
+      for (const p of split(args0, 12)) ev.push({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: p } });
+      ev.push({ type: 'content_block_stop', index: 1 });
+      ev.push({ type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'call_b', name: 'Bash', input: {} } });
+      for (const p of split(args1, 9)) ev.push({ type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: p } });
+      ev.push({ type: 'content_block_stop', index: 2 });
+      ev.push({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 40 } });
+      ev.push({ type: 'message_stop' });
+      writeAnthSse(res, ev);
+      res.end();
+    });
+  });
+  const proxy = await ptProxy(upstream.port);
+  t.after(() => { upstream.close(); proxy.close(); });
+
+  const res = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'pt-model', max_tokens: 256, stream: true,
+      messages: [{ role: 'user', content: '查示例集团控股有限公司的目录' }],
+    }),
+  });
+  const events = anthEvents(await readText(res));
+  const starts = events.filter((e) => e.type === 'content_block_start');
+  assert.deepEqual(starts.map((e) => e.index), [0, 1, 2], '块序原样，无重复无重排');
+  const think = events.filter((e) => e.type === 'content_block_delta' && e.index === 0)
+    .map((e) => e.delta.thinking || '').join('');
+  assert.equal(think, '先查 示例集团控股有限公司 的两个目录再汇总');
+  assert.ok(events.some((e) => e.delta?.type === 'signature_delta' && e.delta.signature === 'sig-abc'),
+            'signature_delta 原样透传');
+  for (const [idx, id, args] of [[1, 'call_a', args0], [2, 'call_b', args1]]) {
+    const st = starts.find((e) => e.index === idx);
+    assert.equal(st.content_block.id, id);
+    const json = events.filter((e) => e.type === 'content_block_delta' && e.index === idx)
+      .map((e) => e.delta.partial_json || '').join('');
+    assert.deepEqual(JSON.parse(json), JSON.parse(args), `${id} 参数必须完整可解析`);
+  }
+});

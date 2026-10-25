@@ -229,7 +229,15 @@ def _parse_claude(line: str) -> dict | None:
         if ev.get("session_id"):
             out["session_id"] = ev["session_id"]
         usage = ev.get("usage") or {}
-        tok = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+        # cache 字段必须计入：直通模式（aigateway 原生 Anthropic 协议）下提示
+        # 缓存生效，input_tokens 只剩可变尾部（实测 34K→18），大头进
+        # cache_read_input_tokens。但**缓存读≠上下文变小**——resume 时那些
+        # token 仍占着窗口，avatar 的续跑上下文预算闸门（chain_tokens）要的
+        # 是上下文真值。翻译路径无 cache 字段，get 默认 0，向后兼容。
+        tok = (int(usage.get("input_tokens") or 0)
+               + int(usage.get("output_tokens") or 0)
+               + int(usage.get("cache_read_input_tokens") or 0)
+               + int(usage.get("cache_creation_input_tokens") or 0))
         if tok:
             out["tokens"] = tok
     return out or None

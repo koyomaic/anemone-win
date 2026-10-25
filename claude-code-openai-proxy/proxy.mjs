@@ -281,11 +281,19 @@ export function createProxy(config, deps = {}) {
       : '';
     const r = key ? config.routes[key] || {} : {};
     const base = r.baseURL || config.baseURL;
+    // mode:'anthropic' ＝上游原生说 Anthropic Messages 协议 → 直通转发（只做
+    // 就地脱敏/还原，不拆包重装）。2026-10-25 实测 aigateway.chambroad.com 原生
+    // Anthropic＋提示缓存可用（cache_read=33732 命中）；翻译层是当天两起切碎
+    // 事故的所在，直通后该 bug 类结构性消失。默认仍走 openai 翻译（30131 的
+    // /v1/messages 是半成品：Bearer 打过去回 OpenAI 格式，不可作直通目标）。
+    const mode = r.mode === 'anthropic' ? 'anthropic' : 'openai';
     return {
       name: key || 'default',
-      url: String(base).replace(/\/$/, '') + '/chat/completions',
+      url: String(base).replace(/\/$/, '')
+        + (mode === 'anthropic' ? '/messages' : '/chat/completions'),
       key: r.apiKey || config.apiKey,
       model: r.model || requested || config.model,
+      mode,
     };
   }
 
@@ -608,6 +616,157 @@ export function createProxy(config, deps = {}) {
     }
   }
 
+  // ── Anthropic 直通（mode:'anthropic' 路由）──
+  // 事件原样转发，只对 text_delta / input_json_delta / thinking_delta 的文本做
+  // 就地脱敏还原；每个内容块一个 StreamProcessor，**content_block_stop 就是协议
+  // 规定的刷新点**——不再需要翻译层那套"猜块何时结束"的收尾逻辑（2026-10-23
+  // 切碎事故的根源即在于此）。usage/cache 字段原生透传，claude-code 与 relay
+  // 记账直接可见缓存命中。
+  const PASSTHROUGH_DELTA_FIELDS = {
+    text_delta: 'text',
+    input_json_delta: 'partial_json',
+    thinking_delta: 'thinking',
+  };
+  const PASSTHROUGH_KIND_DELTA = {
+    text: 'text_delta',
+    tool_use: 'input_json_delta',
+    thinking: 'thinking_delta',
+  };
+
+  async function streamPassthrough(upstream, res, route, map) {
+    const startedAt = Date.now();
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    });
+    const forward = (data) =>
+      res.write(`event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
+    const blocks = new Map();          // index -> { kind, proc }
+    const usage = { input_tokens: 0, output_tokens: 0,
+                    cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    let stopped = false;
+
+    const flushBlock = (index) => {
+      const b = blocks.get(index);
+      if (!b) return;
+      if (b.proc) {
+        const rem = b.proc.flush();
+        const dt = PASSTHROUGH_KIND_DELTA[b.kind] || 'text_delta';
+        if (rem) {
+          forward({ type: 'content_block_delta', index,
+                    delta: { type: dt, [PASSTHROUGH_DELTA_FIELDS[dt]]: rem } });
+        }
+        logDlp(b.proc.state);
+      }
+      blocks.delete(index);
+    };
+
+    function handleEvent(d) {
+      switch (d.type) {
+        case 'message_start': {
+          const u = d.message?.usage || {};
+          for (const k of Object.keys(usage)) {
+            if (typeof u[k] === 'number') usage[k] = u[k];
+          }
+          forward(d);
+          return;
+        }
+        case 'content_block_start':
+          blocks.set(d.index, {
+            kind: d.content_block?.type || 'text',
+            proc: redactor ? createStreamProcessor(redactor, map) : null,
+          });
+          forward(d);
+          return;
+        case 'content_block_delta': {
+          const b = blocks.get(d.index);
+          const dt = d.delta?.type;
+          const field = PASSTHROUGH_DELTA_FIELDS[dt];
+          if (b && b.proc && field && typeof d.delta[field] === 'string'
+              && d.delta[field].length) {
+            const out = b.proc.push(d.delta[field]);
+            if (out) { d.delta[field] = out; forward(d); }
+            // 全被保留区扣下：本事件不转发，尾巴在 content_block_stop 前补发
+          } else {
+            forward(d);           // signature_delta 等原样过
+          }
+          return;
+        }
+        case 'content_block_stop':
+          flushBlock(d.index);    // 协议级刷新点：先补尾巴，再转发 stop
+          forward(d);
+          return;
+        case 'message_delta': {
+          const u = d.usage || {};
+          for (const k of Object.keys(usage)) {
+            if (typeof u[k] === 'number') usage[k] = u[k];
+          }
+          forward(d);
+          return;
+        }
+        case 'message_stop':
+          stopped = true;
+          forward(d);
+          return;
+        case 'error':
+          log('passthrough upstream error event:', JSON.stringify(d.error || {}).slice(0, 300));
+          forward(d);
+          return;
+        default:
+          forward(d);             // ping 及未来新事件类型一律原样过
+      }
+    }
+
+    try {
+      const reader = upstream.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith('data:')) continue;   // event: 行丢弃，转发时按 data.type 重建
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          let d;
+          try {
+            d = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          handleEvent(d);
+        }
+      }
+    } catch (e) {
+      log('passthrough stream error:', e.message);
+    } finally {
+      // 上游断流未发 message_stop：补齐收尾事件，避免 claude-code 挂等
+      // （与翻译路径 finally 的兜底语义一致）。
+      for (const index of [...blocks.keys()]) {
+        flushBlock(index);
+        forward({ type: 'content_block_stop', index });
+      }
+      if (!stopped) {
+        forward({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null },
+                  usage: { output_tokens: usage.output_tokens } });
+        forward({ type: 'message_stop' });
+      }
+      log('passthrough', JSON.stringify({
+        route: route.name, model: route.model,
+        ms: Number((Date.now() - startedAt).toFixed(1)),
+        inTok: usage.input_tokens, outTok: usage.output_tokens,
+        cacheRead: usage.cache_read_input_tokens,
+        cacheCreate: usage.cache_creation_input_tokens,
+      }));
+      res.end();
+    }
+  }
+
   async function streamOpenAi(upstream, res, map) {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
@@ -749,6 +908,63 @@ export function createProxy(config, deps = {}) {
     }
     if (!ensureRedaction(res, 'anthropic')) return;
     const route = resolveRoute(body.model);
+
+    // ── 直通分支：上游原生 Anthropic 协议，不翻译 ──
+    if (route.mode === 'anthropic') {
+      let redactedA;
+      const startedA = Date.now();
+      try {
+        redactedA = redactor
+          ? redactor.redactAnthropicBody(body)
+          : { body, map: null, state: null };
+        if (redactedA.state) {
+          logRedaction({ name: 'anthropic-passthrough', model: route.model },
+                       redactedA.state, startedA);
+        }
+      } catch (e) {
+        return failClosed(res, 'anthropic', e.message);
+      }
+      const ptBody = redactedA.body;
+      ptBody.model = route.model;
+      if (env.PROXY_DEBUG) {
+        fs.writeFileSync(`/tmp/claude_proxy_last_${config.port}.json`,
+                         JSON.stringify(ptBody, null, 2));
+      }
+      let upA;
+      try {
+        upA = await fetchImpl(route.url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-api-key': route.key,
+            authorization: 'Bearer ' + route.key,
+            'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
+          },
+          body: JSON.stringify(ptBody),
+        });
+      } catch (e) {
+        return sendJson(res, 502, {
+          type: 'error',
+          error: { type: 'api_error', message: 'upstream fetch failed: ' + e.message },
+        });
+      }
+      if (!upA.ok) {
+        const t = await upA.text();
+        log('upstream(anthropic)', upA.status, t.slice(0, 300));
+        // 错误体本就是 Anthropic 格式，原样透传（保真优先，不包装不掩盖）
+        res.writeHead(upA.status, { 'content-type': 'application/json' });
+        return res.end(t);
+      }
+      if (ptBody.stream) {
+        return await streamPassthrough(upA, res, route, redactedA.map);
+      }
+      const jA = await upA.json();
+      if (!redactor) return sendJson(res, 200, jA);
+      const processedA = redactor.processAnthropicResponse(jA, redactedA.map);
+      logDlp(processedA.state);
+      return sendJson(res, 200, processedA.json);
+    }
+
     let openaiBody = toOpenAI(body, route.model);
     const redacted = redactRequest(openaiBody, 'anthropic', res);
     if (!redacted) return;

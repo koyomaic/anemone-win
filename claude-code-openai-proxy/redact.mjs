@@ -396,6 +396,67 @@ function redactSchema(node, redactor, state, depth = 0) {
   return node;
 }
 
+// ── Anthropic 原生体（直通模式）──
+// 与 redactContentParts（OpenAI 体）同职责，但按 Anthropic 内容块语义处理：
+// text/thinking/tool_use/tool_result/image/document，其余字段（cache_control、
+// citations、signature 等）原样保留——cache_control 是提示缓存的断点标记，
+// 动了它缓存全灭；signature 动了网关可能验签失败。
+function redactAnthropicBlocks(parts, redactor, state) {
+  const out = [];
+  for (const part of parts || []) {
+    if (!part || typeof part !== 'object') {
+      out.push(redactUnknownValue(part, redactor, state));
+      continue;
+    }
+    if (part.type === 'text' && typeof part.text === 'string') {
+      out.push({ ...part, text: redactor.redactText(part.text, state) });
+      continue;
+    }
+    if (part.type === 'thinking' && typeof part.thinking === 'string') {
+      // 历史回放的 thinking 里是**还原后的真名**（响应方向还原给 claude-code 的），
+      // 上送前必须再脱敏；signature 原样保留（网关空签名不校验，改动反而引入风险）。
+      out.push({ ...part, thinking: redactor.redactText(part.thinking, state) });
+      continue;
+    }
+    if (part.type === 'tool_use' && part.input && typeof part.input === 'object') {
+      out.push({ ...part, input: redactUnknownValue(part.input, redactor, state) });
+      continue;
+    }
+    if (part.type === 'tool_result') {
+      const c = part.content;
+      if (typeof c === 'string') {
+        out.push({ ...part, content: redactor.redactText(c, state) });
+      } else if (Array.isArray(c)) {
+        out.push({ ...part, content: redactAnthropicBlocks(c, redactor, state) });
+      } else {
+        out.push({ ...part, content: redactUnknownValue(c, redactor, state) });
+      }
+      continue;
+    }
+    if (part.type === 'image' || part.type === 'document'
+      || part.type === 'input_audio' || part.type === 'file') {
+      out.push({ type: 'text', text: ATTACHMENT_BLOCKED_NOTE });
+      continue;
+    }
+    out.push(redactUnknownValue(part, redactor, state));
+  }
+  return out;
+}
+
+// 响应方向的深度字符串映射（还原/DLP）：与 redactUnknownValue 同构，但用
+// processText（还原）而非 redactText（脱敏）——工具参数 input 是对象，
+// 占位符藏在任意深度的字符串值里。
+function restoreUnknownValue(value, fn, depth = 0) {
+  if (typeof value === 'string') return fn(value);
+  if (Array.isArray(value)) return value.map((v) => restoreUnknownValue(v, fn, depth + 1));
+  if (value && typeof value === 'object' && depth < 12) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = restoreUnknownValue(v, fn, depth + 1);
+    return out;
+  }
+  return value;
+}
+
 export class Redactor {
   constructor(config = {}) {
     const mode = String(config.mode || REDACTION_MODE).toLowerCase();
@@ -529,7 +590,7 @@ export class Redactor {
     return { body, map: state.map, state };
   }
 
-  processOpenAiResponse(json, map) {
+    processOpenAiResponse(json, map) {
     const state = createState();
     const out = structuredClone(json);
     for (const choice of out.choices || []) {
@@ -542,6 +603,67 @@ export class Redactor {
         if (typeof args === 'string') tc.function.arguments = this.processText(args, map, state);
       }
       if (typeof choice?.text === 'string') choice.text = this.processText(choice.text, map, state);
+    }
+    return { json: out, state };
+  }
+
+  // ── 直通模式（Anthropic → Anthropic）──
+  // 请求体脱敏：system（string|blocks）、messages 内容块、tools 描述与 schema。
+  // 系统注记恒为**第一块**且文本恒定：脱敏是确定性的（固定 salt＋shortHash），
+  // 同一会话每轮的前缀逐字节相同 → 网关提示缓存可命中（2026-10-25 实测
+  // cache_read=33732）。cache_control 断点标记一律原位保留。
+  redactAnthropicBody(inputBody) {
+    this.ensureReady();
+    const state = createState();
+    const body = structuredClone(inputBody);
+    if (typeof body.system === 'string') {
+      body.system = body.system ? this.redactText(body.system, state) : body.system;
+    } else if (Array.isArray(body.system)) {
+      body.system = redactAnthropicBlocks(body.system, this, state);
+    }
+    if (Array.isArray(body.messages)) {
+      for (const msg of body.messages) {
+        if (!msg || typeof msg !== 'object') continue;
+        if (typeof msg.content === 'string') {
+          msg.content = this.redactText(msg.content, state);
+        } else if (Array.isArray(msg.content)) {
+          msg.content = redactAnthropicBlocks(msg.content, this, state);
+        }
+      }
+    }
+    for (const tool of body.tools || []) {
+      if (!tool || typeof tool !== 'object') continue;
+      if (typeof tool.description === 'string') {
+        tool.description = this.redactText(tool.description, state);
+      }
+      if (tool.input_schema) redactSchema(tool.input_schema, this, state);
+    }
+    const note = { type: 'text', text: REDACTION_SYSTEM_NOTE };
+    if (Array.isArray(body.system)) {
+      if (!body.system.some((b) => b && b.text === REDACTION_SYSTEM_NOTE)) {
+        body.system.unshift(note);
+      }
+    } else if (typeof body.system === 'string' && body.system) {
+      body.system = [note, { type: 'text', text: body.system }];
+    } else {
+      body.system = [note];
+    }
+    return { body, map: state.map, state };
+  }
+
+  processAnthropicResponse(json, map) {
+    const state = createState();
+    const out = structuredClone(json);
+    const fn = (s) => this.processText(s, map, state);
+    if (Array.isArray(out.content)) {
+      for (const block of out.content) {
+        if (!block || typeof block !== 'object') continue;
+        if (block.type === 'text' && typeof block.text === 'string') block.text = fn(block.text);
+        else if (block.type === 'thinking' && typeof block.thinking === 'string') block.thinking = fn(block.thinking);
+        else if (block.type === 'tool_use' && block.input && typeof block.input === 'object') {
+          block.input = restoreUnknownValue(block.input, fn);
+        }
+      }
     }
     return { json: out, state };
   }

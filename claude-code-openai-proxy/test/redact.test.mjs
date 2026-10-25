@@ -254,3 +254,73 @@ test('placeholder survives any delta granularity (single-bracket cut regression)
     assert.equal(out, want, `delta=${ds} 时占位符被切漏`);
   }
 });
+
+// ── Anthropic 原生体脱敏（直通模式，2026-10-25）──
+
+test('redactAnthropicBody covers all block kinds, keeps cache_control/signature', () => {
+  const r = makeRedactor();
+  const body = {
+    model: 'x', max_tokens: 10,
+    system: [{ type: 'text', text: '规则：服务示例集团控股有限公司', cache_control: { type: 'ephemeral' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '查示例集团' }] },
+      { role: 'assistant', content: [
+        { type: 'thinking', thinking: '用户要查示例集团控股有限公司', signature: 'sig-x' },
+        { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'echo 示例集团控股有限公司' } },
+      ] },
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'tu1', content: '示例集团控股有限公司 OK' },
+        { type: 'image', source: { type: 'base64', data: 'QUJD' } },
+      ] },
+    ],
+    tools: [{ name: 'Bash', description: '在示例集团环境执行',
+              input_schema: { type: 'object', properties: { command: { type: 'string', description: '示例集团命令' } } } }],
+  };
+  const out = r.redactAnthropicBody(body);
+  const s = JSON.stringify(out.body);
+  assert.ok(!s.includes('示例集团'), '任何块里都不得残留真名');
+  assert.ok(s.includes('[[CO-TEST-CO-01]]'));
+  assert.ok(out.body.system[0].text.includes('脱敏占位符'), '注记须为第一块');
+  assert.deepEqual(out.body.system[1].cache_control, { type: 'ephemeral' });
+  const th = out.body.messages[1].content[0];
+  assert.equal(th.type, 'thinking');
+  assert.equal(th.signature, 'sig-x', 'signature 必须原样保留');
+  assert.ok(out.body.messages[2].content.some(
+    (b) => b.type === 'text' && b.text.includes('attachment blocked')), '图片须替换为拦截注记');
+  assert.ok(out.body.tools[0].description.includes('[[CO-TEST-CO-01]]'));
+  // 注记幂等：二次脱敏不重复注入
+  const again = r.redactAnthropicBody(out.body);
+  const notes = again.body.system.filter((b) => (b.text || '').includes('脱敏占位符'));
+  assert.equal(notes.length, 1);
+});
+
+test('redactAnthropicBody handles string system and fail-closed residual', () => {
+  const r = makeRedactor();
+  const out = r.redactAnthropicBody({ model: 'x', system: '服务示例集团控股有限公司', messages: [] });
+  assert.ok(Array.isArray(out.body.system));
+  assert.ok(out.body.system[0].text.includes('脱敏占位符'));
+  assert.ok(JSON.stringify(out.body.system[1]).includes('[[CO-TEST-CO-01]]'));
+  // 词典不可用 → 抛错（上层 fail-closed 503）
+  const dead = new Redactor({ mode: 'strict', dictionary: '/nonexistent/x.json' });
+  assert.throws(() => dead.redactAnthropicBody({ messages: [] }), /dictionary unavailable/i);
+});
+
+test('processAnthropicResponse restores text/thinking/tool_use input', () => {
+  const r = makeRedactor();
+  const state = createState();
+  r.redactText('示例集团控股有限公司', state);
+  const out = r.processAnthropicResponse({
+    id: 'msg_x', type: 'message', role: 'assistant',
+    content: [
+      { type: 'thinking', thinking: '查到 [[CO-TEST-CO-01]] 的报价', signature: '' },
+      { type: 'text', text: '[[CO-TEST-CO-01]] 报价如下' },
+      { type: 'tool_use', id: 't1', name: 'Write', input: { path: '/tmp/a.txt', content: '致 [[CO-TEST-CO-01]]' } },
+    ],
+    usage: { input_tokens: 1, output_tokens: 2 },
+  }, state.map);
+  assert.equal(out.json.content[0].thinking, '查到 示例集团控股有限公司 的报价');
+  assert.equal(out.json.content[1].text, '示例集团控股有限公司 报价如下');
+  assert.equal(out.json.content[2].input.content, '致 示例集团控股有限公司');
+  assert.equal(out.json.content[2].input.path, '/tmp/a.txt');
+  assert.deepEqual(out.json.usage, { input_tokens: 1, output_tokens: 2 });
+});

@@ -83,6 +83,32 @@ chmod 600 config.json      # 里面有密钥，务必收紧权限
 }
 ```
 
+路由条目可加 `"mode": "anthropic"`：上游**原生说 Anthropic Messages 协议**时走
+直通转发（`{baseURL}/messages`，`x-api-key` 认证），代理只对
+`text_delta`/`input_json_delta`/`thinking_delta` 做就地脱敏还原，事件与
+`usage`（含 `cache_read_input_tokens`）原样透传，`content_block_stop` 即协议级
+刷新点。相比默认的 OpenAI 翻译路径：①`cache_control` 断点得以保留，**提示缓存
+可命中**（脱敏是确定性的，前缀逐字节稳定）；②不做块重构，翻译层的切碎类缺陷
+（2026-10-23 两起事故）结构性消失；③thinking 流不再被丢弃。默认（不写 mode）
+仍走 OpenAI 翻译，兼容 vLLM/new-api 等只说 OpenAI 协议的上游。
+
+```json
+{
+  "routes": {
+    "qwen3.8-flash": {
+      "baseURL": "https://your-anthropic-native-gateway/v1",
+      "apiKey": "sk-...",
+      "model": "qwen3.8-flash",
+      "mode": "anthropic"
+    }
+  }
+}
+```
+
+> 注意：`routes` 只认 **object-map** 格式；数组形式（`[{"match":[...]}]`）是
+> 无效配置，会被静默忽略、全部走默认上游（healthz 的 `routes` 字段显示 `"0"`
+> 即此症状）。
+
 ### 2. 运行
 
 前台试跑：

@@ -3,5 +3,13 @@
   "port": 8790,
   "baseURL": "https://your-openai-compatible-endpoint/v1",
   "apiKey": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "model": "your-model-name"
+  "model": "your-model-name",
+  "routes": {
+    "your-anthropic-native-model": {
+      "baseURL": "https://your-anthropic-native-gateway/v1",
+      "apiKey": "sk-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "model": "your-anthropic-native-model",
+      "mode": "anthropic"
+    }
+  }
 }
