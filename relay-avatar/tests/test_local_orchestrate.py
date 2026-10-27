@@ -181,9 +181,29 @@ def test_local_timeout_uses_heavy_budget_for_report_tasks(cfg, storage, audit,
                                                           policy, shared):
     local_ready(cfg, shared)
     ex = make_ex(cfg, storage, audit, policy)
-    assert ex.local_timeout("整理一下鲁大师智能体项目进度及使用情况报告") == 180
-    assert ex.local_timeout("鲁大师用户日度使用分析每日在此群播报") == 180
+    assert ex.local_timeout("整理一下鲁大师智能体项目进度及使用情况报告") == 300
+    assert ex.local_timeout("鲁大师用户日度使用分析每日在此群播报") == 300
     assert ex.local_timeout("今天有多少人跟鲁大师对话了") == 600
+
+
+def test_local_timeout_data_tasks_not_heavy(cfg, storage, audit, policy, shared):
+    """纯数据处理件（归档/解析/审核/数据表名）不得被误判 heavy 而只给短预算。
+
+    回归 2026-10-27：#1474/1492/1524/1541 四条数据/审核件被裸 html|模板、
+    每日…报告|计划 误命中 heavy（180s），全在 183~186s 触顶白烧后升级 relay。
+    收窄模式后它们应拿 normal 600s 预算。
+    """
+    local_ready(cfg, shared)
+    ex = make_ex(cfg, storage, audit, policy)
+    # 文档审核（引用 .html 原件）——非报告生成，应 normal
+    assert ex.local_timeout("对上面发送的2027年经营计划进行审核（.html 原件）") == 600
+    # 数据表归档（「每日计划量分配表」是数据文件名，非定时播报）——应 normal
+    assert ex.local_timeout("已收到《每日计划量分配表-6月.xlsx》，归档 D-22A 并补登记台账") == 600
+    # 价格表多日比对（数据解析）——应 normal
+    assert ex.local_timeout("比对最近两周每日计划量分配表的价格变化") == 600
+    # 反例：真正的报告生成/定时播报仍须 heavy
+    assert ex.local_timeout("生成一周市场研判报告，html 形式") == 300
+    assert ex.local_timeout("每日 07:50 播报日报到本群") == 300
 
 
 def test_parse_line_collects_partial_context():
