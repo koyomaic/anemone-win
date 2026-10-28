@@ -929,6 +929,7 @@ class Avatar:
         s["last_task_id"] = tid
         s.pop("review_followup_notified", None)
         s.pop("review_reprompt_count", None)
+        s.pop("review_result_sent", None)
         if s.get("followups"):
             self.sess.start_followup_window(s)
             log(f"{len(s['followups'])} followup(s) queued after review {outcome}")
@@ -2024,6 +2025,8 @@ class Avatar:
                 s["review_reprompt_count"] = 0
                 self._send_result(s, row, prefix="👀 办完了，等你过目"
                                                  "（回复「确认」完成 /「冲突」标记文件冲突）")
+                # 记住"结果已随 review 送达"，供 _finish 在超时自动 done 时静默收尾。
+                s["review_result_sent"] = tid
                 self.st.archive_round(tid, "review",
                                       {"result": (row.get("result") or "")[:500]})
                 continue
@@ -3384,6 +3387,16 @@ class Avatar:
                            + ("" if g else f" err={e[:80]}"),
                            backend="relay", task_id=tid)
 
+    @staticmethod
+    def _stale_auto_done(row: dict) -> bool:
+        """是否 relay 清扫把 review 挂起单自动置 done。
+
+        标记由 relay `sweep_stale` → `db.mark_stale_done` 写入，文案固定为
+        「超时自动done」。用子串匹配而非全等：relay 侧将来若在标记后追加停留时长
+        等上下文，这里不至于漏判而重新变成深夜推送。
+        """
+        return "超时自动done" in (row.get("error") or "")
+
     def _finish(self, s: dict, row: dict):
         tid = row.get("id")
         status = row.get("status")
@@ -3391,7 +3404,24 @@ class Avatar:
             "result": (row.get("result") or "")[:500],
             "error": row.get("error")})
         if status == "done":
-            self._send_result(s, row)
+            if self._stale_auto_done(row) and s.get("review_result_sent") == tid:
+                # review 挂起超时被 relay 清扫自动 done：这只是**状态闭环**，结果
+                # 早在进 review 那一刻就随卡片定格 + 附件送达了。此处再走
+                # _send_result 会发一条全新真实消息（card_biz 已被 _card_final
+                # pop 掉，无卡可更新），等于把同一份报告在 8 小时后重推一遍——
+                # 而 RELAY_STALE_TIMEOUT_HOURS 按 created_at 起算，下午提交的任务
+                # 必然在深夜到期。2026-10-27 #475：马文文 15:57 已收到大脑资产
+                # 盘点全文与 HTML 附件，23:58 又收到一条「办好了 ✅」，以为是
+                # 幽灵回复。历史 21 单超时自动 done 里 10 单落在 22:00–07:00。
+                # 仅在"确实送达过 review 结果"时静默；标志缺失（进程重启丢会话、
+                # 或 review 那次投递失败）则照常发送——宁可重复，不可吞结果。
+                # 收尾仍照做：ack 表情换成 done、链路记账、会话回 IDLE。
+                self.audit.log(
+                    "auto_done_silent", str(s.get("uid") or ""),
+                    f"#{tid} review 结果此前已送达，超时自动done 不重复推送",
+                    backend=s.get("card_backend", ""), task_id=tid)
+            else:
+                self._send_result(s, row)
             self._swap_ack(s, "done_text_emotion")
             s["last_task_id"] = tid
             self.sess.note_chain(s, row.get("tokens"), self._chain_digest(row),
@@ -3432,6 +3462,7 @@ class Avatar:
         self._local_progress.pop(s.get("key") or "", None)
         s.pop("review_followup_notified", None)
         s.pop("review_reprompt_count", None)
+        s.pop("review_result_sent", None)
         if s.get("followups"):
             self.sess.start_followup_window(s)
             log(f"{len(s['followups'])} followup(s) queued")

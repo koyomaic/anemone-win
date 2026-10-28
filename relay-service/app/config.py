@@ -128,6 +128,29 @@ DEFAULT_AUTO_DONE_PREFIXES = [
     "shared/_upgrade-backup/",
 ]
 
+# 「再生型固定名产物」豁免名单（fnmatch，匹配工作区相对路径）。
+#
+# 为什么需要：auto_done_reason 原本只要 scan 里有 modified 就一律退回 review，
+# 而报告类技能按约定还会写一份**固定名指针件**（shared/report/<job>/latest.html
+# ＝「最新版」入口）。它每轮必然被覆盖 → 每轮都算 modified → 每轮都进 review 等
+# 人确认。2026-10-27 #475（大脑资产盘点）即如此：15:57 办完、结果随卡片定格与
+# 附件当场送达，只因 latest.html 是覆盖而非新建就挂进 review；发起人没回「确认」，
+# 8 小时后（RELAY_STALE_TIMEOUT_HOURS=8，阈值按 created_at 起算）被清扫自动 done，
+# 23:58 又给用户推了一遍全文——深夜幽灵回复。历史 21 单超时自动 done 里 10 单
+# 落在 22:00–07:00。
+#
+# 边界（刻意收窄）：
+#   · 只豁免 latest.* 这类「每轮重写的最新版指针」，且必须**全部** modified 命中；
+#     任何其它 modified、任何 deleted、跨任务冲突、只读覆盖仍照旧退回人工核查。
+#   · 只作用于「是否自动 done」，不改冲突判定——豁免件仍进 changed_files、仍参与
+#     撞车检测（与 volatile 的区别：volatile 是彻底不算产出）。
+#   · 台账类累积件（如 shared/report/<job>/ledger.md）虽也每轮重写，但内容是实质
+#     记录，默认**不**豁免；确有需要逐机用 RELAY_AUTO_DONE_MODIFIED_OK 追加。
+DEFAULT_AUTO_DONE_MODIFIED_OK = [
+    "shared/report/latest.*",
+    "shared/report/*/latest.*",   # fnmatch 的 * 跨 /，故 asset-map/latest.html 及更深层均命中
+]
+
 # claude 引擎默认禁用的内置工具（透传为 --disallowedTools）。
 #
 # 为什么需要：claude-code 默认挂 26 个工具 + 63 个 slash command + 5 个 agent，
@@ -201,6 +224,20 @@ def _auto_done_prefixes_from_env() -> list[str]:
             continue
         out.append(p if p.endswith("/") else p + "/")
     return out
+
+
+def _auto_done_modified_ok_from_env() -> list[str]:
+    """RELAY_AUTO_DONE_MODIFIED_OK：逗号分隔的 fnmatch 模式。
+
+    未设 → 用 DEFAULT_AUTO_DONE_MODIFIED_OK；显式设 `none`/`-`/`off` → 空列表
+    （＝不豁免任何 modified，回到「有修改就进 review」的旧行为）。
+    """
+    raw = os.environ.get("RELAY_AUTO_DONE_MODIFIED_OK", "").strip()
+    if not raw:
+        return list(DEFAULT_AUTO_DONE_MODIFIED_OK)
+    if raw.lower() in ("none", "-", "off"):
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
 
 def _claude_disallowed_tools_from_env() -> list[str]:
@@ -334,6 +371,8 @@ class Settings:
     # 低风险产出自动 done：on/off。off 时恢复旧行为——任何实质文件产出都进 review。
     auto_done_mode: str = "on"
     auto_done_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_AUTO_DONE_PREFIXES))
+    # 再生型固定名产物豁免：modified 全部命中时不阻塞自动 done（见 DEFAULT_AUTO_DONE_MODIFIED_OK）
+    auto_done_modified_ok: list[str] = field(default_factory=lambda: list(DEFAULT_AUTO_DONE_MODIFIED_OK))
     # 单任务新建文件数上限。超过即认为批量写入风险上升，仍走人工 review。
     auto_done_max_files: int = 200
     conflict_window_hours: float = 24.0  # 同文件冲突判定的时间窗；窗外的先后写入属正常演进，不算冲突
@@ -424,6 +463,7 @@ class Settings:
             volatile_patterns=_volatile_patterns_from_env(),
             auto_done_mode=os.environ.get("RELAY_AUTO_DONE_MODE", "on").strip().lower(),
             auto_done_prefixes=_auto_done_prefixes_from_env(),
+            auto_done_modified_ok=_auto_done_modified_ok_from_env(),
             auto_done_max_files=int(os.environ.get("RELAY_AUTO_DONE_MAX_FILES", "200")),
             conflict_window_hours=float(os.environ.get("RELAY_CONFLICT_WINDOW_HOURS", "24")),
             relay_exclude_providers=[p.strip() for p in os.environ.get("RELAY_EXCLUDE_PROVIDERS", "").split(",") if p.strip()],

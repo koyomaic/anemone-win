@@ -51,6 +51,7 @@ systemd 按序加载，**后者覆盖前者**：
 | RELAY_APPROVAL_TIMEOUT_MINUTES | 60 | pending_approval 停留超时 → 自动 failed |
 | RELAY_AUTO_DONE_MODE | on | 低风险新建产出自动 done（off 恢复“有产出即 review”） |
 | RELAY_AUTO_DONE_PREFIXES | shared/report/,shared/tmp/,shared/data/,shared/_sync/,shared/_migrate/,shared/_inventory/,shared/_upgrade-backup/ | 允许自动 done 的新建文件前缀（逗号分隔） |
+| RELAY_AUTO_DONE_MODIFIED_OK | shared/report/latest.*,shared/report/*/latest.* | 「再生型固定名产物」豁免（fnmatch，逗号分隔）：被**修改**的既有文件全部命中时不阻塞自动 done；`none` 关闭豁免 |
 | RELAY_AUTO_DONE_MAX_FILES | 200 | 单任务新建文件数超过该值仍走 review |
 | RELAY_SWEEP_INTERVAL_SEC | 300 | 超时清扫周期（秒） |
 | RELAY_BLOCKED_PATTERNS | 核心清单(见下) | 高危命令拦截正则（逗号分隔，覆盖默认） |
@@ -149,8 +150,8 @@ team_agent.py approve 42 --decision approve   # pending_approval（高危拦截�
 
 **三类自动 done（减少人工待办）**：
 - **只读自动 done**：执行完且**无任何共享文件改动** → 直接 `done`（备注"自动done（只读，无文件改动）"），不落 review；
-- **低风险新建产出自动 done**：执行完**仅新建**文件、无修改/删除、无跨任务冲突、无越界任务号、有结果文本，且全部新建文件落在 `RELAY_AUTO_DONE_PREFIXES` 下 → 直接 `done`（备注"自动done（低风险新建产出 N 个，无需人工确认）"）；
-- **超时自动 done**：`review` 停留超过 `RELAY_STALE_TIMEOUT_HOURS`（默认 24h）→ 后台清扫置 `done` 并备注"超时自动done"。`pending_approval` 停留超过 `RELAY_APPROVAL_TIMEOUT_MINUTES`（默认 60min）→ 置 `failed`，不会误标完成。
+- **低风险新建产出自动 done**：执行完**仅新建**文件、无修改/删除、无跨任务冲突、无越界任务号、有结果文本，且全部新建文件落在 `RELAY_AUTO_DONE_PREFIXES` 下 → 直接 `done`（备注"自动done（低风险新建产出 N 个，无需人工确认）"）；被修改的既有文件若**全部**命中 `RELAY_AUTO_DONE_MODIFIED_OK`（`latest.html` 这类每轮重写的「最新版」指针件）同样放行，备注追加"再生件重写 N 个"——豁免只影响是否自动 done，这些文件仍进 `changed_files`、仍参与冲突判定；
+- **超时自动 done**：`review` 停留超过 `RELAY_STALE_TIMEOUT_HOURS`（默认 24h，本机 8h）→ 后台清扫置 `done` 并备注"超时自动done"（阈值按 `created_at` 起算，故下午提交的任务会在当夜到期）。这只是**状态闭环**：结果早在进 review 时已由分身送达，分身侧对该标记静默收尾、不再重推全文（见 relay-avatar `_finish`）。`pending_approval` 停留超过 `RELAY_APPROVAL_TIMEOUT_MINUTES`（默认 60min）→ 置 `failed`，不会误标完成。
 
 ## 并行不打架（无 git 版）
 

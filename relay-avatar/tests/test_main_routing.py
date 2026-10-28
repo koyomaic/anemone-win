@@ -932,6 +932,73 @@ def test_approval_reprompt_not_capped_by_review_max(avatar):
                for t in texts(avatar)) == 3
 
 
+# ── review 超时自动 done：静默收尾，不重推全文 ────────────────────
+# 2026-10-27 #475 实测：马文文 15:56 提交「大脑资产」，15:57 办完进 review，
+# 结果随卡片定格 + HTML 附件当场送达；她没回「确认」，relay 清扫按
+# RELAY_STALE_TIMEOUT_HOURS=8（阈值从 created_at 起算）在 23:58 自动置 done，
+# 分身见终态又发了一条全新「办好了 ✅」全文——深夜幽灵回复。历史 21 单超时
+# 自动 done 里 10 单落在 22:00–07:00。自动 done 只是状态闭环，不该再推一遍。
+
+def _audit_rows(avatar):
+    try:
+        with open(avatar.audit.file, encoding="utf-8") as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def _mark_stale_done(avatar, tid):
+    avatar.exec_relay.tasks[tid] = {"id": tid, "status": "done",
+                                    "error": "超时自动done",
+                                    "result": "复核结果", "tokens": 10}
+
+
+def test_stale_auto_done_after_review_is_silent(avatar):
+    s, tid = _start_review(avatar, "130")
+    assert s["review_result_sent"] == tid          # review 那次投递已记账
+    assert any("等你过目" in t for t in texts(avatar))
+    avatar.dws.sent.clear()
+    _mark_stale_done(avatar, tid)
+    avatar._poll_sessions()
+    assert s["state"] == "IDLE" and s["last_task_id"] == tid
+    assert not avatar.dws.sent                     # 8 小时后不再推全文
+    assert s.get("review_result_sent") is None     # 标志随收尾清理
+    assert any(r["action"] == "auto_done_silent" and r["task_id"] == tid
+               for r in _audit_rows(avatar))
+
+
+def test_stale_auto_done_without_prior_delivery_still_sends(avatar):
+    """标志缺失（进程重启丢会话／review 那次没投出去）→ 照常发送。
+
+    宁可重复推送，也不能把结果吞掉：静默的前提是"确实已送达过"。
+    """
+    s, tid = _start_review(avatar, "131")
+    s.pop("review_result_sent")
+    avatar.dws.sent.clear()
+    _mark_stale_done(avatar, tid)
+    avatar._poll_sessions()
+    assert any("复核结果" in t for t in texts(avatar))
+    assert not any(r["action"] == "auto_done_silent" for r in _audit_rows(avatar))
+
+
+def test_regular_done_after_review_still_sends(avatar):
+    """非超时自动 done（如人工确认后 relay 置 done）不受静默影响。"""
+    s, tid = _start_review(avatar, "132")
+    avatar.dws.sent.clear()
+    avatar.exec_relay.tasks[tid] = {"id": tid, "status": "done", "error": "",
+                                    "result": "复核结果", "tokens": 10}
+    avatar._poll_sessions()
+    assert any("复核结果" in t for t in texts(avatar))
+
+
+def test_stale_auto_done_marker_matches_with_extra_context(avatar):
+    """relay 侧将来在标记后追加停留时长等上下文，仍要认得出来。"""
+    assert avatar._stale_auto_done({"error": "超时自动done"})
+    assert avatar._stale_auto_done({"error": "超时自动done（停留 8.0h）"})
+    assert not avatar._stale_auto_done({"error": "自动done（低风险新建产出 1 个）"})
+    assert not avatar._stale_auto_done({})
+
+
 # ── 聚合缓冲兜底：控制关键词不是需求 ──────────────────────────────
 # #150 实测：三条被吞进 followups 的「进度」，在上一件任务结束时被刷成
 # desc="进度\n\n进度\n\n进度" 的真任务——白占一个槽位，还回了一段莫名其妙的话。

@@ -701,28 +701,45 @@ def auto_done_reason(cfg: Settings, row: dict, scan: dict, result_text: str,
     盘点文件的任务等人确认。新策略只放行**新增**且全部落在低风险前缀下的产出；
     修改/删除既有文件、跨任务冲突、只读覆盖、越界任务号、批量过大、无结果文本
     仍保留人工核查。
+
+    唯一例外（2026-10-28）：modified 全部命中 auto_done_modified_ok 的「再生型
+    固定名产物」（latest.html 这类每轮重写的最新版指针）不阻塞自动 done。此前
+    报告类技能因为顺带覆盖一次 latest.html 就整单挂进 review，无人确认则 8h 后
+    被清扫自动 done，终态推送往往落在深夜（#475：15:57 办完、23:58 重推全文）。
+    豁免只影响「是否自动 done」，不改冲突判定：这些文件仍进 changed_files。
     """
     if getattr(cfg, "auto_done_mode", "off") != "on":
         return ""
     if real_conflicts or ro_overwritten:
         return ""
-    if scan.get("modified") or scan.get("deleted"):
+    if scan.get("deleted"):
         return ""
+    modified = scan.get("modified") or []
+    mod_ok = getattr(cfg, "auto_done_modified_ok", []) or []
+    regen = [rel for rel in modified if match_any(rel, mod_ok)]
+    if len(regen) != len(modified):
+        return ""            # 有任何非豁免的既有文件被改 → 保留人工核查
     if scan.get("foreign"):
         return ""
     created = scan.get("created") or []
-    if not created:
+    if not created and not regen:
         return ""
     max_files = int(getattr(cfg, "auto_done_max_files", 0) or 0)
-    if max_files > 0 and len(created) > max_files:
+    if max_files > 0 and len(created) + len(regen) > max_files:
         return ""
     if not (result_text or "").strip():
         return ""
     prefixes = getattr(cfg, "auto_done_prefixes", []) or []
     if not all(_prefix_match(rel, prefixes) for rel in created):
         return ""
-    kind = "只读任务新建低风险产出" if row.get("read_only") else "低风险新建产出"
-    return f"自动done（{kind} {len(created)} 个，无需人工确认）"
+    if created:
+        kind = "只读任务新建低风险产出" if row.get("read_only") else "低风险新建产出"
+        head = f"{kind} {len(created)} 个"
+        if regen:
+            head += f" + 再生件重写 {len(regen)} 个"
+    else:
+        head = f"仅再生件重写 {len(regen)} 个"
+    return f"自动done（{head}，无需人工确认）"
 
 
 def _session_if_same_engine(task_row: dict | None, engine: str) -> str | None:
@@ -736,7 +753,7 @@ def _session_if_same_engine(task_row: dict | None, engine: str) -> str | None:
     if not sid:
         return None
     return sid if (task_row.get("engine") or "opencode") == engine else None
-from .workspace import Workspace
+from .workspace import Workspace, match_any
 
 
 def build_prompt(row: dict, cfg: Settings) -> str:

@@ -4,8 +4,10 @@ import os
 
 import httpx
 
-from app.config import DEFAULT_AUTO_DONE_PREFIXES, Settings
+from app.config import (DEFAULT_AUTO_DONE_MODIFIED_OK, DEFAULT_AUTO_DONE_PREFIXES,
+                        Settings)
 from app.main import _prefix_match, auto_done_reason
+from app.workspace import match_any
 from conftest import submit, wait_task
 
 
@@ -86,6 +88,111 @@ def test_default_auto_done_prefixes_cover_report_tmp_and_system_dirs():
         assert not _prefix_match(rel, DEFAULT_AUTO_DONE_PREFIXES), rel
 
 
+# ── 再生型固定名产物豁免（2026-10-27 #475 深夜幽灵回复）──────────
+# 报告类技能每轮都会覆盖一次「最新版」指针件（shared/report/<job>/latest.html）。
+# 它算 modified，旧逻辑一律退回 review；无人确认则 8h 后被清扫自动 done，终态
+# 推送落在深夜。豁免只放行这类指针件，且必须全部 modified 命中。
+
+def test_default_modified_ok_covers_only_latest_pointers():
+    for rel in ("shared/report/latest.html", "shared/report/asset-map/latest.html",
+                "shared/report/asset-map/latest.json",
+                "shared/report/a/b/latest.md"):
+        assert match_any(rel, DEFAULT_AUTO_DONE_MODIFIED_OK), rel
+    for rel in ("shared/report/asset-map/ledger.md",          # 台账＝实质记录，不豁免
+                "shared/report/asset-map/asset-map-20261027.html",
+                "shared/knowledge/latest.md",                 # 名单外目录
+                "shared/skills/a/latest.py",
+                "shared/report/asset-map/latest",             # 无扩展名
+                "shared/report/asset-map/mylatest.html"):     # 不是固定名 latest
+        assert not match_any(rel, DEFAULT_AUTO_DONE_MODIFIED_OK), rel
+
+
+def test_auto_done_reason_exempts_regenerative_latest_pointer():
+    cfg = _cfg()
+    row = {"id": 475, "read_only": False}
+    reason = auto_done_reason(
+        cfg, row,
+        _scan(created=["shared/report/asset-map/asset-map-20261027-155713.html"],
+              modified=["shared/report/asset-map/latest.html"]),
+        "ok", [], [])
+    assert reason and "低风险新建产出 1 个" in reason and "再生件重写 1 个" in reason
+
+
+def test_auto_done_reason_regen_only_without_new_files():
+    cfg = _cfg()
+    row = {"id": 1, "read_only": False}
+    reason = auto_done_reason(
+        cfg, row, _scan(modified=["shared/report/asset-map/latest.html"]), "ok", [], [])
+    assert reason and "仅再生件重写 1 个" in reason
+
+
+def test_auto_done_reason_still_review_for_non_exempt_modified():
+    cfg = _cfg()
+    row = {"id": 1, "read_only": False}
+    # 台账/正文类既有文件被改 → 照旧人工核查
+    assert not auto_done_reason(
+        cfg, row,
+        _scan(created=["shared/report/a.md"],
+              modified=["shared/report/campus-interview-room-2027/ledger.md"]),
+        "ok", [], [])
+    # 豁免名单外目录即使命中 latest.* 也不放行
+    assert not auto_done_reason(
+        cfg, row, _scan(modified=["shared/knowledge/latest.md"]), "ok", [], [])
+    # 混合：一个豁免 + 一个不豁免 → 不放行（必须全部命中）
+    assert not auto_done_reason(
+        cfg, row,
+        _scan(created=["shared/report/a.md"],
+              modified=["shared/report/j/latest.html", "shared/report/j/ledger.md"]),
+        "ok", [], [])
+
+
+def test_auto_done_reason_exempt_modified_keeps_other_gates():
+    cfg = _cfg()
+    row = {"id": 1, "read_only": False}
+    scan = _scan(created=["shared/report/a.md"],
+                 modified=["shared/report/j/latest.html"])
+    # 删除既有文件仍拦
+    assert not auto_done_reason(
+        cfg, row, _scan(created=["shared/report/a.md"],
+                        modified=["shared/report/j/latest.html"],
+                        deleted=["shared/tmp/b.md"]), "ok", [], [])
+    # 跨任务冲突仍拦
+    assert not auto_done_reason(cfg, row, scan, "ok",
+                                [{"file": "shared/report/a.md"}], [])
+    # 只读覆盖仍拦
+    assert not auto_done_reason(cfg, row, scan, "ok", [], ["shared/report/a.md"])
+    # 无结果文本仍拦
+    assert not auto_done_reason(cfg, row, scan, "", [], [])
+    # 越界任务号仍拦（豁免件本身带别的任务号）
+    assert not auto_done_reason(
+        cfg, row, _scan(created=["shared/report/a.md"],
+                        modified=["shared/report/j/latest.html"],
+                        foreign=[("shared/report/j/latest.html", 999)]), "ok", [], [])
+    # 总文件数（新建 + 再生）超限仍拦
+    assert not auto_done_reason(_cfg(auto_done_max_files=1), row, scan, "ok", [], [])
+    assert auto_done_reason(_cfg(auto_done_max_files=2), row, scan, "ok", [], [])
+
+
+def test_auto_done_modified_ok_can_be_disabled():
+    row = {"id": 1, "read_only": False}
+    scan = _scan(created=["shared/report/a.md"],
+                 modified=["shared/report/j/latest.html"])
+    assert not auto_done_reason(_cfg(auto_done_modified_ok=[]), row, scan, "ok", [], [])
+    assert auto_done_reason(_cfg(), row, scan, "ok", [], [])
+
+
+def test_auto_done_modified_ok_from_env(monkeypatch):
+    from app.config import _auto_done_modified_ok_from_env
+    monkeypatch.delenv("RELAY_AUTO_DONE_MODIFIED_OK", raising=False)
+    assert _auto_done_modified_ok_from_env() == DEFAULT_AUTO_DONE_MODIFIED_OK
+    monkeypatch.setenv("RELAY_AUTO_DONE_MODIFIED_OK", "none")
+    assert _auto_done_modified_ok_from_env() == []
+    monkeypatch.setenv("RELAY_AUTO_DONE_MODIFIED_OK",
+                       "shared/report/*/ledger.md, shared/tmp/*")
+    assert _auto_done_modified_ok_from_env() == ["shared/report/*/ledger.md",
+                                                 "shared/tmp/*"]
+
+
 def _fake_relay(relay_factory, tmp_path, script: str, **overrides) -> dict:
     p = tmp_path / "agent.sh"
     p.write_text(script)
@@ -157,6 +264,44 @@ def test_modified_safe_file_still_review(relay_factory, tmp_path):
     t = wait_task(r["base"], tok, submit(r["base"], tok, "改报告")["task_id"], timeout=60)
     assert t["status"] == "review", t
     assert t["changed_files"] == ["shared/report/existing.md"], t
+
+
+LATEST_POINTER_AGENT = """#!/bin/sh
+mkdir -p ../../shared/report/asset-map
+printf 'v2-%s\\n' "$(date +%s%N)" > ../../shared/report/asset-map/asset-map-v2.html
+printf 'v2-%s\\n' "$(date +%s%N)" > ../../shared/report/asset-map/latest.html
+printf '%s\\n' '{"type":"text","sessionID":"ses_latest","part":{"type":"text","text":"done"}}'
+printf '%s\\n' '{"type":"step_finish","sessionID":"ses_latest","part":{"tokens":{"total":5},"cost":0}}'
+exit 0
+"""
+
+
+def _seed_latest(r) -> None:
+    latest = r["ws"] / "shared" / "report" / "asset-map" / "latest.html"
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    latest.write_text("v1\n", encoding="utf-8")
+
+
+def test_regenerative_latest_pointer_auto_done(relay_factory, tmp_path):
+    """#475 复现：新建报告 + 覆盖 latest.html → 当场 done，不再挂 review。"""
+    r = _fake_relay(relay_factory, tmp_path, LATEST_POINTER_AGENT)
+    _seed_latest(r)
+    tok = _token(r)
+    t = wait_task(r["base"], tok, submit(r["base"], tok, "大脑资产")["task_id"], timeout=60)
+    assert t["status"] == "done", t
+    assert "再生件重写 1 个" in t["error"], t
+    # 豁免只影响是否自动 done：latest.html 仍进 changed_files（冲突判定不放松）
+    assert set(t["changed_files"]) == {"shared/report/asset-map/asset-map-v2.html",
+                                       "shared/report/asset-map/latest.html"}, t
+
+
+def test_latest_pointer_exemption_can_be_turned_off(relay_factory, tmp_path):
+    r = _fake_relay(relay_factory, tmp_path, LATEST_POINTER_AGENT,
+                    auto_done_modified_ok=[])
+    _seed_latest(r)
+    tok = _token(r)
+    t = wait_task(r["base"], tok, submit(r["base"], tok, "大脑资产")["task_id"], timeout=60)
+    assert t["status"] == "review", t
 
 
 MIXED_AGENT = """#!/bin/sh

@@ -29,12 +29,17 @@ def is_runtime_dir(dirpath: str, name: str) -> bool:
     return os.path.isfile(os.path.join(dirpath, name, "pyvenv.cfg"))
 
 
+def match_any(rel: str, patterns: list[str]) -> bool:
+    """路径是否命中任一 fnmatch 模式（`*` 跨 `/`，与 is_volatile 同一套语义）。"""
+    return any(fnmatch.fnmatchcase(rel, p) for p in patterns or [])
+
+
 def is_volatile(rel: str, patterns: list[str]) -> bool:
     """路径是否属工具自动重写的运行时产物（凭据/token 缓存、备份文件等）。
 
     这类改动不是任务产出：不计入 changed_files，也不参与冲突判定。
     """
-    return any(fnmatch.fnmatchcase(rel, p) for p in patterns)
+    return match_any(rel, patterns)
 
 
 # 产出文件名里的任务号段（AGENTS.md 命名约定：<YYYYMMDD>_<taskId>_<topic>_v<N>.<ext>）
