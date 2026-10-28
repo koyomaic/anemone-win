@@ -612,9 +612,37 @@ class Executor:
             return self.cfg.agent_bin
         return "opencode" if self.cfg.engine == "opencode" else "claude"
 
+    # opencode `run --standalone` 特性探测缓存：bin 路径 → 是否支持（进程级）。
+    # 2.2.0+ 才有该 flag；旧版传了会 usage 退出，故必须探测而非硬编码。
+    _standalone_ok_cache: dict[str, bool] = {}
+
+    def _opencode_standalone_ok(self) -> bool:
+        b = self._bin()
+        hit = self._standalone_ok_cache.get(b)
+        if hit is not None:
+            return hit
+        ok = False
+        try:
+            p = subprocess.run([b, "run", "--help"], capture_output=True,
+                               text=True, timeout=10)
+            ok = "--standalone" in ((p.stdout or "") + (p.stderr or ""))
+        except (OSError, subprocess.SubprocessError):
+            ok = False  # 探测失败按旧版处理：不加 flag，行为与历史一致
+        type(self)._standalone_ok_cache[b] = ok
+        return ok
+
     def build_cmd(self, workdir: str, prompt: str, resume_session: str | None) -> list[str]:
         if self.cfg.engine == "opencode":
-            cmd = [self._bin(), "run", "--format", "json", "--auto", "--dir", workdir]
+            # 工作目录由 spawn 的 cwd=workdir 决定（见 run() 的 subprocess 参数），不传 --dir：
+            # opencode 2.2.0 移除了 `run --dir`（directory 改为顶层位置参数），带上会打印
+            # usage 立即退出、任务 0.2s 即 failed（2026-10-28 机队门禁事故根因之一）。
+            cmd = [self._bin(), "run", "--format", "json", "--auto"]
+            # 2.2.0 起改为「托管服务」架构：默认在固定端口(49374)拉起后台服务，任务
+            # 沙箱（全新 HOME/XDG）与既有实例端口冲突即 failed，且并发任务互撞——
+            # --standalone 用私有 server 绕开（同事故根因之二）。旧版无此 flag，
+            # 按 run --help 输出做进程级缓存的特性探测，两代 CLI 都兼容。
+            if self._opencode_standalone_ok():
+                cmd.append("--standalone")
             if self.cfg.model:
                 cmd += ["-m", self.cfg.model]
             if resume_session:
