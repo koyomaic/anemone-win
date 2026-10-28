@@ -1,4 +1,5 @@
 """tests/test_plans.py —— 大脑 ```plan 标记 → relay-avatar 带凭据执行（创建/列表/删除/启停）。"""
+import hashlib
 import json
 import time
 
@@ -961,4 +962,45 @@ def test_plan_health_scan_flags_legacy_no_delivery(avatar, cfg):
     state = avatar._plan_health_state()
     assert "1" in state and "2" not in state and "3" not in state
     assert any("定时计划投递体检" in c for _, c in avatar.dws.sent)
+
+
+def test_plan_health_scan_exempts_host_side_sender_wording(avatar, cfg):
+    """描述已写明「投递不由本任务负责」的计划不该告警。
+
+    原豁免只认字面「禁止自行 dws」，而新能源机 #6 写的是「不发群，发群由宿主机
+    发送器负责」「严禁执行任何 dws 发送命令」「发到群由宿主机 usage-report-send.timer
+    自动完成」——语义正是豁免，却因措辞不同被连日误报（2026-10-24/26/28 各一次）。
+    """
+    cfg._p.setdefault("monitor", {}).update(alert_to="20102")
+    _add_plan(avatar, 1, "宿主机发送器型",
+              action={"type": "task",
+                      "description": "【每日·渲染落盘（不发群，发群由宿主机发送器负责）】"
+                                     "严禁执行任何 dws 发送命令；发到钉钉群由宿主机 "
+                                     "usage-report-send.timer（08:30）自动完成"})
+    _add_plan(avatar, 2, "真问题型",
+              action={"type": "task", "description": "每日发送到中鲁群"})
+    avatar._plan_health_next = 0
+    avatar._scan_plan_health()
+    state = avatar._plan_health_state()
+    assert "1" not in state and "2" in state
+    assert not any("宿主机发送器型" in c for _, c in avatar.dws.sent)
+
+
+def test_plan_health_sig_is_stable_digest(avatar, cfg):
+    """sig 必须跨进程稳定，否则 repeat_sec 形同虚设。
+
+    str 的 hash() 每进程随机加盐（PYTHONHASHSEED）：分身每晚 provision 重启后 sig
+    必变 → 默认 7 天的重复窗口永不命中，每次重启首扫都重发同一条告警。
+    """
+    cfg._p.setdefault("monitor", {}).update(alert_to="20102")
+    desc = "每日发送到中鲁群"
+    _add_plan(avatar, 1, "群发计划", action={"type": "task", "description": desc})
+    avatar._plan_health_next = 0
+    avatar._scan_plan_health()
+    sig = avatar._plan_health_state()["1"]["sig"]
+    assert sig == hashlib.sha256(desc.encode("utf-8")).hexdigest()[:16]
+    avatar.dws.sent.clear()
+    avatar._plan_health_next = 0
+    avatar._scan_plan_health()  # 描述未变 → 重复窗口内不该再告警
+    assert not any("定时计划投递体检" in c for _, c in avatar.dws.sent)
 

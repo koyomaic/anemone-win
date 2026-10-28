@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -3212,7 +3213,14 @@ class Avatar:
                                         "plan_health_repeat_sec", 7 * 86400))
         alert_to = str(self.cfg.get("monitor", "alert_to", "") or "")
         rx = re.compile(r"发至|发到|推送|发送|投递|群播|群里|本群")
-        exempt = re.compile(r"recipients\.py|action\.delivery|禁止自行\s*dws|send_file", re.I)
+        # 豁免＝描述里已写明「本任务不负责投递」。原正则只认字面「禁止自行 dws」，
+        # 而新能源机 #6 写的是「严禁执行任何 dws 发送命令」「不发群，发群由宿主机
+        # usage-report-send.timer 完成」→ 语义正是豁免，却因措辞不同被连日误报
+        # （2026-10-24/26/28 各一次）。补三种等价表述，避免为消警而改业务文案。
+        exempt = re.compile(r"recipients\.py|action\.delivery|禁止自行\s*dws|send_file"
+                            r"|严禁[^。\n]{0,8}dws|不发群"
+                            r"|宿主机[^。\n]{0,12}(?:发送器|timer|推送|自动完成)",
+                            re.I)
         for p in plans:
             pid = str(p.get("id") or "")
             if not pid:
@@ -3224,7 +3232,10 @@ class Avatar:
                 continue
             if not rx.search(desc) or exempt.search(desc):
                 continue
-            sig = str(hash(desc))[:16]
+            # 不能用 hash(desc)：str 的 hash 每进程随机加盐（PYTHONHASHSEED），分身
+            # 每晚 provision 重启后 sig 必变 → repeat_sec（默认 7 天）永不命中，每次
+            # 重启首扫都重发同一条告警（实测 10-24/10-26/10-28 均 01:04）。改稳定摘要。
+            sig = hashlib.sha256(desc.encode("utf-8")).hexdigest()[:16]
             prev = state.get(pid)
             if isinstance(prev, dict) and prev.get("sig") == sig \
                     and now - float(prev.get("ts") or 0) < repeat_sec:
