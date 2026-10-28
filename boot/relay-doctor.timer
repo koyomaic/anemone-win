@@ -1,0 +1,10 @@
+[Unit]
+Description=Relay doctor daily report timer (06:00)
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+RandomizedDelaySec=90
+
+[Install]
+WantedBy=timers.target

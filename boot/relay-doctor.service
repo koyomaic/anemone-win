@@ -1,0 +1,16 @@
+[Unit]
+Description=Relay fleet daily health check (doctor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/team/relay-boot/doctor.sh
+# 性能红线：日频体检绝不与业务抢资源（CPU/IO/内存全限幅，20min 硬顶）
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+MemoryMax=512M
+TasksMax=64
+TimeoutStartSec=1200
+NoNewPrivileges=true

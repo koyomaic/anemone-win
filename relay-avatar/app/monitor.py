@@ -138,7 +138,13 @@ class Monitor:
 
         # 配套 timer
         for t in ("relay-boot.timer", "relay-backup.timer",
-                  "dws-refresh.timer"):
+                  "dws-refresh.timer", "relay-doctor.timer"):
+            if not Path(f"/etc/systemd/system/{t}").exists():
+                continue  # 该机未装此定时器：不采样不告警（防误报）
+            if t == "relay-doctor.timer":
+                rc_en, _ = _run(["systemctl", "is-enabled", "--quiet", t])
+                if rc_en != 0:
+                    continue  # DOCTOR_ENABLED=0 主动停用：不 nag
             rc, _ = _run(["systemctl", "is-active", "--quiet", t])
             add(t, t, "ok" if rc == 0 else "down",
                 "active" if rc == 0 else "inactive")

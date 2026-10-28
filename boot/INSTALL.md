@@ -12,6 +12,7 @@
 | 工作区备份 | `relay-backup.timer` → `scripts/backup.sh` | 每日 03:30：数据库快照（SQLite `.backup` 或 PG `pg_dump -Fc`）+ shared/ + relay.env + relay.log → `/mnt/vol-eltaah12/backup/` |
 | dws 登录态小时级刷新 | `dws-refresh.timer` → `dws-refresh.sh` | 每小时整点（±60s 抖动）：软链共享种子进临时 HOME 跑 `auth status`，token 刷新原地发生在种子上（与 boot 预警同一份登录态）；日志 `/var/log/dws-refresh.log`；登录态失效时清单 WARN，需人工设备码重授权 |
 | 计划触发器 | `relay-plan.timer` → `plan-tick.sh` | 每分钟（±20s 抖动，`Persistent=true` 漏跑补跑）：扫本机 relay 的 due 计划→`POST /plans/{id}/fire` 原子认领并提交任务；纯 HTTP 打 admin 接口，不碰 systemd 单元/不写 /etc；日志 `/var/log/relay-plan.log`。计划由大脑/成员经 `POST /plans` 或 dashboard「计划」页创建，存本机各自的库 |
+| 每日体检 | `relay-doctor.timer` → `doctor.sh` | 每日 06:00（±90s 抖动，漏跑补跑）：26 项检查（任务失败/空间趋势/依赖漂移/引擎真跑探测…）→ Markdown 日报 DM 推本机 `ALERT_TO`；全绿也发（死人开关）。机队默认开启，`DOCTOR_ENABLED=0` 可静默。详见 `boot/DOCTOR.md` |
 | Claude 代理 | `claude-proxy.service` | 可选：Anthropic→OpenAI 翻译代理 :8790；外部模型路由可指向 strict 脱敏代理 |
 | 外部模型脱敏代理 | `claude-proxy-external.service` | 可选：OpenAI 兼容 strict 脱敏出口 :8792；词典/密钥每机私有，未就绪则 fail-closed |
 | TLS 代理 | `relay-tls-proxy.service` | 可选：仅 HTTPS 主机（有 relay-tls 证书才装），socat 回环明文 :8787→TLS :8788（仅本机健康检查兼容） |

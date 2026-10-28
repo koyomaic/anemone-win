@@ -424,6 +424,40 @@ else
   else ok "按机队默认未启用（boot.env 设 USAGE_REPORT_TIMER=1 可开启）"; fi
 fi
 
+# ---------- 19e relay-doctor 每日体检（机队默认开启；设计与检查目录见 boot/DOCTOR.md） ----------
+# 与 usage-collect 的取向差异是刻意的：那是业务日报（opt-in，收件人各机自行确认），
+# 这是机队健康死人开关（opt-out）——每台机 06:00 向本机 ALERT_TO 发日报，
+# 没收到即异常。个别机想静默：boot.env 设 DOCTOR_ENABLED=0（provision 会停用 timer）。
+step "doctor脚本"
+d_drift=""; d_bad=""
+for f in doctor.sh doctor_checks.py; do
+  if [ -f "$BOOT_DIR/$f" ] && cmp -s "$RES_ROOT/boot/$f" "$BOOT_DIR/$f"; then continue; fi
+  d_drift="$d_drift $f"
+  if heal; then cp "$RES_ROOT/boot/$f" "$BOOT_DIR/$f" && chmod 700 "$BOOT_DIR/$f" || d_bad="$d_bad $f"; fi
+done
+if [ -n "$d_bad" ]; then bad "同步失败:$d_bad"
+elif [ -n "$d_drift" ]; then
+  if heal; then ok "已同步$d_drift"; else bad "缺失$d_drift"; fi
+else ok; fi
+sync_unit "relay-doctor.service" "$RES_ROOT/boot/relay-doctor.service" relay-doctor.service copy no
+sync_unit "relay-doctor.timer"   "$RES_ROOT/boot/relay-doctor.timer"   relay-doctor.timer   copy no
+step "doctor定时器"
+if [ "${DOCTOR_ENABLED:-1}" = "1" ]; then
+  if systemctl is-enabled --quiet relay-doctor.timer 2>/dev/null && systemctl is-active --quiet relay-doctor.timer; then ok "已启用（机队默认）"
+  elif heal; then
+    miss "启用（机队默认）"
+    systemctl enable --now relay-doctor.timer 2>/dev/null && ok "已启用" || bad "无法启用"
+  else bad "未启用（机队默认应开启）"; fi
+else
+  if systemctl is-enabled --quiet relay-doctor.timer 2>/dev/null; then
+    if heal; then
+      miss "停用（DOCTOR_ENABLED=0）"
+      systemctl disable --now relay-doctor.timer 2>/dev/null
+      ok "已停用（单元仍在；boot.env 删掉 DOCTOR_ENABLED=0 即恢复）"
+    else warn "已启用但 DOCTOR_ENABLED=0（install 模式将停用）"; fi
+  else ok "按 DOCTOR_ENABLED=0 未启用"; fi
+fi
+
 # ---------- 20 opencode.jsonc（模型 provider+密钥，SOFT） ----------
 step "opencode.jsonc"
 if [ -f "$OC_CONFIG" ] && ! grep -q 'sk-REPLACE_ME' "$OC_CONFIG"; then ok
