@@ -273,7 +273,10 @@ def test_conflict_only_within_window(relay_factory, tmp_path):
     tok = admin_c.post("/users", json={"name": "tester"}).json()["token"]
 
     t1 = wait_task(base, tok, submit(base, tok, "写报告 v1")["task_id"], timeout=60)
-    assert t1["status"] == "review", t1
+    # shared/reports/ 属低风险新建产出，首单自动 done；冲突守卫看的是 changed_files，
+    # 不因自动 done 而失效。
+    assert t1["status"] == "done", t1
+    assert "低风险新建产出" in (t1.get("error") or ""), t1
     t2 = wait_task(base, tok, submit(base, tok, "写报告 v2")["task_id"], timeout=60)
     assert t2["status"] == "conflict", t2
     assert any(c["with_task"] == t1["id"] and c["backup"] for c in t2["conflicts"]), t2
@@ -371,13 +374,14 @@ exit 0
 
 def test_identical_output_from_concurrent_tasks_is_not_conflict(
         relay_factory, tmp_path):
-    """端到端回归：两个任务写同一路径但**内容字节相同** → 不判冲突，正常 review。
+    """端到端回归：两个任务写同一路径但**内容字节相同** → 不判冲突，正常自动 done。
 
     复现 2026-10-10 交互群事故的核心误判：同一需求经三个会话各触发一个任务，
     三者收敛出完全一致的周报（MD5 相同），却因"都改动了同一文件"被判
     conflict/review 卡在人工核查，且核查提示不外发，发起人只看到沉默。
     对照 test_conflict_only_within_window（内容每次不同 → 仍判 conflict），
-    可见判据是**内容分歧**而非路径重合。
+    可见判据是**内容分歧**而非路径重合。shared/reports/ 纳入低风险前缀后，
+    首单也直接 done。
     """
     script = tmp_path / "fake_agent_same.sh"
     script.write_text(FAKE_AGENT_SAME)
@@ -391,7 +395,8 @@ def test_identical_output_from_concurrent_tasks_is_not_conflict(
 
     t1 = wait_task(base, tok, submit(base, tok, "写同一份报告 第一遍")["task_id"],
                    timeout=60)
-    assert t1["status"] == "review", t1
+    assert t1["status"] == "done", t1
+    assert "低风险新建产出" in (t1.get("error") or ""), t1
     assert t1["changed_files"] == ["shared/reports/same.html"], t1
 
     t2 = wait_task(base, tok, submit(base, tok, "写同一份报告 第二遍")["task_id"],

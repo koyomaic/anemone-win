@@ -48,23 +48,33 @@ systemd 按序加载，**后者覆盖前者**：
 | RELAY_XDG_CONFIG_HOME | ~/.config | 共享 agent 配置目录（provider/技能全员共用） |
 | RELAY_DASHBOARD_PASSWORD | 空 | 监控页面口令（空=禁用） |
 | RELAY_STALE_TIMEOUT_HOURS | 24 | review 停留超时 → 自动 done；待审批超时由 RELAY_APPROVAL_TIMEOUT_MINUTES 单独控制 |
-| RELAY_APPROVAL_TIMEOUT_MINUTES | 60 | pending_approval 停留超时 → 自动 failed |
+| RELAY_APPROVAL_TIMEOUT_MINUTES | 360 | pending_approval 停留超时 → 自动 failed；自 `blocked_at` 起算（旧行回落 created_at） |
 | RELAY_AUTO_DONE_MODE | on | 低风险新建产出自动 done（off 恢复“有产出即 review”） |
-| RELAY_AUTO_DONE_PREFIXES | shared/report/,shared/tmp/,shared/data/,shared/_sync/,shared/_migrate/,shared/_inventory/,shared/_upgrade-backup/ | 允许自动 done 的新建文件前缀（逗号分隔） |
-| RELAY_AUTO_DONE_MODIFIED_OK | shared/report/latest.*,shared/report/*/latest.* | 「再生型固定名产物」豁免（fnmatch，逗号分隔）：被**修改**的既有文件全部命中时不阻塞自动 done；`none` 关闭豁免 |
+| RELAY_AUTO_DONE_PREFIXES | shared/report/,shared/reports/,shared/tmp/,shared/data/,shared/_sync/,shared/_migrate/,shared/_inventory/,shared/_upgrade-backup/ | 允许自动 done 的新建文件前缀（逗号分隔） |
+| RELAY_AUTO_DONE_MODIFIED_OK | shared/report/latest.*,shared/report/*/latest.*,shared/reports/latest.*,shared/reports/*/latest.* | 「再生型固定名产物」豁免（fnmatch，逗号分隔）：被**修改**的既有文件全部命中时不阻塞自动 done；`none` 关闭豁免 |
 | RELAY_AUTO_DONE_MAX_FILES | 200 | 单任务新建文件数超过该值仍走 review |
 | RELAY_SWEEP_INTERVAL_SEC | 300 | 超时清扫周期（秒） |
 | RELAY_BLOCKED_PATTERNS | 核心清单(见下) | 高危命令拦截正则（逗号分隔，覆盖默认） |
 | RELAY_RM_SAFE_PREFIXES | /tmp,/var/tmp | 递归 rm 在这些前缀下放行，其余拦截 |
 
-### 高危命令拦截策略（建设初期：开放优先，只守核心）
+### 高危命令拦截策略（2026-10-28：减少无效审批）
 
-- **不拦**（放行）：`systemctl`（含 start/stop/restart 等全部）、`iptables`、`ufw`、`crontab -r`、
-  `useradd`/`userdel`、`curl|sh`、`wget|sh`、非递归单文件 `rm`；
-- **递归 rm 按路径**：目标在 `RELAY_RM_SAFE_PREFIXES`（默认 /tmp、/var/tmp）下放行，
-  其余（含相对路径/`~`/变量，无法验证）拦截；
-- **核心拦截**（不可逆/会炸服务器）：`mkfs`、写裸盘（`of=/dev/…`、`> /dev/…` 磁盘设备）、
-  `shutdown`/`reboot`/`poweroff`/`halt`、`kill -9 1`（init）、`chmod -R 777 /` 或 `~`；
+- **自动拒绝（不进人工审批）**：
+  - 凭据/分身安装目录侦察类；
+  - 系统服务/电源/git 写操作类（`systemctl start|stop|restart|enable|disable|mask|daemon-reload`、
+    `service ...`、`shutdown/reboot/poweroff/halt`、`git push/commit/...` 等）。这些在
+    `ProtectSystem=strict` + 无 capability 的任务沙箱内**批准也执行不了**，第一次自动拒绝并
+    回注正确出口（relay plan / 平台侧人工处理），再犯直接 failed。
+- **放行**：`iptables -L`、`ufw status`、非递归单文件 `rm`、只读 `systemctl status/list-*`、
+  只读 `git log/status/diff/remote -v`、`/tmp` 与 `/var/tmp` 下递归清理、任务自身 workdir/HOME、
+  `__pycache__` 等可再生缓存清理。
+- **纯输出文本不误判**：`echo`/`printf` 的 inert 参数与注释不参与系统保护类正则匹配；
+  命令替换、非 `/dev/null` 重定向、引号内含分隔符的边界形态仍保守送检。
+- **递归 rm 按路径**：目标在 `RELAY_RM_SAFE_PREFIXES`（默认 /tmp、/var/tmp）、任务树、
+  可再生缓存目录下放行；简单字面量 `/tmp` 变量与 `mktemp -d /tmp/...` 可静态展开，
+  其余变量/相对路径无法验证时拦截。
+- **核心不可逆操作**：`mkfs`、写裸盘、电源操作、`kill -9 1`、`chmod -R 777 /` 或 `~` 仍拦截，
+  并按上述系统类自动拒绝处理。
 - **dws 钉钉外发二次确认**：对 dws 发送类命令按目标分级——
   - **1:1 单聊放行**（`--user`/`--open-dingtalk-id`/`+dm --to`，或 `--chat-id` 解析为单聊会话）；
   - **群聊/多接收人(≥2)/命中敏感对象** → 拦。群聊含：群名（`--chat-query`/`--group 名`）、
@@ -151,7 +161,7 @@ team_agent.py approve 42 --decision approve   # pending_approval（高危拦截�
 **三类自动 done（减少人工待办）**：
 - **只读自动 done**：执行完且**无任何共享文件改动** → 直接 `done`（备注"自动done（只读，无文件改动）"），不落 review；
 - **低风险新建产出自动 done**：执行完**仅新建**文件、无修改/删除、无跨任务冲突、无越界任务号、有结果文本，且全部新建文件落在 `RELAY_AUTO_DONE_PREFIXES` 下 → 直接 `done`（备注"自动done（低风险新建产出 N 个，无需人工确认）"）；被修改的既有文件若**全部**命中 `RELAY_AUTO_DONE_MODIFIED_OK`（`latest.html` 这类每轮重写的「最新版」指针件）同样放行，备注追加"再生件重写 N 个"——豁免只影响是否自动 done，这些文件仍进 `changed_files`、仍参与冲突判定；
-- **超时自动 done**：`review` 停留超过 `RELAY_STALE_TIMEOUT_HOURS`（默认 24h，本机 8h）→ 后台清扫置 `done` 并备注"超时自动done"（阈值按 `created_at` 起算，故下午提交的任务会在当夜到期）。这只是**状态闭环**：结果早在进 review 时已由分身送达，分身侧对该标记静默收尾、不再重推全文（见 relay-avatar `_finish`）。`pending_approval` 停留超过 `RELAY_APPROVAL_TIMEOUT_MINUTES`（默认 60min）→ 置 `failed`，不会误标完成。
+- **超时自动 done**：`review` 停留超过 `RELAY_STALE_TIMEOUT_HOURS`（默认 24h，本机 8h）→ 后台清扫置 `done` 并备注"超时自动done"（阈值按 `created_at` 起算，故下午提交的任务会在当夜到期）。这只是**状态闭环**：结果早在进 review 时已由分身送达，分身侧对该标记静默收尾、不再重推全文（见 relay-avatar `_finish`）。`pending_approval` 停留超过 `RELAY_APPROVAL_TIMEOUT_MINUTES`（默认 360min）→ 置 `failed`，不会误标完成；2026-10-28 起阈值按 `blocked_at`（真正被拦时刻）起算，旧行回落 `created_at`。
 
 ## 并行不打架（无 git 版）
 

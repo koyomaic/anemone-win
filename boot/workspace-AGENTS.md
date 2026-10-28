@@ -133,13 +133,18 @@ store sync scan|push|verify|backfill          # jingboWiki 同步
 ## 临时文件清理（无需确认）
 
 - **自己**在本次会话中创建的临时产物——如 `/tmp` 下的打包 zip、解压目录、中间文件、测试残留——直接删除即可，**不要向用户逐个征求确认**（用户要求：减少此类打扰）。
+- `/tmp`、`/var/tmp` 清理请使用**字面路径**（如 `rm -rf /tmp/foo`）。`S=/tmp/foo; rm -rf $S` 这类变量写法只有简单字面量/`mktemp -d /tmp/...` 能被静态放行，复杂变量会保守拦截。
+- `__pycache__`、`.pytest_cache`、`.mypy_cache`、`.ruff_cache` 属可再生缓存，工作区内清理放行；不要为了"收尾干净"去删业务文件。
 - 边界：仅限"本次会话自己生成的临时物"。用户的真实数据（workspace 业务数据、shared/ 共享区、他人文件、任务产出）不在免确认范围内，删除前必须说明并确认。
 
 ## 命令拦截边界（了解即可，正常干活别撞）
 
-- `/tmp`、`/var/tmp` 下的清理（含 `rm -rf`）直接放行；systemctl、防火墙、cron、用户管理等均不拦。
-- 会被拦的核心项：`mkfs`、写裸盘（`of=/dev/磁盘`、`> /dev/磁盘`）、`shutdown/reboot/poweroff/halt`、`kill -9 1`、`chmod -R 777 /` 或 `~`、**非 /tmp 路径的递归 rm**。
-- 若任务确需执行会被拦的命令，如实说明并让用户在监控页审批，不要变着写法绕。
+- **任务沙箱不能管理系统**：`systemctl start/stop/restart/enable/disable/mask/daemon-reload`、`service ...`、写 `/etc/systemd`、`shutdown/reboot`、`git push/commit` 等会被自动拒绝；即使人工批准，`ProtectSystem=strict` 与无特权边界也会让它们失败。**不要尝试、不要换写法绕过。**
+- 定时任务唯一入口是 relay 计划：分身对话用结果正文的 ```plan``` 围栏块；直连 bridge 用 `team-agent-relay` 的 `plan` 子命令。宿主机 systemd 单元只能由平台侧人工/部署脚本管理。
+- 只读查询仍可用：`systemctl status/list-timers/list-units/is-active/cat/show`、`git log/status/diff/remote -v`、`journalctl` 等不在拦截范围。
+- 递归 `rm` 只放行 `/tmp`、`/var/tmp`、任务自身 workdir/HOME、可再生缓存目录；删 shared/ 业务文件会进入人工审批。
+- `dws` 单聊发给普通接收人放行；群聊、多接收人、敏感接收人会进入人工审批。定时计划的结果投递优先绑定 `action.delivery` 或由宿主机发送器完成，不要让计划任务自行群发。
+- 若任务确需执行会被拦的命令，如实说明「需平台侧人工处理」及原因，不要变着写法绕。
 
 ## 软件安装（硬性：沙箱内系统包安装必然失败）
 

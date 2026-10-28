@@ -37,6 +37,9 @@ class ExecRelay:
     def poll(self, tid) -> dict:
         return self.relay.get_task(tid)
 
+    def list_tasks(self, status: str = "", limit: int = 50, uid: str = "") -> dict:
+        return self.relay.list_tasks(status=status, limit=limit)
+
     def progress(self, tid, after_id: int = 0, limit: int = 5) -> dict:
         return self.relay.get_progress(tid, after_id=after_id, limit=limit)
 

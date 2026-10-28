@@ -19,7 +19,8 @@ import pytest
 
 from conftest import audit_lines, submit, wait_task
 from app.config import (AUTO_DENY_REASONS, RECON_BLOCKED_PATTERNS,
-                        _SYSTEM_PROTECT_PATTERNS, block_category)
+                        SYSTEM_AUTO_DENY_REASONS, _SYSTEM_PROTECT_PATTERNS,
+                        block_category)
 from app.db import DB
 from app.main import sweep_stale
 
@@ -43,15 +44,15 @@ def test_block_category_system_and_other():
     assert block_category("某种没见过的原因") == "other"
 
 
-def test_auto_deny_set_is_exactly_the_recon_group():
-    """自动拒绝类＝侦察类，一条不多一条不少。
+def test_auto_deny_sets_are_recon_and_system():
+    """自动拒绝分两组：侦察类（给人看无意义）与系统保护类（批准也执行不了）。
 
-    多了＝把该给人看的（删共享区/对外发送）自动放过；少了＝继续拿侦察命令去
-    骚扰业务用户。系统保护类（git/systemctl/mkfs…）**不得**进自动拒绝集合：
-    运维任务可能合法需要它们。
+    两组都必须与"需要人判断"的 rm/dws 分开；系统保护类不再进人工审批，因为
+    relay.service 的 ProtectSystem=strict + 无 capability 已让它们物理不可行。
     """
     assert AUTO_DENY_REASONS == frozenset(RECON_BLOCKED_PATTERNS)
-    assert not (AUTO_DENY_REASONS & set(_SYSTEM_PROTECT_PATTERNS))
+    assert SYSTEM_AUTO_DENY_REASONS == frozenset(_SYSTEM_PROTECT_PATTERNS)
+    assert not (AUTO_DENY_REASONS & SYSTEM_AUTO_DENY_REASONS)
 
 
 # ── Tier 3c：待审批超时 → failed（此前与 review 共用一条 UPDATE 被置成 done）──
@@ -81,11 +82,14 @@ def _force_created_at(db, tid, ts):
     db._run("UPDATE tasks SET created_at = ? WHERE id = ?", (ts, tid))
 
 
-def _mk(db, status, age_sec, cfg, blocked_cmd="rm -rf /x"):
+def _mk(db, status, age_sec, cfg, blocked_cmd="rm -rf /x", blocked_age_sec=None):
     tid = db.create_task(user="u", description="t", priority="normal",
                          read_only=False, project="", targets=[])
     db.set(tid, status=status, blocked_cmd=blocked_cmd)
-    _force_created_at(db, tid, time.time() - age_sec)
+    now = time.time()
+    _force_created_at(db, tid, now - age_sec)
+    if blocked_age_sec is not None:
+        db.set(tid, blocked_at=now - blocked_age_sec)
     return tid
 
 
@@ -125,6 +129,21 @@ def test_sweep_fresh_approval_untouched(relay):
     tid = _mk(db, "pending_approval", 60, cfg)
     assert sweep_stale(db, _NullBus(), _NullAudit(), cfg, _NullWs()) == []
     assert db.task(tid)["status"] == "pending_approval"
+
+
+def test_sweep_approval_uses_blocked_at_not_created_at(relay):
+    """2026-10-28：审批窗口从被拦时刻起算，不再吃掉任务已运行时间。"""
+    cfg = relay["cfg"]
+    db = DB(cfg.db_path)
+    # 任务跑了 5h 后才被拦，blocked_at 只有 10 分钟 → 不该超时
+    fresh = _mk(db, "pending_approval", 5 * 3600 + 600, cfg, blocked_age_sec=600)
+    # 任务创建很久，blocked_at 也已超过阈值 → 该超时
+    stale = _mk(db, "pending_approval", 7 * 3600, cfg,
+                blocked_age_sec=cfg.approval_timeout_minutes * 60 + 120)
+    swept = sweep_stale(db, _NullBus(), _NullAudit(), cfg, _NullWs())
+    assert fresh not in swept and stale in swept
+    assert db.task(fresh)["status"] == "pending_approval"
+    assert db.task(stale)["status"] == "failed"
 
 
 def test_sweep_approval_uses_shorter_threshold_than_review(relay):
@@ -220,6 +239,33 @@ def test_auto_deny_hint_does_not_exempt_the_command(relay_factory, tmp_path):
     assert t["error"].startswith("blocked:recon:"), t["error"]
 
 
+SYSTEM_AGENT = """#!/bin/sh
+prompt="$*"
+if printf '%s' "$prompt" | grep -q "自动拒绝"; then
+  printf '%s\\n' '{"type":"text","sessionID":"ses_sys","part":{"type":"text","text":"改走计划后完成"}}'
+  printf '%s\\n' '{"type":"step_finish","sessionID":"ses_sys","part":{"tokens":{"total":10},"cost":0}}'
+  exit 0
+fi
+printf '%s\\n' '{"type":"tool_use","sessionID":"ses_sys","part":{"tool":"bash","title":"Bash","state":{"status":"completed","input":{"command":"systemctl stop yuqing-daily.timer"}}}}'
+sleep 10
+"""
+
+
+def test_system_command_auto_denied_not_human_approval(relay_factory, tmp_path):
+    """systemctl 写操作在沙箱内批准也执行不了：自动拒绝并提示改走计划。"""
+    r = _fake(relay_factory, tmp_path, SYSTEM_AGENT)
+    base = r["base"]
+    tok = httpx.Client(base_url=base, headers={"Authorization": "Bearer admin-test"},
+                       timeout=30).post("/users", json={"name": "faker"}).json()["token"]
+    tid = submit(base, tok, "停用定时器")["task_id"]
+    t = wait_task(base, tok, tid, timeout=90)
+    assert t["status"] in ("done", "review"), t
+    assert "改走计划后完成" in (t.get("result") or "")
+    lines = audit_lines(r["cfg"].log_path)
+    assert any(f"task={tid}\tuser=faker\tauto_deny\tsystem" in ln for ln in lines), lines[-6:]
+    assert not any(f"task={tid}\tuser=faker\tblock\t" in ln for ln in lines)
+
+
 def test_non_recon_still_goes_to_human(relay_factory, tmp_path):
     """非侦察类（删共享区等）不得自动拒绝——那正是需要人判断的部分。"""
     script = """#!/bin/sh
@@ -292,10 +338,10 @@ def test_from_env_fallbacks_match_dataclass_defaults(monkeypatch):
         f"{drift}")
 
 
-def test_approval_timeout_default_is_60(monkeypatch):
+def test_approval_timeout_default_is_360(monkeypatch):
     """显式锁死本次改动涉及的阈值，防再次被兜底字符串悄悄改掉。"""
     for k in [k for k in os.environ if k.startswith("RELAY_")]:
         monkeypatch.delenv(k, raising=False)
     from app.config import Settings
-    assert Settings.from_env().approval_timeout_minutes == 60.0
+    assert Settings.from_env().approval_timeout_minutes == 360.0
     assert Settings.from_env().auto_deny_max == 2

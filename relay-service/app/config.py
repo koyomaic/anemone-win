@@ -13,8 +13,11 @@ from dataclasses import dataclass, field
 # 注意：本清单是审计+审批层（可被 python -c 等绕过、可人工批准豁免）；对"中转自身"
 # 的硬边界在 relay.service 挂载命名空间（ProtectSystem=strict + InaccessiblePaths），
 # 硬边界内即使批准也写不动（EROFS），例外只能由人在宿主机操作。
-# 系统／中转自身保护类：不可逆或影响服务存续的操作。命中走**人工审批**——运维任务
-# 可能合法需要它们（如超管让 agent 重启服务），不能自动拒。
+# 系统／中转自身保护类：不可逆或影响服务存续的操作。relay.service 的硬边界
+# （ProtectSystem=strict、CapabilityBoundingSet=、InaccessiblePaths=凭据）使这些
+# 操作在任务沙箱内**即使人工批准也物理不可行**；继续拿去问人只会制造无效审批
+# （2026-10-21 #371/#372、2026-10-26 #402/#405 实测）。故命中走自动拒绝 +
+# 回注提示，让 agent 改走 relay plan / 宿主机人工通道。
 _SYSTEM_PROTECT_PATTERNS = [
     r"\bmkfs",                                      # 格式化文件系统（不可逆）
     r"\bof=/dev/(sd|vd|nvme|hd|xvd|dm-|md)\w*",     # dd 写裸盘
@@ -22,10 +25,11 @@ _SYSTEM_PROTECT_PATTERNS = [
     r"\b(shutdown|reboot|poweroff|halt)\b",         # 服务器电源操作
     r"\bkill\s+(-9|-kill)\s+1(?!\d)",               # 杀 init（PID 1）
     r"\bchmod\s+-r\s+777\s+(?:~|/(?!\w))",          # 根/家目录递归 777
-    # ---- 中转自身保护（2026-09-17 加固）----
+    # ---- 中转自身保护（2026-09-17 加固；2026-10-28 收窄 git remote 只读误伤）----
     # 选项跳跃组 (?:...)*?：覆盖 git -C <path> push / git -c k=v commit /
     # systemctl --no-pager restart 等全局选项间隔写法（冒烟实测发现的绕过面）。
-    r"\bgit\s+(?:-{1,2}[a-z-]+(?:[= ]\S+)?\s+)*?(push|commit|am|rebase|merge|reset|clean|tag|remote|cherry-pick|apply|format-patch|revert)\b",
+    # `git remote -v` / `git remote show` 是只读，不应拦；只拦会改远端配置的子命令。
+    r"\bgit\s+(?:-{1,2}[a-z-]+(?:[= ]\S+)?\s+)*?(push|commit|am|rebase|merge|reset|clean|tag|remote\s+(?:add|set-url|set-head|set-branches|remove|rename|prune|update)|cherry-pick|apply|format-patch|revert)\b",
     r"\bsystemctl\s+(?:--?\S+\s+)*?(start|stop|restart|try-restart|reload|kill|enable|disable|mask|unmask|edit|daemon-reload|daemon-reexec|isolate|preset)\b",
     r"\bservice\s+[\w.@-]+\s+(start|stop|restart|reload)\b",
     r"\b(pkill|killall)\s+.*\b(relay|app\.serve|uvicorn|claude-proxy)\b",
@@ -62,10 +66,13 @@ DEFAULT_BLOCKED_PATTERNS = _SYSTEM_PROTECT_PATTERNS + RECON_BLOCKED_PATTERNS
 # 运维若用 RELAY_BLOCKED_PATTERNS 覆盖掉某条侦察模式，它自然不再触发自动拒绝；
 # 新增的模式默认落人工审批（保守取向）。
 AUTO_DENY_REASONS = frozenset(RECON_BLOCKED_PATTERNS)
+# 系统保护类同样自动拒绝：不是因为"低风险"，而是因为 relay.service 沙箱让它
+# **批准也执行不了**。把它送进人工审批只会让用户面对无法判断、也无法生效的弹窗。
+SYSTEM_AUTO_DENY_REASONS = frozenset(_SYSTEM_PROTECT_PATTERNS)
 
 
 def block_category(reason: str) -> str:
-    """拦截原因 → 短类别标识（recon/rm/dws/system/other）。
+    """拦截原因 → 短类别标识（recon/system/rm/dws/other）。
 
     供 error 字段编码用（`blocked:<cat>: <cmd>`），让分身侧能用**业务语言**向超管
     转述，而不必把 shell 原文甩给业务用户。只做字符串前缀/集合比对，**不跑正则**。
@@ -74,12 +81,12 @@ def block_category(reason: str) -> str:
         return "other"
     if reason in AUTO_DENY_REASONS:
         return "recon"
+    if reason in SYSTEM_AUTO_DENY_REASONS:
+        return "system"
     if reason.startswith("recursive rm outside safe dirs:"):
         return "rm"
     if reason.startswith("dws "):
         return "dws"
-    if reason in _SYSTEM_PROTECT_PATTERNS:
-        return "system"
     return "other"
 
 
@@ -120,6 +127,7 @@ DEFAULT_VOLATILE_PATTERNS = [
 # 不放 knowledge/memory/skills/mcp/tools/secrets 等会影响后续行为或权限的目录。
 DEFAULT_AUTO_DONE_PREFIXES = [
     "shared/report/",
+    "shared/reports/",   # 实际工作区长期用复数目录；漏掉它会让报告件白白挂 review
     "shared/tmp/",
     "shared/data/",
     "shared/_sync/",
@@ -149,6 +157,8 @@ DEFAULT_AUTO_DONE_PREFIXES = [
 DEFAULT_AUTO_DONE_MODIFIED_OK = [
     "shared/report/latest.*",
     "shared/report/*/latest.*",   # fnmatch 的 * 跨 /，故 asset-map/latest.html 及更深层均命中
+    "shared/reports/latest.*",
+    "shared/reports/*/latest.*",  # 复数报告目录与单数同权
 ]
 
 # claude 引擎默认禁用的内置工具（透传为 --disallowedTools）。
@@ -320,11 +330,10 @@ class Settings:
     # 为什么与 review 分开：review 是"活已干完、等人过目"，超时置 done 无损；
     # pending_approval 是"活干到一半被门禁拦住"，超时置 done 等于把**没办完的
     # 任务标成办完了**（#299 若无人手工拒批，24h 后就会被标 done）。
-    # 默认 60min：无 blocked_at 列（不迁移 schema），超时从 created_at 起算，故要
-    # 覆盖「任务本身跑掉的时间 + 留给人决策的时间」。任务时限 1800s(30min)，60min
-    # 意味着最坏情况（跑满 30min 才被拦）仍有 30min 决策窗。#299 从 09:29 卡到
-    # 10:45（76 分钟）无人处理，60min 足以让超管看到，又不至于让发起人干等一上午。
-    approval_timeout_minutes: float = 60.0
+    # 2026-10-28 起有 blocked_at 列，超时从**真正被拦时刻**起算，不再吃掉任务
+    # 已运行时间。默认 360min：pending_approval 不占执行槽，延长不会拖慢队列；
+    # 6h 能覆盖下班/睡眠窗口，又不至于让过期上下文无限挂起。
+    approval_timeout_minutes: float = 360.0
     # 侦察类命令的自动拒绝续跑上限（Tier 2）。超过即转人工审批，防 agent 反复
     # 试探把续跑变成死循环——每次续跑都是一次完整 claude 调用，代价不低。
     auto_deny_max: int = 2
@@ -442,7 +451,7 @@ class Settings:
             dashboard_password=os.environ.get("RELAY_DASHBOARD_PASSWORD", ""),
             stale_timeout_hours=float(os.environ.get("RELAY_STALE_TIMEOUT_HOURS", "24")),
             approval_timeout_minutes=float(
-                os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "60")),
+                os.environ.get("RELAY_APPROVAL_TIMEOUT_MINUTES", "360")),
             auto_deny_max=int(os.environ.get("RELAY_AUTO_DENY_MAX", "2")),
             long_task_mode=os.environ.get("RELAY_LONG_TASK_MODE", "on").strip().lower(),
             long_task_threshold_sec=float(

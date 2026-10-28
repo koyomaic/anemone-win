@@ -104,10 +104,15 @@ background_id = "im_bg_5"
 
 [keywords]
 submit = ["提交", "开始执行"]
-cancel = ["取消"]
-confirm = ["确认", "同意"]
-deny = ["拒绝", "不同意"]
+cancel = ["取消", "停止", "停", "停下", "终止", "别跑了"]
+confirm = ["确认", "同意", "确认完成", "上一件任务：确认", "上一件任务:确认",
+           "上一件确认", "通过", "没问题"]
+deny = ["拒绝", "不同意", "否决"]
 conflict = ["冲突"]
+progress = ["进度", "进展", "状态", "进度？", "进度?", "查进度", "看进度",
+            "任务还在进行吗", "任务还在进行吗？", "这个任务在执行吗",
+            "这个任务在执行吗？", "在执行吗", "在执行吗？", "还在吗", "还在吗？",
+            "任务还在吗"]
 
 [group]
 enabled = false                # 群@监听默认关；开启需显式改本文件（决策留痕）
@@ -130,12 +135,14 @@ grant_valid_days = 90          # 动态授权强制过期天数（修 fenshen P1
 default_backend = "relay"      # 主执行走 relay 门禁体系
 local_enabled = false          # local claude 后端总开关（关掉则下面两个 *_backend 一律无效）
 local_allowed_for = ["self", "l3"]   # 预留；self 通路尚未接线（run_self 目前无调用方）
-approval_timeout_minutes = 60   # 仅用于审批通知文案（告知超管"多久没人管会自动终止"）。
+approval_timeout_minutes = 360  # 仅用于审批通知文案（告知超管"多久没人管会自动终止"）。
                                # 须与 relay 侧 RELAY_APPROVAL_TIMEOUT_MINUTES 一致；
                                # 不一致只是文案数字不准——真正执行超时清扫的是 relay
-                               # 的 sweep_stale。relay 侧超时把待审批任务置 **failed**
-                               # （此前与 review 共用一条 UPDATE 被置成 done，等于把
-                               # 没办完的任务报成办完了）。
+                               # 的 sweep_stale。relay 侧自 blocked_at 起算，超时把
+                               # 待审批任务置 **failed**（不会误标完成）。
+gate_watch_enabled = true      # 轮询 relay 全部 pending_approval，覆盖直连 bridge 任务
+gate_watch_poll_sec = 60
+gate_watch_limit = 50
 # tier → 后端。relay=走 /tasks 门禁体系（审批/追问/冲突检测齐全）；
 # local=本机 claude「只读编排」，可用 Task 委派 subagent（如十一智能体），但禁写
 # 禁执行禁联网、cwd 锁 security.l2_sandbox_dir，需落地时自动升级 relay（升级不降级）。

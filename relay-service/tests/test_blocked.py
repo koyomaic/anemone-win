@@ -245,3 +245,48 @@ def test_credential_block_does_not_break_existing_allow(ex):
            'cp /root/.local/share/dws-cli/auth-token.enc "$HOME/.local/share/dws-cli/" 2>&1; '
            'ls -la "$HOME/.local/share/dws-cli/"')
     assert ex._is_blocked(cmd, WORKDIR) is None
+
+
+# ---- 2026-10-28：纯输出文本/注释不再误触发系统门禁 ----
+
+def test_inert_echo_and_comments_do_not_block(ex):
+    assert ex._is_blocked(
+        'echo "=== uptime (reboot history context) ==="; uptime -s') is None
+    assert ex._is_blocked(
+        'echo "=== systemctl enable writes wants-symlink ==="; ls -ld /run/systemd/system') is None
+    assert ex._is_blocked('cat x # reboot later') is None
+    # 真实命令仍拦
+    assert ex._is_blocked('echo "ok"; reboot') is not None
+    assert ex._is_blocked('echo "ok"; systemctl stop relay') is not None
+    # 命令替换不是 inert
+    assert ex._is_blocked('echo "$(reboot)"') is not None
+    # 重定向到磁盘不是 inert
+    assert ex._is_blocked('echo x > /dev/vda') is not None
+
+
+def test_readonly_git_remote_allowed(ex):
+    assert ex._is_blocked("git remote -v && git branch -vv && git log --oneline -5") is None
+    assert ex._is_blocked("git remote add evil https://x") is not None
+    assert ex._is_blocked("git remote set-url origin https://x") is not None
+
+
+# ---- 2026-10-28：再生型缓存清理与 /tmp 简单变量 ----
+
+def test_cache_cleanup_allowed(ex):
+    shared = "/mnt/vol-eltaah12/workspace/shared"
+    ex.cfg.workspace_root = "/mnt/vol-eltaah12/workspace"
+    ex.cfg.shared_dir = shared
+    assert ex._is_blocked(f"rm -rf {shared}/skills/foo/__pycache__") is None
+    assert ex._is_blocked(f"cd {shared}/scripts/foo && find . -name __pycache__ -type d -exec rm -r {{}} +") is None
+    assert ex._is_blocked(f"rm -rf {shared}/skills/foo") is not None
+    assert ex._is_blocked(f"cd {shared}/scripts/foo && find . -name config.json -exec rm -r {{}} +") is not None
+
+
+def test_simple_tmp_variable_rm_allowed(ex):
+    assert ex._is_blocked("S=/tmp/yneg-runsh; rm -rf $S; mkdir -p $S") is None
+    assert ex._is_blocked('S="/tmp/yneg"; rm -rf "$S/x"') is None
+    assert ex._is_blocked("S=$(mktemp -d /tmp/yq-XXXXXX); rm -rf $S") is None
+    assert ex._is_blocked("S=/mnt/vol-eltaah12/workspace/shared; rm -rf $S") is not None
+    assert ex._is_blocked("S=$(echo /mnt/vol-eltaah12/workspace/shared); rm -rf $S") is not None
+    assert ex._is_blocked("cd $S; rm -rf reports") is not None
+

@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tasks(
   cost REAL NOT NULL DEFAULT 0,
   resume_from INTEGER,
   blocked_cmd TEXT NOT NULL DEFAULT '',
+  blocked_at REAL,
   resume_hint TEXT NOT NULL DEFAULT '',
   read_only INTEGER NOT NULL DEFAULT 0,
   requester TEXT NOT NULL DEFAULT '',
@@ -100,6 +101,7 @@ PG_SCHEMA = [
       cost DOUBLE PRECISION NOT NULL DEFAULT 0,
       resume_from BIGINT,
       blocked_cmd TEXT NOT NULL DEFAULT '',
+      blocked_at DOUBLE PRECISION,
       resume_hint TEXT NOT NULL DEFAULT '',
       read_only BOOLEAN NOT NULL DEFAULT FALSE,
       requester TEXT NOT NULL DEFAULT '',
@@ -128,8 +130,8 @@ PG_SCHEMA = [
 TASK_FIELDS = {
     "user", "description", "project", "targets", "priority", "status",
     "session_id", "engine", "workdir", "result", "error", "changed_files",
-    "conflicts", "tokens", "cost", "resume_from", "blocked_cmd", "resume_hint", "read_only",
-    "started_at", "finished_at",
+    "conflicts", "tokens", "cost", "resume_from", "blocked_cmd", "blocked_at",
+    "resume_hint", "read_only", "started_at", "finished_at",
 }
 
 # plans 可更新字段白名单（update_plan 用）；owner_name/created_at 不可改。
@@ -190,6 +192,7 @@ class DB:
                 self._conn.executescript(SCHEMA)
                 cols = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
                 for name, decl in (("blocked_cmd", "TEXT NOT NULL DEFAULT ''"),
+                                   ("blocked_at", "REAL"),
                                    ("resume_hint", "TEXT NOT NULL DEFAULT ''"),
                                    ("read_only", "INTEGER NOT NULL DEFAULT 0"),
                                    ("engine", "TEXT NOT NULL DEFAULT ''"),
@@ -219,6 +222,7 @@ class DB:
                             " WHERE table_schema='public' AND table_name='tasks'")
         cols = {r["column_name"] for r in rows}
         for name, decl in (("blocked_cmd", "TEXT NOT NULL DEFAULT ''"),
+                           ("blocked_at", "DOUBLE PRECISION"),
                            ("resume_hint", "TEXT NOT NULL DEFAULT ''"),
                            ("read_only", "BOOLEAN NOT NULL DEFAULT FALSE"),
                            ("engine", "TEXT NOT NULL DEFAULT ''"),

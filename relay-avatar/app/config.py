@@ -88,13 +88,18 @@ DEFAULTS: dict[str, Any] = {
                  "long_task_mode": "on", "long_task_threshold_sec": 600,
                 "noise_ignore": [], "self_poll": False,
                 "self_poll_interval_sec": 5},
-    "keywords": {"submit": ["提交", "开始执行"], "cancel": ["取消"],
-                 "confirm": ["确认", "同意"], "deny": ["拒绝", "不同意"],
+    "keywords": {"submit": ["提交", "开始执行"],
+                 "cancel": ["取消", "停止", "停", "停下", "终止", "别跑了"],
+                 "confirm": ["确认", "同意", "确认完成", "上一件任务：确认",
+                             "上一件任务:确认", "上一件确认", "通过", "没问题"],
+                 "deny": ["拒绝", "不同意", "否决"],
                  "conflict": ["冲突"],
                  # 查询类指令：必须与 submit/cancel 同级识别，否则 RUNNING 时会被
                  # 当追问吞进 followups、IDLE 时被当暂存笔记存起来（#149 实测）。
-                 "progress": ["进度", "进展", "状态", "进度？", "进度?",
-                              "查进度", "看进度"]},
+                  "progress": ["进度", "进展", "状态", "进度？", "进度?",
+                               "查进度", "看进度", "任务还在进行吗", "任务还在进行吗？",
+                               "这个任务在执行吗", "这个任务在执行吗？", "在执行吗",
+                               "在执行吗？", "还在吗", "还在吗？", "任务还在吗"]},
     "group": {"enabled": False},
     "permissions": {"default_mode": "whitelist", "guest_mode": "silent",
                     "superadmin": [],
@@ -103,12 +108,17 @@ DEFAULTS: dict[str, Any] = {
     "execution": {"default_backend": "relay", "local_enabled": False,
                   "local_allowed_for": ["self", "l3"],
                   "l2_backend": "relay", "super_backend": "relay",
-                  # 仅用于审批通知文案里告知超管"多久没人管会自动终止"。
-                  # **必须与 relay 侧 RELAY_APPROVAL_TIMEOUT_MINUTES 保持一致**
-                  # （relay 默认 60）；不一致只是文案数字不准，不影响实际清扫
-                   # ——真正执行超时的是 relay 的 sweep_stale。
-                   "approval_timeout_minutes": 60,
-                   # 计划投递绑定：创建计划时把当前会话写入 action.delivery，
+                   # 仅用于审批通知文案里告知超管"多久没人管会自动终止"。
+                   # **必须与 relay 侧 RELAY_APPROVAL_TIMEOUT_MINUTES 保持一致**
+                   # （relay 默认 360，且自 blocked_at 起算）；不一致只是文案数字
+                   # 不准，不影响实际清扫——真正执行超时的是 relay 的 sweep_stale。
+                    "approval_timeout_minutes": 360,
+                    # 全局门禁看板：轮询 relay 所有 pending_approval，覆盖直连 bridge
+                    # 任务（它们不经分身会话，此前只有 dashboard 能看见）。
+                    "gate_watch_enabled": True,
+                    "gate_watch_poll_sec": 60,
+                    "gate_watch_limit": 50,
+                    # 计划投递绑定：创建计划时把当前会话写入 action.delivery，
                    # 计划任务结束后由 avatar 按绑定目标代投结果/文件。
                     "plan_delivery_enabled": True,
                     "plan_delivery_poll_sec": 15,

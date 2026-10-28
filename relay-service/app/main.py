@@ -21,7 +21,7 @@ from .audit import AuditLog
 from . import progress
 from . import shared_knowledge
 from . import plans as plan_util
-from .config import AUTO_DENY_REASONS, Settings
+from .config import AUTO_DENY_REASONS, SYSTEM_AUTO_DENY_REASONS, Settings, block_category
 from .db import DB
 from .events import TERMINAL, EventBus
 
@@ -981,10 +981,15 @@ def sweep_stale(db, bus, audit, cfg, ws) -> list[int]:
     # status 与各自阈值分流。取 min 会漏掉全部待审批任务（实测踩到）。
     for t in db.stale_tasks(["review", "pending_approval"], max(rcut, acut)):
         if t["status"] == "pending_approval":
-            if (t.get("created_at") or 0) >= acut:
+            # 2026-10-28：有 blocked_at 后从**被拦时刻**起算，不再吃掉任务已运行
+            # 时间；旧行/异常空值回落 created_at，保持向后兼容。
+            anchor = float(t.get("blocked_at") or t.get("created_at") or 0)
+            if anchor >= acut:
                 continue                                   # 未到待审批阈值
+            waited = int((now - anchor) / 60)
             err = (f"待审批超过 {cfg.approval_timeout_minutes:g} 分钟无人处理，"
-                   f"自动终止（被拦命令：{(t.get('blocked_cmd') or '')[:120]}）")
+                   f"自动终止（实际等待 {waited} 分钟；被拦命令："
+                   f"{(t.get('blocked_cmd') or '')[:120]}）")
             if db.mark_approval_timeout(t["id"], err):
                 bus.publish(t["id"], t="status", s="failed", error=err)
                 audit.line(t["id"], t["user"], "approval_timeout", err[:200])
@@ -1131,6 +1136,38 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             # **必须同时清空 blocked_cmd**——self_resume 分支会把它当 exempt_cmd，
             # 不清空等于给这条命令发通行证，下次直接放行。
             n = auto_deny_counts.get(task_id, 0)
+            cat = block_category(res.block_reason)
+            if res.block_reason in SYSTEM_AUTO_DENY_REASONS:
+                # 系统服务/电源/git 写操作在 ProtectSystem=strict + 无 capability 的
+                # 任务沙箱里**批准也执行不了**。第一次自动拒绝并给正确出口；再犯直接
+                # failed，不再制造无效人工审批。
+                if n < 1:
+                    auto_deny_counts[task_id] = n + 1
+                    hint = (
+                        "上一条命令被系统**自动拒绝**（非人工审批，无需等待任何人）：它试图"
+                        "管理系统服务/电源/远端仓库，而任务沙箱对这些路径只读、无特权，"
+                        "人工批准也无法执行。\n"
+                        f"被拒命令：{(res.blocked_cmd or '')[:200]}\n\n"
+                        "请**不要重试该命令、也不要换写法绕过**。定时任务唯一入口是结果正文的 "
+                        "```plan``` 围栏块（分身/桥侧 plan 命令代办）；宿主机 systemd/服务变更"
+                        "请在结论中写明「需平台侧人工处理」。若原任务因此无法完成，请如实说明"
+                        "「做不到及原因」，不要静默降级糊弄。")
+                    db.set(task_id, status="queued", error="", resume_hint=hint,
+                           blocked_cmd="", blocked_at=None)
+                    bus.publish(task_id, t="status", s="queued")
+                    audit.line(task_id, row["user"], "auto_deny",
+                               f"system 1/1 {(res.blocked_cmd or '')[:160]}")
+                    await sched.submit(task_id, row["priority"])
+                    return
+                err = (f"blocked:system: 系统级操作在任务沙箱内不可行，已自动拒绝并提示后仍重试；"
+                       f"被拒命令：{(res.blocked_cmd or '')[:200]}")
+                db.set(task_id, status="failed", error=err, finished_at=time.time(),
+                       blocked_cmd=res.blocked_cmd, blocked_at=time.time())
+                bus.publish(task_id, t="status", s="failed", error=err)
+                audit.line(task_id, row["user"], "auto_deny_limit",
+                           (res.blocked_cmd or "")[:200])
+                ws.cleanup_terminal(db.task(task_id) or row)
+                return
             if res.block_reason in AUTO_DENY_REASONS and n < cfg.auto_deny_max:
                 auto_deny_counts[task_id] = n + 1
                 hint = (
@@ -1146,7 +1183,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                     "若原任务确实无法在不访问该路径的前提下完成，请如实说明「做不到"
                     "及原因」，不要静默降级糊弄。")
                 db.set(task_id, status="queued", error="", resume_hint=hint,
-                       blocked_cmd="")
+                       blocked_cmd="", blocked_at=None)
                 bus.publish(task_id, t="status", s="queued")
                 audit.line(task_id, row["user"], "auto_deny",
                            f"{n + 1}/{cfg.auto_deny_max} "
@@ -1154,9 +1191,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 await sched.submit(task_id, row["priority"])
                 return
             db.set(task_id, status="pending_approval", error=res.error,
-                   blocked_cmd=res.blocked_cmd)
+                   blocked_cmd=res.blocked_cmd, blocked_at=time.time())
             bus.publish(task_id, t="status", s="pending_approval",
-                        error=res.error, blocked_cmd=res.blocked_cmd)
+                        error=res.error, blocked_cmd=res.blocked_cmd,
+                        blocked_at=time.time())
             audit.line(task_id, row["user"], "block", (res.blocked_cmd or "")[:200])
             return
         row = db.task(task_id)  # 刷新
@@ -1219,7 +1257,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                     "若确实无法在预算内完成，如实说明已完成到哪一步、还差什么，"
                     "不要静默降级糊弄。）", nxt)
                 db.set(task_id, status="queued", error="", resume_hint=hint,
-                       blocked_cmd="")
+                       blocked_cmd="", blocked_at=None)
                 bus.publish(task_id, t="status", s="queued", segment=nxt)
                 audit.line(task_id, row["user"], "segment_continue",
                            f"{nxt}/{cfg.long_task_max_segments} "
@@ -1246,7 +1284,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             # 排除 timed_out：超时也是 SIGTERM(143)，但那是任务自己的预算用尽，
             # 重新排队只会再超时一次。
             db.set(task_id, status="queued", error="服务重启，任务重新排队",
-                   blocked_cmd="")
+                   blocked_cmd="", blocked_at=None)
             bus.publish(task_id, t="status", s="queued", reason="restart")
             audit.line(task_id, row["user"], "restart_requeue",
                        f"exit={res.exit_code}({signal_name(res.exit_code)}) "
@@ -1375,7 +1413,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         # 重启恢复：进程重启后旧子进程必死，DB 里 queued/running 的任务重新入队
         for t in db.active_tasks():
             if t["status"] == "running":
-                db.set(t["id"], status="queued", error="服务重启，任务重新排队")
+                db.set(t["id"], status="queued", error="服务重启，任务重新排队",
+                       blocked_at=None)
         # 收尾竞态兜底：systemd KillMode=control-group 把 SIGTERM **同时**发给整个
         # cgroup，agent 子进程可能在 lifespan 置 shutting_down 之前就死了，于是被
         # 上一轮进程判成 failed（#151 实测：status=failed，error 却明写 SIGTERM）。
@@ -1386,7 +1425,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             if not signal_name(code):
                 continue
             db.set(t["id"], status="queued", error="服务重启，任务重新排队",
-                   finished_at=None, blocked_cmd="")
+                   finished_at=None, blocked_cmd="", blocked_at=None)
             audit.line(t["id"], t["user"], "restart_requeue_boot",
                        f"exit={code}({signal_name(code)}) "
                        f"prev_error={(t.get('error') or '')[:120]}")
@@ -1763,7 +1802,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             return db.task(task_id)
         hint = (f"上一次执行因高危命令被拦截，人工已批准执行以下命令：\n{row['blocked_cmd']}\n"
                 "请从该命令继续完成原任务。")
-        db.set(task_id, status="queued", error="", resume_hint=hint)
+        db.set(task_id, status="queued", error="", resume_hint=hint, blocked_at=None)
         audit.line(task_id, who, "approve", (row["blocked_cmd"] or "")[:200])
         bus.publish(task_id, t="status", s="queued")
         await sched.submit(task_id, row["priority"])

@@ -79,7 +79,8 @@ def test_auto_done_reason_allows_read_only_new_low_risk_output():
 
 
 def test_default_auto_done_prefixes_cover_report_tmp_and_system_dirs():
-    for rel in ("shared/report/a.md", "shared/tmp/a.txt", "shared/data/a.csv",
+    for rel in ("shared/report/a.md", "shared/reports/a.md",
+                "shared/tmp/a.txt", "shared/data/a.csv",
                 "shared/_sync/a.txt", "shared/_migrate/a.part",
                 "shared/_inventory/a.md", "shared/_upgrade-backup/a.txt"):
         assert _prefix_match(rel, DEFAULT_AUTO_DONE_PREFIXES), rel
@@ -95,10 +96,12 @@ def test_default_auto_done_prefixes_cover_report_tmp_and_system_dirs():
 
 def test_default_modified_ok_covers_only_latest_pointers():
     for rel in ("shared/report/latest.html", "shared/report/asset-map/latest.html",
+                "shared/reports/latest.html", "shared/reports/asset-map/latest.html",
                 "shared/report/asset-map/latest.json",
                 "shared/report/a/b/latest.md"):
         assert match_any(rel, DEFAULT_AUTO_DONE_MODIFIED_OK), rel
     for rel in ("shared/report/asset-map/ledger.md",          # 台账＝实质记录，不豁免
+                "shared/reports/asset-map/ledger.md",
                 "shared/report/asset-map/asset-map-20261027.html",
                 "shared/knowledge/latest.md",                 # 名单外目录
                 "shared/skills/a/latest.py",

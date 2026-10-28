@@ -104,6 +104,8 @@ ALLOWED = [
     "git fetch origin",
     "git --no-pager log -3",
     "git -c /mnt/vol-eltaah12/finaagent log --oneline -3",
+    "git remote -v",
+    "git branch -vv",
     "systemctl status relay",
     "systemctl is-active relay",
     "systemctl list-timers",

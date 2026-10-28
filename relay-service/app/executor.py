@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 from . import progress
 from . import shared_knowledge
-from .config import block_category
+from .config import RECON_BLOCKED_PATTERNS, block_category
 
 # 环境继承收敛（2026-09-17 加固）：服务自身机密绝不进任务环境——
 # RELAY_* 前缀整体剔除（ADMIN_TOKEN / DB 连接串 / DASHBOARD_PASSWORD / TLS_DIR 等），
@@ -33,6 +33,180 @@ _STREAM_LIMIT = 64 * 1024 * 1024
 def _scrubbed_environ() -> dict:
     return {k: v for k, v in os.environ.items()
             if not k.startswith(_ENV_DROP_PREFIXES) and k not in _ENV_DROP_EXACT}
+
+
+# ── 门禁风险文本预处理（2026-10-28）──
+#
+# 历史误报：#371 实际只跑 `systemctl list-units`，却因 `echo "... reboot ..."`
+# 命中电源操作；#372 实际只跑 `cat/ls/touch`，却因 `echo "... systemctl enable ..."`
+# 命中服务控制。危险词出现在**纯输出文本**里不会执行，不应触发门禁。
+# 这里只用于 blocked_patterns 匹配，不改实际命令；dws 发送目标与 rm 路径仍按
+# 原始命令解析，避免把引号里的真实收件人/路径也剥掉。
+_INERT_OUTPUT_CMDS = {"echo", "printf"}
+_ELEMENT_SEPS = ("&&", "||", ";", "|", "\n")
+_SAFE_CACHE_NAMES = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+})
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.+)$")
+_MKTEMP_SAFE_RE = re.compile(
+    r"^\$\(\s*mktemp\s+-d\s+(?:-p\s+)?(/tmp|/var/tmp)(?:/\S*)?\s*\)$")
+
+
+def _strip_comments(cmd: str) -> str:
+    """删除引号外的 shell 注释（`#` 到行尾），保留引号内原文与引号本身。"""
+    out: list[str] = []
+    quote = ""
+    skip_to_nl = False
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if skip_to_nl:
+            if ch == "\n":
+                skip_to_nl = False
+                out.append(ch)
+            i += 1
+            continue
+        if quote:
+            out.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                out.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(cmd[i + 1])
+            i += 2
+            continue
+        if ch == "#" and (i == 0 or cmd[i - 1].isspace()):
+            skip_to_nl = True
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_elements(cmd: str) -> list[tuple[str, str]]:
+    """按引号外的 `&& || ; | 换行` 拆分简单命令元素。
+
+    返回 `(element, separator_after)` 列表，最后一项 separator 为空。保留原文与
+    原分隔符，供 risk_text 重组时不破坏 `env | grep` 这类跨元素正则。
+    """
+    parts: list[tuple[str, str]] = []
+    buf: list[str] = []
+    quote = ""
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(cmd[i + 1])
+            i += 2
+            continue
+        matched = ""
+        for sep in _ELEMENT_SEPS:
+            if cmd.startswith(sep, i):
+                matched = sep
+                break
+        if matched:
+            parts.append(("".join(buf).strip(), matched))
+            buf.clear()
+            i += len(matched)
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append(("".join(buf).strip(), ""))
+    return [(p, s) for p, s in parts if p]
+
+
+def _has_command_substitution(text: str) -> bool:
+    return "$(" in text or "`" in text
+
+
+def _redirect_target_unsafe(el: str) -> bool:
+    """echo/printf 带重定向时，只有 /dev/null 视为 inert；其它目标保留原样送检。"""
+    m = re.search(r">{1,2}\s*(\S+)", el)
+    if not m:
+        return False
+    return m.group(1).strip("\"'") != "/dev/null"
+
+
+def _is_inert_output_element(el: str) -> bool:
+    """是否是纯 echo/printf 输出元素（无命令替换、无危险重定向、无引号内分隔符）。
+
+    引号内仍含 `; | & 换行` 时一律 fail-closed 保留原文：这类形态可能是多行
+    命令/管道被引号包住的边界写法，宁可继续按旧规则送检，也不冒险剥掉。
+    """
+    if _has_command_substitution(el) or _redirect_target_unsafe(el):
+        return False
+    if re.search(r"[;|&\n]", el):
+        return False
+    try:
+        tokens = shlex.split(el, comments=False)
+    except ValueError:
+        return False
+    idx = 0
+    while idx < len(tokens) and _ASSIGN_RE.match(tokens[idx]):
+        idx += 1
+    if idx >= len(tokens):
+        return False
+    cmd = os.path.basename(tokens[idx])
+    return cmd in _INERT_OUTPUT_CMDS
+
+
+def risk_text(cmd: str) -> str:
+    """用于 blocked_patterns 匹配的命令文本：去掉注释与纯 echo/printf 参数。
+
+    刻意保守：解析失败、含命令替换、带非 /dev/null 重定向、引号内含分隔符的
+    元素一律保留原文。重组时保留原分隔符，避免把 `env | grep` 拆成 `env; grep`
+    而漏掉跨元素正则。
+    """
+    out: list[str] = []
+    for el, sep in _split_elements(_strip_comments(cmd or "")):
+        if not _is_inert_output_element(el):
+            out.append(el)
+            if sep:
+                out.append(sep)
+    return "".join(out).strip()
+
+
+def expand_simple_vars(text: str, vars: dict[str, str]) -> str:
+    """把 `$VAR` / `${VAR}` 替换为已静态确认安全的值；未知变量原样保留。"""
+    if not vars or "$" not in text:
+        return text
+
+    def rep(m: re.Match) -> str:
+        name = m.group(1) or m.group(2)
+        return vars.get(name, m.group(0))
+
+    return _VAR_RE.sub(rep, text)
 
 
 @dataclass
@@ -673,10 +847,16 @@ class Executor:
 
     def _is_blocked(self, cmd: str, workdir: str = "",
                     dws_env: dict | None = None) -> str | None:
-        low = cmd.lower()
+        # 系统保护类只看"会执行的风险文本"：纯 echo/printf 参数与注释里的
+        # reboot/systemctl enable 不再误触发门禁（#371/#372）。凭据侦察类保持
+        # 原文匹配——echo 里出现 RELAY_DEVICE_SECRET 虽不执行，但正是 agent 在
+        # 试探凭据边界的强信号，宁可继续自动拒绝。
+        low_orig = (cmd or "").lower()
+        low_risk = risk_text(cmd).lower()
         for p in self.cfg.blocked_patterns:
             if not p:
                 continue
+            low = low_orig if p in RECON_BLOCKED_PATTERNS else low_risk
             try:
                 if re.search(p, low):
                     return p
@@ -834,10 +1014,11 @@ class Executor:
         return recursive, paths
 
     @staticmethod
-    def _resolve_rm_path(p: str, home: str) -> str:
-        """去引号、把开头的 ~/$HOME/${HOME} 展开为任务真实 HOME，再规范化（防 .. 逃逸）。"""
+    def _resolve_rm_path(p: str, home: str, vars: dict[str, str] | None = None) -> str:
+        """去引号、展开已确认安全的简单变量与 ~/$HOME，再规范化（防 .. 逃逸）。"""
         if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'":
             p = p[1:-1]
+        p = expand_simple_vars(p, vars or {})
         if home:
             if p in ("~", "$HOME", "${HOME}"):
                 p = home
@@ -849,8 +1030,9 @@ class Executor:
                 p = home + p[len("${HOME}"):]
         return os.path.normpath(p) if p.startswith("/") else p
 
-    def _rm_path_safe(self, p: str, home: str = "", workdir: str = "") -> bool:
-        p = self._resolve_rm_path(p, home)
+    def _rm_path_safe(self, p: str, home: str = "", workdir: str = "",
+                      vars: dict[str, str] | None = None) -> bool:
+        p = self._resolve_rm_path(p, home, vars)
         if not p.startswith("/"):  # 相对路径/无法展开的变量：无法验证，拦截
             return False
         for root in self.cfg.rm_safe_prefixes:
@@ -865,7 +1047,92 @@ class Executor:
         # 从而不匹配本前缀，故 .. 逃逸挡得住。
         if workdir and (p == workdir or p.startswith(workdir + "/")):
             return True
+        # 再生型工具缓存：__pycache__ 等目录删了会自动重建，不是业务产出。
+        # #373/#374/#413 都因收尾清理 __pycache__ 卡审批，其中 #413 主要工作已完成，
+        # 60 分钟后整单失败。只放行工作区内、目录名精确命中缓存名单的路径。
+        base = os.path.basename(p.rstrip("/"))
+        if base in _SAFE_CACHE_NAMES:
+            for root in (self.cfg.workspace_root, self.cfg.shared_dir):
+                if root and (p == root or p.startswith(root + "/")):
+                    return True
         return False
+
+    def _safe_tmp_vars(self, segments: list[str], idx: int) -> dict[str, str]:
+        """静态确认安全的简单 shell 变量（仅限 /tmp、/var/tmp）。
+
+        只认两种形态：
+          VAR=/tmp/...
+          VAR=$(mktemp -d /tmp/...)  /  VAR=$(mktemp -d -p /tmp ...)
+        含其它命令替换、管道、未知变量的赋值一律不收录。#417 的
+        `S=/tmp/yneg-runsh; rm -rf $S` 属第一种，本应放行。
+        """
+        vars: dict[str, str] = {}
+        assign_re = re.compile(
+            r"(?:^|[\s;&|])([A-Za-z_][A-Za-z0-9_]*)="
+            r"(\$\([^)]*\)|\"[^\"]*\"|'[^']*'|\S+)")
+        for seg in segments[:idx]:
+            for m in assign_re.finditer(seg):
+                name, raw = m.group(1), m.group(2)
+                val = raw.strip("\"'")
+                mk = _MKTEMP_SAFE_RE.match(val)
+                if mk:
+                    vars[name] = mk.group(1)
+                    continue
+                if not val or "$" in val or "`" in val:
+                    continue
+                if val in ("/tmp", "/var/tmp") or val.startswith(("/tmp/", "/var/tmp/")):
+                    vars[name] = val
+        return vars
+
+    def _root_deletable(self, p: str, home: str = "", workdir: str = "") -> bool:
+        """路径是否落在允许做缓存清理的根内（/tmp、任务树、workspace/shared）。"""
+        if not p.startswith("/"):
+            return False
+        roots = [r for r in self.cfg.rm_safe_prefixes if r]
+        roots += [home, workdir, self.cfg.workspace_root, self.cfg.shared_dir]
+        return any(p == root or p.startswith(root + "/") for root in roots if root)
+
+    def _find_cache_cleanup_safe(self, segment: str, segments: list[str],
+                                 idx: int, workdir: str) -> bool:
+        """`find <安全根> -name __pycache__ ... -exec rm -r {} +` 视为安全缓存清理。"""
+        if "find" not in segment or "-exec" not in segment:
+            return False
+        if not re.search(r"-exec\s+rm\s+(?:-[A-Za-z]+\s+)*-?[A-Za-z]*r", segment):
+            return False
+        try:
+            tokens = shlex.split(segment, comments=False)
+        except ValueError:
+            return False
+        if not tokens or os.path.basename(tokens[0]) != "find":
+            return False
+        roots: list[str] = []
+        i = 1
+        while i < len(tokens) and not tokens[i].startswith("-"):
+            roots.append(tokens[i])
+            i += 1
+        if not roots:
+            return False
+        names: list[str] = []
+        while i < len(tokens):
+            if tokens[i] in ("-name", "-iname") and i + 1 < len(tokens):
+                names.append(tokens[i + 1].strip("\"'"))
+                i += 2
+                continue
+            i += 1
+        if not names or any(n not in _SAFE_CACHE_NAMES for n in names):
+            return False
+        home = os.path.join(workdir, "home") if workdir else ""
+        vars = self._safe_tmp_vars(segments, idx)
+        cwd = self._cwd_at(segments, idx, workdir, vars)
+        for root in roots:
+            resolved = self._resolve_rm_path(root, home, vars)
+            if not resolved.startswith("/"):
+                if not cwd:
+                    return False
+                resolved = os.path.normpath(os.path.join(cwd, resolved))
+            if not self._root_deletable(resolved, home, workdir):
+                return False
+        return True
 
     def _rm_violation(self, cmd: str, workdir: str = "") -> str | None:
         home = os.path.join(workdir, "home") if workdir else ""
@@ -874,43 +1141,46 @@ class Executor:
             recursive, paths = self._rm_targets(segment)
             if not recursive:
                 continue
+            if self._find_cache_cleanup_safe(segment, segments, idx, workdir):
+                continue
+            vars = self._safe_tmp_vars(segments, idx)
             for p in paths:
-                if self._rm_path_safe(p, home, workdir):
+                if self._rm_path_safe(p, home, workdir, vars):
                     continue
                 # 惰性 cd 回溯：**只有**走到这里（按绝对路径判不安全）且目标是相对
                 # 路径时才付费扫描前缀段。绝大多数命令在上一行就 continue 了，
                 # 故热路径零额外开销。修 #121：`cd /tmp && rm -rf syncpkg` 里
                 # /tmp 本属安全前缀，只因相对路径没解析就被拦。
                 #
-                # 但含 `$`／反引号／引号的目标**一律不做 cd 解析、直接拦**：这类值
-                # 静态展开不了，拼进 cwd 会得到 `<workdir>/"$HOME"/x` 这种以
-                # workdir 开头的字面路径，被"自身 workdir 树安全"规则误放行
-                # （2026-09-29 对抗测试实测到的洞）。
-                if not any(c in p for c in "$`\"'") \
-                        and not p.startswith(("/", "~")):
-                    cwd = self._cwd_at(segments, idx, workdir)
+                # 含未知 `$`／反引号／引号的目标仍直接拦；已知安全变量已在
+                # _rm_path_safe 内展开。
+                expanded = expand_simple_vars(p, vars)
+                if not any(c in expanded for c in "$`\"'") \
+                        and not expanded.startswith(("/", "~")):
+                    cwd = self._cwd_at(segments, idx, workdir, vars)
                     if cwd and self._rm_path_safe(
-                            os.path.join(cwd, p), home, workdir):
+                            os.path.join(cwd, expanded), home, workdir, vars):
                         continue
                 return f"recursive rm outside safe dirs: {p}"
         return None
 
     @staticmethod
-    def _cwd_at(segments: list[str], idx: int, workdir: str) -> str:
+    def _cwd_at(segments: list[str], idx: int, workdir: str,
+                vars: dict[str, str] | None = None) -> str:
         """回溯 segments[:idx] 里最后一次 cd 的目标。仅相对路径 rm 时调用（惰性）。
 
-        返回 ""＝cwd 不可知，调用方必须拦截。**含 `$`／反引号的 cd 目标一律视为
-        不可知**：`KEY=/…/shared; cd "$KEY"; rm -rf reports` 里 $KEY 静态展开不了，
-        若把字面量 "$KEY" 拼进 workdir，会得到 `<workdir>/$KEY/reports`——它以
-        workdir 开头，于是被"自身 workdir 树安全"规则放行，而真实目标是
-        `shared/reports`。这是 2026-09-29 改 Tier 1 时实测踩到的洞（#217/#222）。
+        返回 ""＝cwd 不可知，调用方必须拦截。**含未知 `$`／反引号的 cd 目标一律
+        视为不可知**：`KEY=/…/shared; cd "$KEY"; rm -rf reports` 里 $KEY 静态展开
+        不了，若把字面量 "$KEY" 拼进 workdir，会得到 `<workdir>/$KEY/reports`——
+        它以 workdir 开头，于是被"自身 workdir 树安全"规则放行，而真实目标是
+        `shared/reports`。已知安全 /tmp 变量可展开。
         """
         cwd = workdir or ""
         for seg in segments[:idx]:
             m = _CD_RE.search(seg)
             if not m:
                 continue
-            t = m.group(1).strip("\"'")
+            t = expand_simple_vars(m.group(1).strip("\"'"), vars or {})
             if not t or "$" in t or "`" in t:
                 return ""          # 不可静态展开 → cwd 不可知
             cwd = t if t.startswith("/") else os.path.normpath(

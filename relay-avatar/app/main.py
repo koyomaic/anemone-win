@@ -47,6 +47,15 @@ from app.session import SessionManager
 from app.storage import Storage
 
 EMOJI_RE = re.compile(r"^(\[[^\[\]]{1,12}\]\s*)+$")
+_CMD_PUNCT_RE = re.compile(r"[\s。．.！!？?：:；;，,、~～\"'“”‘’()（）]+")
+# 全局门禁审批口令（超管单聊）：与动态白名单审批的「同意/拒绝 <userId>」区分开，
+# 拒绝必须带「任务」二字，避免把 `拒绝 18434` 这类授权驳回误判成任务门禁。
+GATE_APPROVE_RE = re.compile(r"^(?:批准|放行|approve)(?:任务)?\s*#?(\d+)$", re.I)
+GATE_DENY_RE = re.compile(r"^(?:拒绝任务|否决任务|deny)(?:任务)?\s*#?(\d+)$", re.I)
+# review 期间的明确正向反馈 + 新需求：先确认上一件，再立即处理新需求，
+# 不再静默排队到 8h review 超时（2026-10-26 马忠建 #397→#413 实测）。
+REVIEW_ACK_NEW_RE = re.compile(
+    r"^(?:做的很好|做得很好|很好|不错|认可|没问题|通过)[。！!~\s]*(.+)$", re.S)
 
 # 大脑在回复里放的结构化计划标记：```plan\n{json}\n```。relay-avatar 解析并执行
 # （理解交给 LLM，带凭据的创建/管理留在本进程）。解析失败则原样保留、不吞正文。
@@ -138,12 +147,14 @@ class Avatar:
         self.contacts = self.st.run / "contacts.json"
         self.plan_delivery_file = self.st.run / "plan_delivery_state.json"
         self.plan_health_file = self.st.run / "plan_health_state.json"
+        self.gate_watch_file = self.st.run / "gate_watch_state.json"
         self.sign = str(cfg.get("identity", "sign", "") or "")
         self._guide_seen: dict = {}
         self._guest_seen: dict = {}
         self._note_guard: dict = {}
         self._plan_delivery_next = 0.0
         self._plan_health_next = 0.0
+        self._gate_watch_next = 0.0
         self._local_progress: dict = {}
         self._card_sweep_next = 0.0
         self._relay_progress_enabled = bool(
@@ -317,6 +328,10 @@ class Avatar:
         # 复用上面已算出的 lvl（level_of 结果），不再单独调 is_superadmin(uid)：
         # 后者只查 uid，按 openId 入 superadmin 名单的人会被漏判。
         if lvl == "super" and not is_group:
+            gc = self._parse_gate_cmd(str(content))
+            if gc:
+                self._dm(uid or sid, self._do_gate_cmd(gc[0], gc[1], uid))
+                return
             ap = self.policy.parse_approval(str(content))
             if ap:
                 self._dm(uid or sid, self._do_approval(ap, uid))
@@ -539,6 +554,34 @@ class Avatar:
         return (f"没找到「{target}」的授权记录（撤销只对**已授权用户**生效；"
                 f"待审申请请用 `拒绝 {target}`）。")
 
+    # ── 全局任务门禁审批（直连 bridge 任务也能在钉钉里拍板）──
+
+    @staticmethod
+    def _parse_gate_cmd(text: str):
+        t = str(text or "").strip()
+        m = GATE_APPROVE_RE.match(t)
+        if m:
+            return "approve", int(m.group(1))
+        m = GATE_DENY_RE.match(t)
+        if m:
+            return "deny", int(m.group(1))
+        return None
+
+    def _do_gate_cmd(self, decision: str, tid: int, uid: str) -> str:
+        row = self.exec_relay.poll(tid)
+        if "_error" in row:
+            return f"⚠️ 读取任务 #{tid} 失败：{row.get('_error')}"
+        if row.get("status") != "pending_approval":
+            return (f"任务 #{tid} 当前是 {row.get('status')}，"
+                    "只有待审批任务可放行/拒绝。")
+        r = self.exec_relay.approve(tid, decision, uid)
+        if "_error" in r:
+            return f"⚠️ 审批失败：{r.get('_error')} {str(r.get('_detail',''))[:120]}"
+        self.audit.log("gate_global_approve", uid, f"#{tid} {decision}",
+                       backend="relay", task_id=tid)
+        return ("✅ 已放行，任务继续执行。" if decision == "approve"
+                else "🚫 已拒绝，任务终止。")
+
     def _handle_unauthorized(self, uid: str, sender: str, text: str,
                              is_group: bool, ev: dict) -> str:
         avatar = self.cfg.avatar_name
@@ -609,8 +652,13 @@ class Avatar:
         if not t:
             return
         # 审批指令：superadmin 经自聊审批（分身用本人账号，审批入口即自聊）
-        ap = self.policy.parse_approval(t)
         sid, sender = self._ident(s)
+        if self.policy.level_of(uid, sid, sender) == "super":
+            gc = self._parse_gate_cmd(t)
+            if gc:
+                self._dm(uid or sid, self._do_gate_cmd(gc[0], gc[1], uid))
+                return
+        ap = self.policy.parse_approval(t)
         if ap and self.policy.level_of(uid, sid, sender) == "super":
             self._dm(uid or sid, self._do_approval(ap, uid))
             return
@@ -731,7 +779,20 @@ class Avatar:
 
     # ── 会话流（自 im-bridge 演进） ──
     def _kw(self, text: str, name: str) -> bool:
-        return text in self.cfg.get("keywords", name, [])
+        """控制关键词判定：去标点/空白后做**全等**匹配，不做子串匹配。
+
+        2026-10-26 马忠建实测：「上一件任务：确认」「任务还在进行吗？」「停止」
+        全因旧版精确列表未覆盖而被当新需求排队，review 挂起 8 小时后才凌晨执行。
+        全等 + 归一化既能容错标点，又不会把「确认一下数据」误判成 review 确认。
+        """
+        t = _CMD_PUNCT_RE.sub("", str(text or ""))
+        if not t:
+            return False
+        for k in self.cfg.get("keywords", name, []) or []:
+            k = _CMD_PUNCT_RE.sub("", str(k))
+            if k and t == k:
+                return True
+        return False
 
     def _is_control_kw(self, text: str) -> bool:
         """是否**纯**控制关键词（进度/取消/确认…）。聚合缓冲的兜底过滤用。"""
@@ -821,6 +882,16 @@ class Avatar:
                 return
             if self._is_noise(cmd):
                 self._react(s, "noise_emoji")
+                return
+            m = REVIEW_ACK_NEW_RE.match(cmd)
+            if m:
+                # 「做的很好。请把这个工作保存成技能…」这类明确正向反馈 + 新需求，
+                # 旧版会因为不是纯「确认」而排队到 review 8h 超时，导致凌晨才执行。
+                # 现在先确认上一件，再立即把剩余需求交给正常会话流。
+                self._confirm_review(s, "done", uid)
+                remainder = m.group(1).strip()
+                if remainder:
+                    self._on_message(key, s, remainder, uid, cmd_text=remainder)
                 return
             if cmd:
                 # review 期间的新需求不再每条都 reprompt：先排队，等用户确认上一件
@@ -2005,6 +2076,7 @@ class Avatar:
                 # 类别由 relay 编码在 error 里（blocked:<cat>: <cmd>），拿来即可，
                 # 分身侧不再自己跑正则猜命令类型。
                 s["gate_cat"], _ = self._parse_block_error(row.get("error") or "")
+                s["gate_deadline"] = self._gate_deadline(row)
                 uid = str(s.get("uid") or "")
                 self._notify_gate(s, uid)
                 if s.get("card_biz"):
@@ -2082,19 +2154,37 @@ class Avatar:
             return m.group(1), m.group(2)
         return "", body
 
+    def _gate_deadline(self, row: dict) -> float:
+        """审批到期时刻：优先 relay 新增的 blocked_at，旧行回落 created_at。"""
+        mins = float(self.cfg.get("execution", "approval_timeout_minutes", 360) or 360)
+        anchor = float(row.get("blocked_at") or row.get("created_at") or time.time())
+        return anchor + mins * 60
+
+    @staticmethod
+    def _gate_remaining_text(deadline: float) -> str:
+        left = max(0, int(deadline - time.time()))
+        when = time.strftime("%m-%d %H:%M", time.localtime(deadline))
+        if left >= 3600:
+            return f"{left // 3600} 小时 {left % 3600 // 60} 分钟（到 {when}）"
+        return f"{left // 60} 分钟（到 {when}）"
+
     def _approval_text(self, s: dict, for_super: bool = False) -> str:
         cmd = s.get("gate_cmd") or ""
         summary = self._gate_summary(cmd, s.get("gate_cat") or "")
         tid = s.get("task_id")
         if for_super:
             first = (cmd.splitlines() or [""])[0][:160]
-            mins = self.cfg.get("execution", "approval_timeout_minutes", 60)
+            deadline = float(s.get("gate_deadline") or 0)
+            left = (self._gate_remaining_text(deadline) if deadline
+                    else f"{self.cfg.get('execution', 'approval_timeout_minutes', 360):g} 分钟")
             return (f"🚧 **待你拍板**：任务 #{tid} 需要一步高风险操作\n\n"
                     f"· 操作：{summary}\n"
                     f"· 发起人：{(s.get('reply') or {}).get('sender') or '?'}\n"
-                    f"· 命令首行：`{first}…`\n\n"
-                    f"到 dashboard「任务」页点批准/拒绝。{mins:g} 分钟内无人处理"
-                    "将自动终止（不会像以前那样被静默标成已完成）。")
+                    f"· 命令首行：`{first}…`\n"
+                    f"· 剩余：{left}\n\n"
+                    f"在本会话回复「确认」放行 /「拒绝」终止；"
+                    f"也可在任意单聊回复「批准任务 {tid}」/「拒绝任务 {tid}」，"
+                    "或到 dashboard「任务」页处理。")
         return (f"🚧 你这个任务里有一步需要管理员确认：{summary}。\n\n"
                 "已转给超管拍板，你不用管、也不用回什么；批下来会自动继续，"
                 "被拒或超时会告诉你原因。")
@@ -2121,6 +2211,78 @@ class Avatar:
         for su in sups:
             if su not in (uid, sid):
                 self._dm(su, txt)
+
+    # ── 全局门禁看板：直连 bridge 任务也能在钉钉里被发现/拍板 ──
+
+    def _gate_watch_state(self) -> dict:
+        return self.st.load_json(self.gate_watch_file, {})
+
+    def _save_gate_watch_state(self, state: dict) -> None:
+        self.st.save_json(self.gate_watch_file, state)
+
+    def _global_gate_text(self, row: dict) -> str:
+        tid = row.get("id")
+        cmd = row.get("blocked_cmd") or ""
+        cat, _ = self._parse_block_error(row.get("error") or "")
+        summary = self._gate_summary(cmd, cat)
+        first = (cmd.splitlines() or [""])[0][:160]
+        who = str(row.get("requester") or row.get("user") or "?")
+        left = self._gate_remaining_text(self._gate_deadline(row))
+        return (f"🚧 **待审批任务 #{tid}**（直连/非当前会话）\n\n"
+                f"· 发起人：{who}\n"
+                f"· 操作：{summary}\n"
+                f"· 命令首行：`{first}…`\n"
+                f"· 剩余：{left}\n\n"
+                f"回复「批准任务 {tid}」放行 /「拒绝任务 {tid}」终止。")
+
+    def _poll_global_gates(self):
+        if not bool(self.cfg.get("execution", "gate_watch_enabled", True)):
+            return
+        if not self.policy.superadmin:
+            return
+        now = time.time()
+        if now < self._gate_watch_next:
+            return
+        self._gate_watch_next = now + float(
+            self.cfg.get("execution", "gate_watch_poll_sec", 60))
+        limit = int(self.cfg.get("execution", "gate_watch_limit", 50))
+        list_tasks = getattr(self.exec_relay, "list_tasks", None)
+        if not callable(list_tasks):
+            return
+        r = list_tasks(status="pending_approval", limit=limit,
+                       uid="__gate_watch__")
+        if not isinstance(r, dict) or "_error" in r:
+            return
+        rows = r.get("tasks") or []
+        session_tids = {str(s.get("task_id")) for s in self.sess.sessions.values()
+                        if s.get("state") == "WAIT_APPROVAL" and s.get("task_id")}
+        state = self._gate_watch_state()
+        changed = False
+        seen = set()
+        for row in rows:
+            tid = str(row.get("id") or "")
+            if not tid or tid in session_tids:
+                continue
+            seen.add(tid)
+            sig = hashlib.sha256(
+                f"{tid}:{row.get('blocked_at') or row.get('created_at')}:"
+                f"{row.get('blocked_cmd') or ''}".encode("utf-8")).hexdigest()[:16]
+            prev = state.get(tid)
+            if isinstance(prev, dict) and prev.get("sig") == sig:
+                continue
+            state[tid] = {"sig": sig, "ts": now}
+            changed = True
+            txt = self._global_gate_text(row)
+            self.audit.log("gate_watch_notify", str(row.get("user") or ""),
+                           f"#{tid} {row.get('blocked_cmd','')[:80]}",
+                           backend="relay", task_id=row.get("id"))
+            self._notify_superadmins(txt)
+        for tid in list(state.keys()):
+            if tid not in seen:
+                del state[tid]
+                changed = True
+        if changed:
+            self._save_gate_watch_state(state)
 
     def _transcript_bytes(self, row: dict) -> int:
         """上一任务会话转写的字节数＝resume 链会被整段重放的真实体量。
@@ -3519,6 +3681,7 @@ class Avatar:
         self._drain_local()
         self._poll_plan_deliveries()
         self._scan_plan_health()
+        self._poll_global_gates()
         for key, s, kind in self.sess.due():
             s["deadline"] = 0
             self._flush(s, followup=(kind == "followup"))

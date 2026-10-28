@@ -1,5 +1,6 @@
 """tests/test_main_routing.py —— 入口路由：bot拉黑/guest引导/审批流/会话流/限流。"""
 import json
+import time
 
 import pytest
 
@@ -68,6 +69,7 @@ class FakeExec:
     def __init__(self):
         self.submitted = []
         self.tasks = {}
+        self.approvals = []
 
     def available(self):
         return True
@@ -76,15 +78,21 @@ class FakeExec:
                  requester=""):
         tid = len(self.submitted) + 1
         self.submitted.append({"tid": tid, "desc": desc,
-                               "resume": resume_from, "uid": uid})
+                                "resume": resume_from, "uid": uid})
         self.tasks[tid] = {"id": tid, "status": "queued"}
         return {"task_id": tid, "status": "queued"}
 
     def poll(self, tid):
         return self.tasks.get(tid, {"_error": 404})
 
+    def list_tasks(self, status="", limit=50, uid=""):
+        rows = [t for t in self.tasks.values()
+                if not status or t.get("status") == status]
+        return {"tasks": rows[:limit]}
+
     def approve(self, tid, decision, uid=""):
-        self.tasks[tid]["status"] = "running"
+        self.approvals.append((tid, decision, uid))
+        self.tasks[tid]["status"] = "running" if decision == "approve" else "failed"
         return {"ok": True}
 
     def confirm(self, tid, outcome, uid=""):
@@ -1104,3 +1112,97 @@ def test_wait_approval_cancel_terminates(avatar):
     assert calls == [(tid, "deny")]
     assert s["state"] == "IDLE" and s["task_id"] is None
     assert any("已取消，任务终止" in t for t in texts(avatar))
+
+
+# ── 2026-10-28 马忠建反馈：关键词容错、review 正向反馈、全局门禁审批 ──
+
+def test_keyword_variant_review_confirm(avatar):
+    s, tid = _start_review(avatar, "400")
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("上一件任务：确认", n="401"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "done"
+    assert s["state"] == "IDLE"
+    assert any("已确认完成" in t for t in texts(avatar))
+
+
+def test_keyword_variant_cancel_and_progress(avatar):
+    avatar.on_event(ev("跑个任务", n="402"))
+    s = avatar.sess.sessions["o:sid200"]
+    avatar._flush(s, uid="200")
+    tid = s["task_id"]
+    avatar.exec_relay.tasks[tid]["status"] = "running"
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("任务还在进行吗？", n="403"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "running"
+    assert texts(avatar), "进度类问法应得到回复，而不是被吞进 followups"
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("停止", n="404"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "cancelled"
+    assert s["state"] == "IDLE"
+
+
+def test_review_positive_ack_starts_new_task_immediately(avatar):
+    s, tid = _start_review(avatar, "405")
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("做的很好。请把这个工作保存成技能", n="406"))
+    assert avatar.exec_relay.tasks[tid]["status"] == "done"
+    assert s["state"] != "WAIT_REVIEW"
+    assert not s.get("followups")
+    queued = "\n".join(s.get("buffer") or [])
+    assert "保存成技能" in queued or any(
+        "保存成技能" in x["desc"] for x in avatar.exec_relay.submitted)
+
+
+def test_approval_text_actionable_and_remaining(avatar):
+    avatar.on_event(ev("删库跑路", n="407", sid="sid18434"))
+    s = avatar.sess.sessions["o:sid18434"]
+    avatar._flush(s, uid="18434")
+    tid = s["task_id"]
+    now = time.time()
+    avatar.exec_relay.tasks[tid] = {
+        "id": tid, "status": "pending_approval", "blocked_cmd": "rm -rf /",
+        "error": "blocked:rm: rm -rf /", "blocked_at": now, "created_at": now - 1800}
+    avatar.dws.sent.clear()
+    avatar._poll_sessions()
+    txt = "\n".join(texts(avatar))
+    assert "回复「确认」放行" in txt
+    assert f"批准任务 {tid}" in txt
+    assert "剩余" in txt
+
+
+def test_global_gate_watch_notifies_and_dedupes(avatar):
+    now = time.time()
+    avatar.exec_relay.tasks[777] = {
+        "id": 777, "status": "pending_approval", "user": "马忠建",
+        "requester": "马忠建", "blocked_cmd": "dws chat +send-to-group --group x",
+        "error": "blocked:dws: dws chat +send-to-group --group x",
+        "blocked_at": now, "created_at": now}
+    avatar.dws.sent.clear()
+    avatar._poll_global_gates()
+    sent = [c for t, c in avatar.dws.sent if (t or {}).get("user_id") == "18434"]
+    assert any("#777" in c and "批准任务 777" in c for c in sent), sent
+    avatar.dws.sent.clear()
+    avatar._gate_watch_next = 0
+    avatar._poll_global_gates()
+    assert not avatar.dws.sent, "同一门禁状态不应重复通知（无额外提醒）"
+
+
+def test_global_gate_command_approve_and_deny(avatar):
+    now = time.time()
+    avatar.exec_relay.tasks[778] = {
+        "id": 778, "status": "pending_approval", "user": "马忠建",
+        "blocked_cmd": "rm -rf /x", "error": "blocked:rm: rm -rf /x",
+        "blocked_at": now, "created_at": now}
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("批准任务 778", sid="sid18434", sender="王洪彬", n="408"))
+    assert avatar.exec_relay.tasks[778]["status"] == "running"
+    assert any("已放行" in t for t in texts(avatar))
+
+    avatar.exec_relay.tasks[779] = {
+        "id": 779, "status": "pending_approval", "user": "马忠建",
+        "blocked_cmd": "rm -rf /y", "error": "blocked:rm: rm -rf /y",
+        "blocked_at": now, "created_at": now}
+    avatar.dws.sent.clear()
+    avatar.on_event(ev("拒绝任务 779", sid="sid18434", sender="王洪彬", n="409"))
+    assert avatar.exec_relay.tasks[779]["status"] == "failed"
+    assert any("已拒绝" in t for t in texts(avatar))
