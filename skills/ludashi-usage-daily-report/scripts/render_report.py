@@ -64,6 +64,15 @@ def n(v, dash="-"):
     return dash if v is None else v
 
 
+def anomaly_rate(t):
+    """提问级异常率＝系统级异常（失败＋冲突待裁）/ 提问数。
+    中断（已重跑/续跑成功）与待复核（人工流程）不计异常——2026-10-28 用户口径：
+    日报不提成功率、改提异常率，异常的反面即正常。"""
+    q = t.get("questions") or 0
+    a = (t.get("q_failed") or 0) + (t.get("q_conflict") or 0)
+    return round(a * 100.0 / q, 1) if q else 0.0
+
+
 def d_(cur, prev):
     if cur is None or prev is None:
         return "-"
@@ -167,13 +176,14 @@ def anomaly_items(f: dict, limit: int = 5) -> list[str]:
         out.append(f"[降级] {(f.get('degraded') or ['PG 不可用'])[0]}")
     if f.get("is_weekend"):
         out.append("[周末基线] 当日为周末，低活跃属正常节律，环比不与工作日直接同比")
-    bad = []
-    for key, label in (("q_failed", "失败"), ("q_cancelled", "中断"),
-                       ("q_review", "待复核"), ("q_conflict", "冲突待裁")):
-        if t.get(key):
-            bad.append(f"{label} {t[key]}")
-    if bad:
-        out.append(f"交付质量：提问级成功率 {n(t.get('q_success_rate'))}%，" + "、".join(bad))
+    # 异常率＝系统级（失败＋冲突待裁）；中断（已重跑/续跑）与待复核（人工流程）不计异常，单独披露
+    _extra = []
+    if t.get("q_cancelled"):
+        _extra.append(f"中断 {t['q_cancelled']}（已重跑/续跑，正常）")
+    if t.get("q_review"):
+        _extra.append(f"待复核 {t['q_review']}（人工流程）")
+    out.append(f"交付质量：提问级异常率 {anomaly_rate(t)}%（失败 {t.get('q_failed', 0)}·冲突 {t.get('q_conflict', 0)}）"
+               + ("；" + "、".join(_extra) if _extra else ""))
     anom = collections.Counter(a.get("action") for a in (lg.get("anomalies") or []) if a.get("action"))
     if anom:
         out.append("审计异常：" + "；".join(f"{a}×{c}" for a, c in anom.most_common(3)))
@@ -251,9 +261,9 @@ def render(f: dict, mode: str) -> str:
     L.append(f"- **重点用户**：{n(k.get('active'))}/{n(k.get('roster_size'))} 活跃"
              f"（{n(k.get('active_rate'))}%，环比 {d_(k.get('active'), k.get('prev_active'))}）"
              f"｜静默 {len(sil)} 人")
-    L.append(f"- **交付**：提问级成功率 **{n(t.get('q_success_rate'))}%**"
-             f"（完成 {n(t.get('q_done'))}｜失败 {n(t.get('q_failed'))}｜中断 {n(t.get('q_cancelled'))}"
-             f"｜待复核 {n(t.get('q_review'))}｜冲突 {n(t.get('q_conflict'))}）")
+    L.append(f"- **交付**：提问级异常率 **{anomaly_rate(t)}%**（系统级：失败 {n(t.get('q_failed'))}·冲突 {n(t.get('q_conflict'))}）"
+             f"｜完成 {n(t.get('q_done'))}｜中断 {n(t.get('q_cancelled'))}（已重跑/续跑，正常）"
+             f"｜待复核 {n(t.get('q_review'))}（人工流程）")
     L.append(f"- **渠道**：{channel_text(t.get('by_source') or {})}"
              f"（任务行 {n(t.get('task_rows'))}，影子执行去重后 {n(t.get('questions'))} 条提问）")
     L.append(f"- **消息/算力**：入站 {n(lg.get('inbound_msgs'))} 条（{inbound_kinds}）"
@@ -331,7 +341,7 @@ def render_summary(f: dict) -> str:
         f"（{k.get('active_rate', '-')}%）｜静默 {len(sil)} 人"
         + (f"｜超30天：{'、'.join(over30)}" if over30 else ""),
         f"- **核心汇总**：人工提问 **{t.get('questions', 0)}** 条（环比 {d_(t.get('questions'), p.get('questions'))}）"
-        f"｜活跃 **{t.get('active_users', 0)}** 人｜人均 {per} 条｜成功率 **{t.get('q_success_rate', '-')}%**",
+        f"｜活跃 **{t.get('active_users', 0)}** 人｜人均 {per} 条｜异常率 **{anomaly_rate(t)}%**（失败{t.get('q_failed', 0)}·冲突{t.get('q_conflict', 0)}）",
         f"- **渠道/算力**：{channel_text(t.get('by_source') or {})}（任务行 {t.get('task_rows', 0)}）"
         f"｜入站 {lg.get('inbound_msgs', 0)} 条｜多轮 {lg.get('multi_round_sessions', 0)} 个｜token {tokens:,}",
         f"- **异常/提示**：{anom_txt}",
