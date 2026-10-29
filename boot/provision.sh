@@ -167,10 +167,8 @@ ins_node()     {
   elif command -v dnf >/dev/null 2>&1; then
     dnf module install -y nodejs:22 >/dev/null 2>&1 || dnf install -y -q nodejs npm >/dev/null 2>&1
   else return 1; fi; }
-chk_opencode() { # 版本 >= 要求即通过（sort -V 取最小者等于要求版本 ⇒ 实际 ≥ 要求），避免新版被降级重装
-  command -v opencode >/dev/null || return 1
-  local v; v="$(opencode --version 2>/dev/null | head -1)"
-  [ -n "$v" ] && [ "$(printf '%s\n%s\n' "$OPENCODE_VER" "$v" | sort -V | head -1)" = "$OPENCODE_VER" ]
+chk_opencode() { # 只校验存在且可执行，不再要求特定版本（2026-10-29 用户指示去掉 opencode 版本校验；缺失时仍按 OPENCODE_VER 装）
+  command -v opencode >/dev/null && opencode --version >/dev/null 2>&1
 }
 ins_opencode() { # npm 偶发跳过 postinstall（bin 占位符报 "postinstall script was not run"），装完验证、失败则手动补跑修复
   npm install -g --no-fund --no-audit "opencode-ai@$OPENCODE_VER" >/dev/null 2>&1
@@ -194,7 +192,7 @@ try "curl/tar/openssl"    chk_tools    ins_tools
 try "sqlite3"             chk_sqlite3  ins_sqlite3
 try "python3>=3.10+venv"  chk_python3  ins_python3
 try "node>=20+npm"        chk_node     ins_node
-try "opencode>=$OPENCODE_VER" chk_opencode ins_opencode
+try "opencode"               chk_opencode ins_opencode
 try "dws@$DWS_VER"        chk_dws      ins_dws
 
 # ---------- 10 资源树 ----------

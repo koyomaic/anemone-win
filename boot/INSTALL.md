@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/koyomaic/business_advisor/main/boot
 | 02 | 目录布局（/mnt/vol-eltaah12/*、/opt/team/*） | mkdir -p | 硬 |
 | 03-05 | git / curl·tar·openssl / sqlite3 | apt/dnf 安装 | 硬 |
 | 06-07 | python3≥3.10+venv / node≥20+npm | apt/dnf（node 走 NodeSource 22.x） | 硬 |
-| 08-09 | opencode-ai≥1.18.29（sort -V 比较，新版不降级）/ dingtalk-workspace-cli@1.0.61 | npm -g 安装；opencode 装后验证 --version，npm 跳过 postinstall 时手动补跑 | 硬 |
+| 08-09 | opencode-ai（存在且可执行即可，不校验版本；缺失时按 OPENCODE_VER 装）/ dingtalk-workspace-cli@1.0.61 | npm -g 安装；opencode 装后验证 --version，npm 跳过 postinstall 时手动补跑 | 硬 |
 | 10 | 资源树（release/现役树，否则临时 clone） | git clone | 硬 |
 | 11 | venv+依赖（fastapi/uvicorn/httpx/pytest/psycopg2 可导入） | venv + pip -r requirements.txt（阿里云镜像） | 硬 |
 | 12-13 | boot.env / boot.sh | 生成标准布局 / 从资源树同步(700) | 硬 |
