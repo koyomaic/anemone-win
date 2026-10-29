@@ -758,6 +758,13 @@ class Executor:
             # 必须在 build_cmd 之前：--resume 一旦带上，claude-code 就会把整段
             # 历史（含图片 base64）重放上送。
             self._strip_resume_images(resume_session, user, task_id, publish)
+        if self.cfg.engine == "opencode":
+            # 特性探测必须离开事件循环：subprocess.run 同步、最长吃满 10s 超时，
+            # 直接在协程里调用会卡死整个服务（2026-10-29 门禁
+            # test_blocked_command_full_flow_fake_agent ReadTimeout 根因——fake
+            # agent 对 run --help 同样 sleep，探测 10s 与轮询 httpx.get(timeout=10)
+            # 同边界竞态，偶发饿死 GET /tasks/{id}）。线程预热后 build_cmd 即命中缓存。
+            await asyncio.to_thread(self._opencode_standalone_ok)
         cmd = self.build_cmd(workdir, prompt, resume_session)
         env = self.build_env(workdir, xdg, user)
         if data_dir:
